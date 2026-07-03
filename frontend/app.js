@@ -17,7 +17,8 @@
     pendingFiles: [], // files attached before sending a message
     trades: [],
     vendors: [],
-    teamMembers: []
+    teamMembers: [],
+    users: []
   };
 
   // ═══ DOM Helpers ═══
@@ -191,6 +192,9 @@
   async function fetchTeamMembers() {
     try { const r = await apiReq('/api/team-members'); const d = await r.json(); state.teamMembers = d.team_members || []; } catch (e) { state.teamMembers = []; }
   }
+  async function fetchUsers() {
+    try { const r = await apiReq('/api/users'); const d = await r.json(); state.users = d.users || []; } catch (e) { state.users = []; }
+  }
   async function fetchDocuments() {
     try {
       const r = await apiReq('/api/documents');
@@ -213,14 +217,16 @@
   }
   async function fetchAllData() {
     if (!getApiUrl()) return;
-    await Promise.all([fetchTrades(), fetchVendors(), fetchTeamMembers(), fetchDocuments()]);
+    await Promise.all([fetchTrades(), fetchVendors(), fetchTeamMembers(), fetchDocuments(), fetchUsers()]);
     renderPage();
   }
 
   // ═══ Navigation ═══
   const PAGE_TITLES = {
     'project-details': 'Project Details', 'trades': 'Trades Management', 'vendors': 'Vendors Management',
-    'documents': 'Documents', 'marshal-chat': 'Marshal Chat'
+    'documents': 'Documents', 'marshal-chat': 'Marshal Chat',
+    'users': 'User', 'contact': 'Contact', 'my-feedback': 'My Feedback',
+    'company-info': 'Company Info', 'project-types': 'Project Types', 'task-types': 'Task Types'
   };
 
   function navigateTo(page) {
@@ -229,7 +235,8 @@
     const active = $(`.nav-item[data-page="${page}"]`);
     if (active) active.classList.add('active');
     if (['project-details'].includes(page)) state.expandedGroups.project = true;
-    if (['trades', 'vendors'].includes(page)) state.expandedGroups.companySettings = true;
+    if (['trades', 'vendors', 'users', 'contact', 'my-feedback', 'company-info', 'project-types', 'task-types'].includes(page))
+      state.expandedGroups.companySettings = true;
     updateNavGroups();
     DOM.headerPageTitle.textContent = PAGE_TITLES[page] || page;
     renderPage();
@@ -253,6 +260,11 @@
       case 'vendors': DOM.contentArea.innerHTML = renderVendorsPage(); break;
       case 'documents': DOM.contentArea.innerHTML = renderDocumentsPage(); break;
       case 'marshal-chat': DOM.contentArea.innerHTML = renderChatFullPage(); showChat(); break;
+      case 'users': renderUsersPage(); break;
+      case 'create-user': renderCreateUserPage(); break;
+      case 'edit-user': renderEditUserPage(state._editUserId); break;
+      case 'contact': case 'my-feedback': case 'company-info': case 'project-types': case 'task-types':
+        DOM.contentArea.innerHTML = `<div class="empty-state"><span class="material-icons-outlined">construction</span><h3>${PAGE_TITLES[page] || page}</h3><p>This section is coming soon.</p></div>`; break;
       default: DOM.contentArea.innerHTML = renderProjectDetails(); break;
     }
     bindPageEvents();
@@ -346,6 +358,340 @@
     </div>`;
   }
 
+  // ═══ User Management ═══
+
+  const ROLES = ['Guest', 'User', 'Admin', 'Super Admin', 'System Admin'];
+  const DEPARTMENTS = ['Management', 'Construction / Site Operations', 'Engineering', 'Finance', 'HR', 'IT', 'Sales', 'Operations'];
+  const DESIGNATIONS = ['Project Manager', 'Site Supervisor', 'Engineer', 'Estimator', 'Coordinator', 'Director', 'Analyst', 'Developer'];
+  const TIME_ZONES = ['UTC', 'UTC-8 (PST)', 'UTC-7 (MST)', 'UTC-6 (CST)', 'UTC-5 (EST)', 'UTC+0 (GMT)', 'UTC+5:30 (IST)', 'UTC+8 (CST/HKT)', 'UTC+10 (AEST)'];
+
+  function roleBadgeClass(role) {
+    return {
+      'Guest': 'badge-role-guest', 'User': 'badge-role-user',
+      'Admin': 'badge-role-admin', 'Super Admin': 'badge-role-super',
+      'System Admin': 'badge-role-system'
+    }[role] || 'badge-role-user';
+  }
+
+  function renderUsersPage() {
+    // Extract unique departments from loaded users
+    const depts = [...new Set(state.users.map(u => u.department).filter(Boolean))];
+
+    const rows = state.users.map(u => `<tr data-id="${u.id}">
+      <td>${esc(u.name)}</td>
+      <td>${esc(u.email)}</td>
+      <td>${esc(u.phone || '')}</td>
+      <td>${esc(u.address || '')}</td>
+      <td><span class="badge ${u.status === 'Active' ? 'badge-active' : 'badge-inactive'}">${u.status}</span></td>
+      <td><span class="badge ${roleBadgeClass(u.role)}">${u.role}</span></td>
+      <td>${u.department ? `<span class="badge badge-dept">${esc(u.department)}</span>` : '—'}</td>
+      <td><div class="table-actions"><button class="btn-table-action" data-action="edit-user" data-id="${u.id}" title="Edit"><span class="material-icons-outlined">edit</span></button></div></td>
+    </tr>`).join('');
+
+    DOM.contentArea.innerHTML = `${notConnectedMsg()}
+      <div class="page-header">
+        <h1 class="page-title">User</h1>
+        <button class="btn btn-primary" id="btnAddUser">
+          <span class="material-icons-outlined" style="font-size:18px">add</span> Add User
+        </button>
+      </div>
+      <div class="filters-bar">
+        <div class="filters-row">
+          <div class="filter-group">
+            <div class="filter-label">Name</div>
+            <input class="filter-input" id="userNameFilter" placeholder="Filter by name (min 3 chars)">
+          </div>
+          <div class="filter-group">
+            <div class="filter-label">Email</div>
+            <input class="filter-input" id="userEmailFilter" placeholder="Filter by email (min 3 chars)">
+          </div>
+          <div class="filter-group">
+            <div class="filter-label">Status</div>
+            <select class="filter-input" id="userStatusFilter">
+              <option value="">Select status</option>
+              <option value="Active">Active</option>
+              <option value="Inactive">Inactive</option>
+            </select>
+          </div>
+          <div class="filter-group">
+            <div class="filter-label">Role</div>
+            <select class="filter-input" id="userRoleFilter">
+              <option value="">Select role</option>
+              ${ROLES.map(r => `<option value="${r}">${r}</option>`).join('')}
+            </select>
+          </div>
+          <div class="filter-group">
+            <div class="filter-label">Department</div>
+            <select class="filter-input" id="userDeptFilter">
+              <option value="">Select department</option>
+              ${depts.map(d => `<option value="${esc(d)}">${esc(d)}</option>`).join('')}
+            </select>
+          </div>
+        </div>
+        <div class="filters-meta">
+          <span class="total-count" id="userTotalCount">Total: ${state.users.length}</span>
+          <button class="btn btn-secondary btn-sm" id="btnClearUserFilters">Clear</button>
+        </div>
+      </div>
+      <div class="data-table-container">
+        <table class="data-table" id="usersTable">
+          <thead><tr>
+            <th>Name</th><th>Email</th><th>Phone</th><th>Address</th>
+            <th>Status</th><th>Role</th><th>Department</th><th>Actions</th>
+          </tr></thead>
+          <tbody id="usersTableBody">${rows || `<tr><td colspan="8" class="td-empty">${getApiUrl() ? 'No users found' : 'Connect backend to load users'}</td></tr>`}</tbody>
+        </table>
+      </div>`;
+  }
+
+  function applyUserFilters() {
+    const name = ($('#userNameFilter')?.value || '').toLowerCase();
+    const email = ($('#userEmailFilter')?.value || '').toLowerCase();
+    const status = $('#userStatusFilter')?.value || '';
+    const role = $('#userRoleFilter')?.value || '';
+    const dept = $('#userDeptFilter')?.value || '';
+
+    let filtered = state.users;
+    if (name.length >= 3) filtered = filtered.filter(u => u.name.toLowerCase().includes(name));
+    if (email.length >= 3) filtered = filtered.filter(u => u.email.toLowerCase().includes(email));
+    if (status) filtered = filtered.filter(u => u.status === status);
+    if (role) filtered = filtered.filter(u => u.role === role);
+    if (dept) filtered = filtered.filter(u => u.department === dept);
+
+    const tbody = $('#usersTableBody');
+    const countEl = $('#userTotalCount');
+    if (!tbody) return;
+    if (countEl) countEl.textContent = `Total: ${filtered.length}`;
+    tbody.innerHTML = filtered.length ? filtered.map(u => `<tr data-id="${u.id}">
+      <td>${esc(u.name)}</td><td>${esc(u.email)}</td><td>${esc(u.phone || '')}</td>
+      <td>${esc(u.address || '')}</td>
+      <td><span class="badge ${u.status === 'Active' ? 'badge-active' : 'badge-inactive'}">${u.status}</span></td>
+      <td><span class="badge ${roleBadgeClass(u.role)}">${u.role}</span></td>
+      <td>${u.department ? `<span class="badge badge-dept">${esc(u.department)}</span>` : '—'}</td>
+      <td><div class="table-actions"><button class="btn-table-action" data-action="edit-user" data-id="${u.id}" title="Edit"><span class="material-icons-outlined">edit</span></button></div></td>
+    </tr>`).join('') : `<tr><td colspan="8" class="td-empty">No users match filters</td></tr>`;
+    tbody.querySelectorAll('[data-action]').forEach(el => el.addEventListener('click', handleAction));
+  }
+
+  function clearUserFilters() {
+    ['userNameFilter', 'userEmailFilter'].forEach(id => { const el = $(`#${id}`); if (el) el.value = ''; });
+    ['userStatusFilter', 'userRoleFilter', 'userDeptFilter'].forEach(id => { const el = $(`#${id}`); if (el) el.value = ''; });
+    applyUserFilters();
+  }
+
+  function renderCreateUserPage() {
+    DOM.contentArea.innerHTML = `
+      <div class="user-form-page">
+        <div class="page-header" style="margin-bottom:24px">
+          <h1 class="page-title">Create User</h1>
+        </div>
+        <div class="user-form-card">
+          <div class="user-form-grid">
+            <div class="form-group">
+              <label class="form-label required-label">Name</label>
+              <input class="form-input" id="ufName" placeholder="Full name">
+            </div>
+            <div class="form-group">
+              <label class="form-label required-label">Email</label>
+              <input class="form-input" id="ufEmail" type="email" placeholder="email@example.com">
+            </div>
+            <div class="form-group">
+              <label class="form-label required-label">Password</label>
+              <div class="pw-group">
+                <input class="form-input" id="ufPassword" type="password" placeholder="Password">
+                <button type="button" class="pw-toggle" tabindex="-1"><span class="material-icons-outlined">visibility_off</span></button>
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label required-label">Confirm Password</label>
+              <div class="pw-group">
+                <input class="form-input" id="ufConfirmPassword" type="password" placeholder="Confirm password">
+                <button type="button" class="pw-toggle" tabindex="-1"><span class="material-icons-outlined">visibility_off</span></button>
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Phone</label>
+              <input class="form-input" id="ufPhone" placeholder="Phone number">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Address</label>
+              <input class="form-input" id="ufAddress" placeholder="Address">
+            </div>
+            <div class="form-group">
+              <label class="form-label required-label">Role</label>
+              <select class="form-input" id="ufRole">
+                <option value="">Select role...</option>
+                ${ROLES.map(r => `<option value="${r}">${r}</option>`).join('')}
+              </select>
+            </div>
+          </div>
+          <div class="user-form-actions">
+            <button class="btn btn-primary" id="btnCreateUserSubmit">Create</button>
+            <button class="btn btn-secondary" id="btnCancelCreate">Cancel</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  async function submitCreateUser() {
+    const name = $('#ufName')?.value.trim();
+    const email = $('#ufEmail')?.value.trim();
+    const pw = $('#ufPassword')?.value;
+    const pwConf = $('#ufConfirmPassword')?.value;
+    const role = $('#ufRole')?.value;
+    const phone = $('#ufPhone')?.value.trim();
+    const address = $('#ufAddress')?.value.trim();
+
+    if (!name) { showToast('Name is required', 'warning'); return; }
+    if (!email) { showToast('Email is required', 'warning'); return; }
+    if (!pw) { showToast('Password is required', 'warning'); return; }
+    if (pw !== pwConf) { showToast('Passwords do not match', 'error'); return; }
+    if (!role) { showToast('Role is required', 'warning'); return; }
+
+    try {
+      await apiReq('/api/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, email, password: pw, role, phone, address }),
+      });
+      await fetchUsers();
+      showToast('User created successfully', 'success');
+      navigateTo('users');
+    } catch (err) { showToast(err.message, 'error'); }
+  }
+
+  function renderEditUserPage(userId) {
+    const user = state.users.find(u => u.id === userId);
+    if (!user) { navigateTo('users'); return; }
+
+    const isActive = user.status === 'Active';
+    DOM.contentArea.innerHTML = `
+      <div class="user-form-page">
+        <div class="edit-user-header">
+          <h1 class="page-title">Edit User</h1>
+          <div class="edit-user-status">
+            <span style="margin-right:8px;font-size:14px;color:var(--text-muted)">Status</span>
+            <label class="toggle-switch">
+              <input type="checkbox" id="userStatusToggle" ${isActive ? 'checked' : ''}>
+              <span class="toggle-track"></span>
+            </label>
+            <span class="toggle-label" id="userStatusLabel" style="margin-left:8px;font-weight:600;color:${isActive ? 'var(--brand-green)' : 'var(--text-muted)'}">${user.status}</span>
+          </div>
+        </div>
+        <input type="hidden" id="editUserId" value="${user.id}">
+        <div class="user-form-card">
+          <div class="tab-strip">
+            <button class="tab-btn active" data-tab="details">Details</button>
+            <button class="tab-btn" data-tab="permission">Permission</button>
+          </div>
+
+          <div id="tab-details" class="tab-content active">
+            <div class="edit-user-layout">
+              <div class="edit-user-fields">
+                <div class="user-form-grid">
+                  <div class="form-group">
+                    <label class="form-label required-label">Name</label>
+                    <input class="form-input" id="euName" value="${esc(user.name)}">
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label required-label">Email</label>
+                    <input class="form-input" id="euEmail" type="email" value="${esc(user.email)}">
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">Phone</label>
+                    <input class="form-input" id="euPhone" value="${esc(user.phone || '')}">
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">Address</label>
+                    <input class="form-input" id="euAddress" value="${esc(user.address || '')}">
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">Role</label>
+                    <select class="form-input" id="euRole">
+                      ${ROLES.map(r => `<option value="${r}" ${user.role === r ? 'selected' : ''}>${r}</option>`).join('')}
+                    </select>
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">Company</label>
+                    <input class="form-input" id="euCompany" value="${esc(user.company || '')}" ${user.company ? 'disabled' : ''}>
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">Department</label>
+                    <select class="form-input" id="euDepartment">
+                      <option value="">Select department</option>
+                      ${DEPARTMENTS.map(d => `<option value="${d}" ${user.department === d ? 'selected' : ''}>${d}</option>`).join('')}
+                    </select>
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">Designation</label>
+                    <select class="form-input" id="euDesignation">
+                      <option value="">Select designation</option>
+                      ${DESIGNATIONS.map(d => `<option value="${d}" ${user.designation === d ? 'selected' : ''}>${d}</option>`).join('')}
+                    </select>
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">Time Zone</label>
+                    <select class="form-input" id="euTimeZone">
+                      ${TIME_ZONES.map(tz => `<option value="${tz}" ${user.time_zone === tz ? 'selected' : ''}>${tz}</option>`).join('')}
+                    </select>
+                  </div>
+                </div>
+              </div>
+              <div class="edit-user-avatar">
+                <div class="avatar-circle">
+                  <span class="material-icons-outlined avatar-placeholder">account_circle</span>
+                  <div class="avatar-actions">
+                    <button class="avatar-btn avatar-btn-camera" title="Upload photo"><span class="material-icons-outlined">photo_camera</span></button>
+                    <button class="avatar-btn avatar-btn-delete" title="Remove photo"><span class="material-icons-outlined">delete</span></button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div id="tab-permission" class="tab-content">
+            <div style="padding:32px;text-align:center;color:var(--text-muted)">
+              <span class="material-icons-outlined" style="font-size:48px">security</span>
+              <p style="margin-top:8px">Permission settings will appear here.</p>
+            </div>
+          </div>
+
+          <div class="user-form-actions">
+            <button class="btn btn-primary" id="btnUpdateUser">Save Changes</button>
+            <button class="btn btn-secondary" id="btnCancelEdit">Cancel</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  async function submitUpdateUser() {
+    const id = $('#editUserId')?.value;
+    const name = $('#euName')?.value.trim();
+    const email = $('#euEmail')?.value.trim();
+    const phone = $('#euPhone')?.value.trim();
+    const address = $('#euAddress')?.value.trim();
+    const role = $('#euRole')?.value;
+    const department = $('#euDepartment')?.value;
+    const designation = $('#euDesignation')?.value;
+    const time_zone = $('#euTimeZone')?.value;
+    const company = $('#euCompany')?.value.trim();
+    const status = $('#userStatusToggle')?.checked ? 'Active' : 'Inactive';
+
+    if (!name) { showToast('Name is required', 'warning'); return; }
+    if (!email) { showToast('Email is required', 'warning'); return; }
+
+    try {
+      await apiReq(`/api/users/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, email, phone, address, role, department, designation, time_zone, company, status }),
+      });
+      await fetchUsers();
+      showToast('User updated successfully', 'success');
+      navigateTo('users');
+    } catch (err) { showToast(err.message, 'error'); }
+  }
+
   // ═══ Page Events ═══
   function bindPageEvents() {
     $$('[data-nav]').forEach(el => el.addEventListener('click', e => { e.preventDefault(); navigateTo(el.dataset.nav); }));
@@ -353,6 +699,56 @@
     const btnCT = $('#btnCreateTrade'); if (btnCT) btnCT.addEventListener('click', () => openCrudModal('trade'));
     const btnCV = $('#btnCreateVendor'); if (btnCV) btnCV.addEventListener('click', () => openCrudModal('vendor'));
     const btnUD = $('#btnUploadDocs'); if (btnUD) btnUD.addEventListener('click', openUploadPanel);
+
+    // User page events
+    const btnAddUser = $('#btnAddUser');
+    if (btnAddUser) btnAddUser.addEventListener('click', () => navigateTo('create-user'));
+    const userFilters = ['userNameFilter', 'userEmailFilter', 'userStatusFilter', 'userRoleFilter', 'userDeptFilter'];
+    userFilters.forEach(id => { const el = $(`#${id}`); if (el) el.addEventListener('input', applyUserFilters); });
+    const btnClearFilters = $('#btnClearUserFilters');
+    if (btnClearFilters) btnClearFilters.addEventListener('click', clearUserFilters);
+
+    // Create user form
+    const btnCreateUser = $('#btnCreateUserSubmit');
+    if (btnCreateUser) btnCreateUser.addEventListener('click', submitCreateUser);
+    const btnCancelCreate = $('#btnCancelCreate');
+    if (btnCancelCreate) btnCancelCreate.addEventListener('click', () => navigateTo('users'));
+
+    // Password show/hide toggles
+    $$('.pw-toggle').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const inp = btn.previousElementSibling;
+        if (!inp) return;
+        inp.type = inp.type === 'password' ? 'text' : 'password';
+        btn.querySelector('span.material-icons-outlined').textContent = inp.type === 'password' ? 'visibility_off' : 'visibility';
+      });
+    });
+
+    // Edit user form
+    const btnUpdateUser = $('#btnUpdateUser');
+    if (btnUpdateUser) btnUpdateUser.addEventListener('click', submitUpdateUser);
+    const btnCancelEdit = $('#btnCancelEdit');
+    if (btnCancelEdit) btnCancelEdit.addEventListener('click', () => navigateTo('users'));
+
+    // Edit user tabs
+    $$('.tab-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        $$('.tab-btn').forEach(b => b.classList.remove('active'));
+        $$('.tab-content').forEach(c => c.classList.remove('active'));
+        btn.classList.add('active');
+        const tab = $(`#tab-${btn.dataset.tab}`);
+        if (tab) tab.classList.add('active');
+      });
+    });
+
+    // Status toggle in edit user
+    const statusToggle = $('#userStatusToggle');
+    if (statusToggle) {
+      statusToggle.addEventListener('change', () => {
+        const lbl = $('#userStatusLabel');
+        if (lbl) lbl.textContent = statusToggle.checked ? 'Active' : 'Inactive';
+      });
+    }
   }
 
   async function handleAction(e) {
@@ -379,6 +775,10 @@
     else if (action === 'delete-doc') {
       if (!confirm('Delete this document?')) return;
       try { await apiReq(`/api/documents/${id}`, { method: 'DELETE' }); await fetchDocuments(); renderPage(); showToast('Document deleted', 'info'); } catch (e) { showToast(e.message, 'error'); }
+    }
+    else if (action === 'edit-user') {
+      state._editUserId = id;
+      navigateTo('edit-user');
     }
   }
 
