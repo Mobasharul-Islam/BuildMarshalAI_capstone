@@ -1,20 +1,25 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <meta name="description" content="BuildMarshal — AI-powered construction project management platform with document intelligence.">
+  <meta name="description"
+    content="BuildMarshal — AI-powered construction project management platform with document intelligence.">
   <meta name="theme-color" content="#1e293b">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title>BuildMarshal — Construction Project Management</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><defs><linearGradient id='g' x1='0%25' y1='0%25' x2='100%25' y2='100%25'><stop offset='0%25' style='stop-color:%2322c55e'/><stop offset='100%25' style='stop-color:%2316a34a'/></linearGradient></defs><rect rx='20' width='100' height='100' fill='url(%23g)'/><text x='50' y='68' font-size='50' font-weight='900' fill='white' text-anchor='middle' font-family='sans-serif'>BM</text></svg>">
+  <link rel="icon"
+    href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><defs><linearGradient id='g' x1='0%25' y1='0%25' x2='100%25' y2='100%25'><stop offset='0%25' style='stop-color:%2322c55e'/><stop offset='100%25' style='stop-color:%2316a34a'/></linearGradient></defs><rect rx='20' width='100' height='100' fill='url(%23g)'/><text x='50' y='68' font-size='50' font-weight='900' fill='white' text-anchor='middle' font-family='sans-serif'>BM</text></svg>">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
+    rel="stylesheet">
   <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Outlined" rel="stylesheet">
   <link rel="stylesheet" href="styles.css">
 </head>
+
 <body>
   <div class="app-layout" id="appLayout">
 
@@ -26,8 +31,9 @@
       <div class="sidebar-logo">
         <div class="logo-icon">
           <svg viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <rect width="40" height="40" rx="8" fill="#22c55e"/>
-            <path d="M12 20.5L17.5 26L28 15" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+            <rect width="40" height="40" rx="8" fill="#22c55e" />
+            <path d="M12 20.5L17.5 26L28 15" stroke="white" stroke-width="3" stroke-linecap="round"
+              stroke-linejoin="round" />
           </svg>
         </div>
         <div class="logo-text">
@@ -46,18 +52,35 @@
             <span class="nav-label">Marshal Chat</span>
           </li>
 
-          <!-- Project -->
-          <li class="nav-group">
-            <div class="nav-group-header" data-group="project">
-              <span class="material-icons-outlined">apartment</span>
-              <span class="nav-label">Project</span>
+          <!-- Tasks -->
+          <li class="nav-item" data-page="tasks">
+            <span class="material-icons-outlined">task_alt</span>
+            <span class="nav-label">Tasks</span>
+          </li>
+
+          <!-- Projects -->
+          <li class="nav-group" id="navGroupProjects">
+            <div class="nav-group-header" data-group="projects">
+              <span class="material-icons-outlined">folder</span>
+              <span class="nav-label">Projects</span>
               <span class="material-icons-outlined nav-chevron">expand_more</span>
             </div>
-            <ul class="nav-sublist" id="projectSubmenu">
+            <ul class="nav-sublist" id="projectsSubmenu">
+              <li class="nav-item sub-item" data-page="all-projects">
+                <span class="material-icons-outlined" style="font-size:18px">list</span>
+                <span class="nav-label">All Projects</span>
+              </li>
               <li class="nav-item sub-item" data-page="project-details">
+                <span class="material-icons-outlined" style="font-size:18px">dashboard</span>
                 <span class="nav-label">Project Details</span>
               </li>
             </ul>
+          </li>
+
+          <!-- Calendar -->
+          <li class="nav-item" data-page="calendar">
+            <span class="material-icons-outlined">calendar_today</span>
+            <span class="nav-label">Calendar</span>
           </li>
 
           <li class="nav-item" data-page="documents">
@@ -130,7 +153,8 @@
           <h1 class="header-page-title" id="headerPageTitle">Project Details</h1>
         </div>
         <div class="header-right">
-          <button class="btn-icon-only btn-chat-mobile" id="btnOpenChatMobile" aria-label="Open chat" title="Marshal AI Chat">
+          <button class="btn-icon-only btn-chat-mobile" id="btnOpenChatMobile" aria-label="Open chat"
+            title="Marshal AI Chat">
             <span class="material-icons-outlined">chat</span>
           </button>
           <button class="btn btn-secondary btn-sm" id="btnHeaderSettings">
@@ -202,7 +226,8 @@
             <span class="material-icons-outlined">attach_file</span>
           </button>
           <input type="file" id="chatFileInput" multiple accept="*/*" style="display:none">
-          <textarea id="chatInput" placeholder="Ask about your documents..." rows="1" aria-label="Type a message"></textarea>
+          <textarea id="chatInput" placeholder="Ask about your documents..." rows="1"
+            aria-label="Type a message"></textarea>
           <button class="btn-send" id="btnChatSend" aria-label="Send message">
             <span class="material-icons-outlined">send</span>
           </button>
@@ -318,4 +343,5 @@
   <script src="config.js"></script>
   <script src="app.js"></script>
 </body>
+
 </html>
