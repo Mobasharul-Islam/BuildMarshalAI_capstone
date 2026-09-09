@@ -1,0 +1,108 @@
+[33mcommit 2795ee994c453aac8e9345804ab048413333939e[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m
+Author: hm-aktaruzzaman-mukdho <aktaruzzamanmukdho@gmail.com>
+Date:   Thu Jul 2 22:13:56 2026 +0600
+
+    Added new dual-t4 working code for running the colpali models and the response generation qwen-vl model on t4 gpu.
+
+[33mcommit ebb62657d1cacdd4980c1cba2f0eda23400fa2f0[m
+Author: hm-aktaruzzaman-mukdho <aktaruzzamanmukdho@gmail.com>
+Date:   Mon Apr 6 02:28:06 2026 +0600
+
+    Added new notebook. Using athrael-soju/colqwen3.5-4.5B-v3
+    
+    -> For colpali using athrael-soju/colqwen3.5-4.5B-v3
+    -> For response generation using Qwen3.5-9B
+    -> Not using any other api keys.
+    
+    Performs significantly better than other colpali models, very accurate
+    doccument extraction. ALso qwen3.5 performs very good response
+    generation.
+
+[33mcommit d643abdb504e423e0f307915ca97ef63b63f2c90[m
+Author: hm-aktaruzzaman-mukdho <aktaruzzamanmukdho@gmail.com>
+Date:   Mon Apr 6 01:29:33 2026 +0600
+
+    -> Added colpali model vidore/colpali-v1.2 and vidore/colqwen2.5-v0.2 in the backend code in two seperate notebooks
+    
+    -> No api key is being used yet.
+    -> Just using qwen-2.5-VL-7b for response generation in from the doccument images.
+    -> Directly providing the images and the query to the VL model for response.
+    -> Not providing the entire doccuments"
+
+[33mcommit 4f150d65ae5d21aa821835562967fd2abe9eb575[m
+Author: Ahtasham Haque <2105067@ugrad.cse.buet.ac.bd>
+Date:   Mon Apr 6 00:52:23 2026 +0600
+
+    Chat panel drag-to-resize via left edge handle
+    
+    - Added invisible 6px resize handle on the left edge of the chat panel
+    - Drag left to widen (up to 700px), drag right to narrow (down to 280px)
+    - Blue accent line appears on hover to hint at the draggable edge
+    - Width persisted to localStorage and restored on reload
+    - CSS transition disabled during drag for real-time smooth feedback
+    - Resize handle hidden on tablet/mobile where chat is a fixed overlay
+    - Touch support included (touchstart/touchmove/touchend)
+
+[33mcommit 69474d116646d891614b8920d436fedbb003e627[m
+Author: Ahtasham Haque <2105067@ugrad.cse.buet.ac.bd>
+Date:   Mon Apr 6 00:27:48 2026 +0600
+
+    Chat session management: new chat, history panel, switch/delete chats
+    
+    - Added New Chat button (add_comment icon) to create fresh conversations
+    - Added Chat History button (history icon) with slide-down panel
+    - History panel shows all chats sorted newest-first with title, message count, date
+    - Click to switch between chat sessions, hover-reveal delete button per chat
+    - deleteChat() auto-switches to next chat or creates new if none left
+    - Chat state persisted in localStorage across reloads
+    - renderChatHistory() called on init/create/delete/switch for consistent state
+    - Fixed CSS specificity for hide-mobile utility class (lint fix)
+
+[33mcommit 18ff2b07ef43c3b207e63e753359c19bf308dc73[m
+Author: Ahtasham Haque <2105067@ugrad.cse.buet.ac.bd>
+Date:   Sun Apr 5 23:16:17 2026 +0600
+
+    Responsive UI: document preview, audio support, scalable chat, mobile layout
+    
+    - Document preview modal: PDF pages, images, audio player, video player
+    - Documents page: card grid layout with preview/delete actions
+    - Chat: auto-resizing textarea, file attachments strip, suggestion chips
+    - Audio/video file upload support (mp3, wav, ogg, m4a, mp4, etc.)
+    - Fully responsive: 3 breakpoints (1200px tablet, 768px mobile, 480px small)
+    - Mobile: sidebar slide-over with overlay, full-screen chat, hamburger menu
+    - Chat panel hides on tablet/mobile with toggle button in header
+    - All file types supported for upload and indexing
+
+[33mcommit 2cbe3692d028eaa30aa66d7f2d9e48f0ccde36cc[m
+Author: Ahtasham Haque <2105067@ugrad.cse.buet.ac.bd>
+Date:   Sun Apr 5 11:58:22 2026 +0600
+
+    updated url
+
+[33mcommit 5e9c0b45acdce43413200b909c19a4bf0e0d3727[m
+Author: Ahtasham Haque <2105067@ugrad.cse.buet.ac.bd>
+Date:   Sun Apr 5 11:55:52 2026 +0600
+
+    Clean up: remove demo data and unused features
+    
+    - Removed all mock/demo data (Tanvir Test, Pan Pacific, fake photos, etc.)
+    - Kept only backend-powered features: Project Details, Trades, Vendors, Documents, Chat
+    - All CRUD operations now hit real backend API endpoints
+    - Added connection banner when backend is not configured
+    - Settings accessible from sidebar and header
+    - Empty states prompt user to connect backend
+
+[33mcommit ce8514b32325305d399d3d547974b14f42687d95[m
+Author: Ahtasham Haque <2105067@ugrad.cse.buet.ac.bd>
+Date:   Sun Apr 5 11:40:49 2026 +0600
+
+    Complete BuildMarshal UI redesign - Project management dashboard with AI chat panel
+    
+    - Redesigned frontend to match BuildMarshal.ai production UI
+    - Light theme with professional color palette
+    - 3-column layout: sidebar navigation, content area, chat panel
+    - Pages: Project Details, Trades, Vendors, Documents, Photos
+    - CRUD operations for trades, vendors, team members
+    - Marshal AI chat panel with streaming support
+    - Backend: Added management API endpoints (trades, vendors, team-members)
+    - Vercel deployment config for fast hosting

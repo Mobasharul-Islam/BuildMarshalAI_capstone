@@ -1,0 +1,14 @@
+# CLIProxyAPI configuration for local BuildMarshalAI development.
+# Copy this file to a private location (for example
+# %USERPROFILE%\.cli-proxy-api\config.yaml) and replace the API key.
+
+host: "127.0.0.1"
+port: 8317
+
+# This protects the local OpenAI-compatible endpoint. Do not commit the real key.
+api-keys:
+  - "replace-with-a-long-random-local-key"
+
+# OAuth credentials are created by `cli-proxy-api.exe --antigravity-login` and
+# stored in CLIProxyAPI's auth directory. They do not belong in this file.
+

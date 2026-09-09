@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="description"
+    content="BuildMarshal — AI-powered construction project management platform with document intelligence.">
+  <meta name="theme-color" content="#1e293b">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>BuildMarshal — Construction Project Management</title>
+  <link rel="icon"
+    href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><defs><linearGradient id='g' x1='0%25' y1='0%25' x2='100%25' y2='100%25'><stop offset='0%25' style='stop-color:%2322c55e'/><stop offset='100%25' style='stop-color:%2316a34a'/></linearGradient></defs><rect rx='20' width='100' height='100' fill='url(%23g)'/><text x='50' y='68' font-size='50' font-weight='900' fill='white' text-anchor='middle' font-family='sans-serif'>BM</text></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
+    rel="stylesheet">
+  <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Outlined" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css?v=20260908-todo">
+</head>
+
+<body>
+  <div class="app-layout" id="appLayout">
+
+    <!-- ═══ MOBILE OVERLAY ═══ -->
+    <div class="sidebar-overlay" id="sidebarOverlay"></div>
+
+    <!-- ═══ LEFT SIDEBAR ═══ -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-logo">
+        <div class="logo-icon">
+          <svg viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect width="40" height="40" rx="8" fill="#22c55e" />
+            <path d="M12 20.5L17.5 26L28 15" stroke="white" stroke-width="3" stroke-linecap="round"
+              stroke-linejoin="round" />
+          </svg>
+        </div>
+        <div class="logo-text">
+          <span class="logo-build">BUILD</span>
+          <span class="logo-marshal">MARSHAL</span>
+        </div>
+        <button class="btn-icon-only sidebar-close-mobile" id="btnCloseSidebar" aria-label="Close sidebar">
+          <span class="material-icons-outlined">close</span>
+        </button>
+      </div>
+
+      <nav class="sidebar-nav" id="sidebarNav">
+        <ul class="nav-list">
+          <li class="nav-item" data-page="marshal-chat">
+            <span class="material-icons-outlined">smart_toy</span>
+            <span class="nav-label">Marshal Chat</span>
+          </li>
+
+          <!-- Tasks -->
+          <li class="nav-item" data-page="tasks">
+            <span class="material-icons-outlined">task_alt</span>
+            <span class="nav-label">Tasks</span>
+          </li>
+
+          <!-- To-do lists -->
+          <li class="nav-item" data-page="todo-lists">
+            <span class="material-icons-outlined">checklist</span>
+            <span class="nav-label">To-Do Lists</span>
+          </li>
+
+          <!-- Projects -->
+          <li class="nav-group" id="navGroupProjects">
+            <div class="nav-group-header" data-group="projects">
+              <span class="material-icons-outlined">folder</span>
+              <span class="nav-label">Projects</span>
+              <span class="material-icons-outlined nav-chevron">expand_more</span>
+            </div>
+            <ul class="nav-sublist" id="projectsSubmenu">
+              <li class="nav-item sub-item" data-page="all-projects">
+                <span class="material-icons-outlined" style="font-size:18px">list</span>
+                <span class="nav-label">All Projects</span>
+              </li>
+              <li class="nav-item sub-item" data-page="project-details">
+                <span class="material-icons-outlined" style="font-size:18px">dashboard</span>
+                <span class="nav-label">Project Details</span>
+              </li>
+            </ul>
+          </li>
+
+          <!-- Calendar -->
+          <li class="nav-item" data-page="calendar">
+            <span class="material-icons-outlined">calendar_today</span>
+            <span class="nav-label">Calendar</span>
+          </li>
+
+          <li class="nav-item" data-page="documents">
+            <span class="material-icons-outlined">description</span>
+            <span class="nav-label">Documents</span>
+            <span class="nav-badge" id="docCountBadge" style="display:none">0</span>
+          </li>
+
+          <li class="nav-item" data-page="google-workspace">
+            <span class="material-icons-outlined">cloud_sync</span>
+            <span class="nav-label">Google Workspace</span>
+          </li>
+
+          <li class="nav-item" data-page="microsoft-workspace">
+            <span class="material-icons-outlined">window</span>
+            <span class="nav-label">Microsoft 365</span>
+          </li>
+
+          <!-- Company Settings -->
+          <li class="nav-group">
+            <div class="nav-group-header" data-group="companySettings">
+              <span class="material-icons-outlined">settings</span>
+              <span class="nav-label">Company Settings</span>
+              <span class="material-icons-outlined nav-chevron">expand_more</span>
+            </div>
+            <ul class="nav-sublist" id="companySettingsSubmenu">
+              <li class="nav-item sub-item" data-page="company-info">
+                <span class="material-icons-outlined" style="font-size:18px">business</span>
+                <span class="nav-label">Company Info</span>
+              </li>
+              <li class="nav-item sub-item" data-page="trades">
+                <span class="material-icons-outlined" style="font-size:18px">swap_horiz</span>
+                <span class="nav-label">Trades</span>
+              </li>
+              <li class="nav-item sub-item" data-page="vendors">
+                <span class="nav-label">External Companies</span>
+              </li>
+              <li class="nav-item sub-item" data-page="project-types">
+                <span class="nav-label">Project Types</span>
+              </li>
+              <li class="nav-item sub-item" data-page="task-types">
+                <span class="nav-label">Task Types</span>
+              </li>
+              <li class="nav-item sub-item" data-page="user-roles">
+                <span class="nav-label">User Roles</span>
+              </li>
+              <li class="nav-item sub-item" data-page="users">
+                <span class="material-icons-outlined" style="font-size:18px">person</span>
+                <span class="nav-label">User</span>
+              </li>
+              <li class="nav-item sub-item" data-page="contact">
+                <span class="material-icons-outlined" style="font-size:18px">contacts</span>
+                <span class="nav-label">Contact</span>
+              </li>
+              <li class="nav-item sub-item" data-page="my-feedback">
+                <span class="material-icons-outlined" style="font-size:18px">feedback</span>
+                <span class="nav-label">My Feedback</span>
+              </li>
+            </ul>
+          </li>
+        </ul>
+
+        <div class="sidebar-bottom">
+          <div class="nav-item" id="btnOpenSettings">
+            <span class="material-icons-outlined">tune</span>
+            <span class="nav-label">Settings</span>
+          </div>
+          <div class="nav-item" id="connectionStatusNav">
+            <span class="status-dot disconnected" id="statusDotNav"></span>
+            <span class="nav-label" id="statusTextNav">Disconnected</span>
+          </div>
+        </div>
+      </nav>
+    </aside>
+
+    <!-- ═══ MAIN AREA ═══ -->
+    <div class="main-area">
+      <header class="top-header" id="topHeader">
+        <div class="header-left">
+          <button class="btn-icon-only btn-sidebar-toggle" id="btnSidebarToggle" aria-label="Toggle sidebar">
+            <span class="material-icons-outlined">menu</span>
+          </button>
+          <h1 class="header-page-title" id="headerPageTitle">Project Details</h1>
+        </div>
+        <div class="header-right">
+          <button class="btn-icon-only btn-chat-mobile" id="btnOpenChatMobile" aria-label="Open chat"
+            title="Marshal AI Chat">
+            <span class="material-icons-outlined">chat</span>
+          </button>
+          <div class="notif-wrap">
+            <button class="btn-icon-only" id="btnNotifications" aria-label="Notifications"
+              aria-haspopup="true" aria-expanded="false" title="Upcoming deadlines">
+              <span class="material-icons-outlined">notifications</span>
+              <span class="notif-badge" id="notifBadge" hidden></span>
+            </button>
+            <div class="notif-panel" id="notifPanel" role="dialog" aria-label="Upcoming deadlines" hidden></div>
+          </div>
+          <button class="btn btn-secondary btn-sm" id="btnHeaderSettings">
+            <span class="material-icons-outlined" style="font-size:18px">settings</span>
+            <span class="btn-label-desktop">Settings</span>
+          </button>
+          <div class="user-profile-header" id="userProfileHeader"></div>
+        </div>
+      </header>
+
+      <main class="content-area" id="contentArea">
+        <!-- Dynamic content rendered by JS -->
+      </main>
+    </div>
+
+    <!-- ═══ RIGHT CHAT PANEL ═══ -->
+    <aside class="chat-panel" id="chatPanel">
+      <div class="chat-resize-handle" id="chatResizeHandle" title="Drag to resize"></div>
+      <div class="chat-panel-header">
+        <div class="chat-panel-title">
+          <div class="marshal-avatar">
+            <span class="material-icons-outlined">smart_toy</span>
+          </div>
+          <div>
+            <div class="marshal-name">Marshal</div>
+            <div class="marshal-status">
+              <span class="status-dot disconnected" id="statusDot"></span>
+              <span id="statusText">Disconnected</span>
+            </div>
+          </div>
+        </div>
+        <div class="chat-header-actions">
+          <button class="btn-icon-only" id="btnChatHistory" aria-label="Chat history" title="Chat history">
+            <span class="material-icons-outlined">history</span>
+          </button>
+          <button class="btn-icon-only" id="btnNewChat" aria-label="New chat" title="New chat">
+            <span class="material-icons-outlined">add_comment</span>
+          </button>
+          <button class="btn-icon-only" id="btnExportChat" aria-label="Export to PDF" title="Export to PDF">
+            <span class="material-icons-outlined">picture_as_pdf</span>
+          </button>
+          <button class="btn-icon-only chat-panel-toggle" id="btnToggleChat" aria-label="Close chat panel">
+            <span class="material-icons-outlined">close</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Chat History Panel (slide-down) -->
+      <div class="chat-history-panel" id="chatHistoryPanel">
+        <div class="chat-history-header">
+          <span>Chat History</span>
+          <button class="btn-icon-only" id="btnCloseHistory" aria-label="Close history">
+            <span class="material-icons-outlined" style="font-size:18px">close</span>
+          </button>
+        </div>
+        <div class="chat-history-list" id="chatHistoryList">
+          <!-- Rendered by JS -->
+        </div>
+      </div>
+
+      <div class="chat-panel-messages" id="chatMessages">
+        <!-- Messages rendered by JS -->
+      </div>
+
+      <!-- File attachment preview strip -->
+      <div class="chat-attachments" id="chatAttachments" style="display:none">
+        <!-- Attached files shown here before sending -->
+      </div>
+
+      <div class="chat-panel-input">
+        <div class="chat-input-row">
+          <button class="btn-icon-only" id="btnChatAttach" aria-label="Attach file" title="Upload document/audio/image">
+            <span class="material-icons-outlined">attach_file</span>
+          </button>
+          <input type="file" id="chatFileInput" multiple accept="*/*" style="display:none">
+          <button class="btn-icon-only btn-voice" id="btnVoiceInput" aria-label="Record voice message"
+            title="Record voice message">
+            <span class="material-icons-outlined">mic</span>
+          </button>
+          <textarea id="chatInput" placeholder="Ask about your documents..." rows="1"
+            aria-label="Type a message"></textarea>
+          <button class="btn-send" id="btnChatSend" aria-label="Send message">
+            <span class="material-icons-outlined">send</span>
+          </button>
+        </div>
+      </div>
+    </aside>
+    <div class="chat-overlay" id="chatOverlay"></div>
+
+    <!-- ═══ MODALS ═══ -->
+
+    <!-- Settings Modal -->
+    <div class="modal-overlay" id="settingsModal">
+      <div class="modal">
+        <div class="modal-header">
+          <h2>⚙ Backend Settings</h2>
+          <button class="btn-icon-only modal-close" id="btnCloseSettings" aria-label="Close">
+            <span class="material-icons-outlined">close</span>
+          </button>
+        </div>
+        <div class="modal-body">
+          <div class="form-group">
+            <label class="form-label" for="apiUrlInput">Backend URL</label>
+            <input type="url" class="form-input" id="apiUrlInput" placeholder="http://127.0.0.1:8000" />
+            <div class="form-hint">Use the local URL printed by the CLIProxyAPI notebook, or its ngrok URL when enabled.</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="voiceApiUrlInput">Voice Service URL (Ngrok)</label>
+            <input type="url" class="form-input" id="voiceApiUrlInput" placeholder="https://xxxx-voice.ngrok-free.app" />
+            <div class="form-hint">Paste the URL printed by the separate Whisper notebook.</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="modelSelect">Gemini Model</label>
+            <select class="form-input" id="modelSelect">
+              <option value="gemini-3.7-flash-high">Gemini 3.7 Flash High (CLIProxyAPI)</option>
+              <option value="auto">Auto-select available Gemini Flash</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="topKInput">Retrieval Top-K</label>
+            <input type="number" class="form-input" id="topKInput" value="5" min="1" max="20" />
+            <div class="form-hint">Number of document pages to retrieve per query (1-20).</div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="btnCancelSettings">Cancel</button>
+          <button class="btn btn-primary" id="btnSaveSettings">Save Changes</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- CRUD Modal -->
+    <div class="modal-overlay" id="crudModal">
+      <div class="modal">
+        <div class="modal-header">
+          <h2 id="crudModalTitle">Create</h2>
+          <button class="btn-icon-only modal-close" id="btnCloseCrud" aria-label="Close">
+            <span class="material-icons-outlined">close</span>
+          </button>
+        </div>
+        <div class="modal-body" id="crudModalBody"></div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="btnCancelCrud">Cancel</button>
+          <button class="btn btn-primary" id="btnSaveCrud">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Document Preview Modal -->
+    <div class="modal-overlay" id="docPreviewModal">
+      <div class="modal modal-lg">
+        <div class="modal-header">
+          <h2 id="docPreviewTitle">Document Preview</h2>
+          <button class="btn-icon-only modal-close" id="btnCloseDocPreview" aria-label="Close">
+            <span class="material-icons-outlined">close</span>
+          </button>
+        </div>
+        <div class="modal-body doc-preview-body" id="docPreviewBody">
+          <!-- Preview content rendered dynamically -->
+        </div>
+      </div>
+    </div>
+
+    <!-- Exact-page Evidence Viewer -->
+    <div class="modal-overlay" id="evidenceModal">
+      <div class="modal evidence-modal" role="dialog" aria-modal="true" aria-labelledby="evidenceTitle">
+        <div class="modal-header evidence-modal-header">
+          <div>
+            <div class="evidence-eyebrow">Verified evidence</div>
+            <h2 id="evidenceTitle">Source page</h2>
+            <div class="evidence-subtitle" id="evidenceSubtitle"></div>
+          </div>
+          <button class="btn-icon-only modal-close" id="btnCloseEvidence" aria-label="Close evidence viewer">
+            <span class="material-icons-outlined">close</span>
+          </button>
+        </div>
+        <div class="modal-body evidence-body" id="evidenceBody">
+          <div class="preview-loading"><div class="typing-indicator"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div><p>Loading evidence…</p></div>
+        </div>
+        <div class="evidence-footer">
+          <span>Was this page useful for the answer?</span>
+          <div class="evidence-feedback-actions">
+            <button class="btn btn-secondary evidence-feedback-btn" data-rating="relevant"><span class="material-icons-outlined">thumb_up</span> Relevant</button>
+            <button class="btn btn-secondary evidence-feedback-btn" data-rating="not_relevant"><span class="material-icons-outlined">thumb_down</span> Not relevant</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Image Preview -->
+    <div class="image-preview-overlay" id="imagePreviewOverlay">
+      <button class="btn-icon-only image-preview-close" aria-label="Close preview">
+        <span class="material-icons-outlined">close</span>
+      </button>
+      <img id="imagePreviewImg" src="" alt="Preview" />
+    </div>
+
+    <!-- Upload Panel -->
+    <div class="upload-panel-overlay" id="uploadPanelOverlay"></div>
+    <aside class="upload-panel" id="uploadPanel">
+      <div class="upload-panel-header">
+        <h2>📁 Upload Files</h2>
+        <button class="btn-icon-only" id="btnCloseUploadPanel" aria-label="Close">
+          <span class="material-icons-outlined">close</span>
+        </button>
+      </div>
+      <div class="drop-zone" id="dropZone">
+        <input type="file" id="fileInput" multiple accept="*/*" />
+        <span class="material-icons-outlined drop-zone-icon">cloud_upload</span>
+        <div class="drop-zone-text">Drop files here or click to browse</div>
+        <div class="drop-zone-hint">PDF, Excel, Word, Images, Audio — up to 50MB each</div>
+      </div>
+      <div class="document-list" id="documentList">
+        <div class="document-list-header">
+          <span>Indexed Documents</span>
+          <span id="docTotalCount">0 files</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Toast Notifications -->
+    <div class="toast-container" id="toastContainer"></div>
+  </div>
+
+  <!-- ═══ AUTHENTICATION GATE ═══ -->
+  <div class="auth-gate" id="authGate" role="dialog" aria-modal="true" aria-labelledby="authGateHeading">
+    <div class="auth-gate-panel">
+      <div class="auth-gate-brand">
+        <div class="logo-icon">
+          <svg viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect width="40" height="40" rx="8" fill="#22c55e" />
+            <path d="M12 20.5L17.5 26L28 15" stroke="white" stroke-width="3" stroke-linecap="round"
+              stroke-linejoin="round" />
+          </svg>
+        </div>
+        <div class="logo-text">
+          <span class="logo-build">BUILD</span>
+          <span class="logo-marshal">MARSHAL</span>
+        </div>
+      </div>
+      <h1 class="auth-gate-heading" id="authGateHeading">Sign in to your workspace</h1>
+      <p class="auth-gate-subheading">Every account keeps its own documents, index, projects, settings, and
+        conversations.</p>
+
+      <div class="auth-tabs" role="tablist">
+        <button class="auth-tab active" id="tabBtnSignIn" role="tab" aria-selected="true">Sign in</button>
+        <button class="auth-tab" id="tabBtnSignUp" role="tab" aria-selected="false">Create account</button>
+      </div>
+
+      <form class="auth-form" id="formSignIn" autocomplete="on">
+        <div class="form-group">
+          <label class="form-label" for="signInEmail">Email</label>
+          <input class="form-input" type="email" id="signInEmail" autocomplete="username" required
+            placeholder="you@company.com">
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="signInPassword">Password</label>
+          <input class="form-input" type="password" id="signInPassword" autocomplete="current-password" required
+            placeholder="Your password">
+        </div>
+        <div class="auth-error" id="signInError" role="alert"></div>
+        <div class="auth-form-footer">
+          <button class="btn btn-primary btn-block" type="submit" id="btnSignInSubmit">Sign in</button>
+          <div class="auth-switch-text">No account yet? <a href="#" id="linkSwitchToSignUp">Create one</a></div>
+        </div>
+      </form>
+
+      <form class="auth-form" id="formSignUp" style="display:none" autocomplete="on">
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" for="signUpName">Your name</label>
+            <input class="form-input" type="text" id="signUpName" autocomplete="name" required placeholder="Jane Engineer">
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="signUpAccount">Workspace name</label>
+            <input class="form-input" type="text" id="signUpAccount" placeholder="Apex Structures">
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="signUpEmail">Email</label>
+          <input class="form-input" type="email" id="signUpEmail" autocomplete="username" required
+            placeholder="you@company.com">
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" for="signUpPassword">Password</label>
+            <input class="form-input" type="password" id="signUpPassword" autocomplete="new-password" required
+              minlength="8" placeholder="At least 8 characters">
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="signUpConfirm">Confirm password</label>
+            <input class="form-input" type="password" id="signUpConfirm" autocomplete="new-password" required
+              minlength="8" placeholder="Repeat password">
+          </div>
+        </div>
+        <div class="auth-error" id="signUpError" role="alert"></div>
+        <div class="auth-form-footer">
+          <button class="btn btn-primary btn-block" type="submit" id="btnSignUpSubmit">Create account</button>
+          <div class="auth-switch-text">Already have an account? <a href="#" id="linkSwitchToSignIn">Sign in</a></div>
+        </div>
+      </form>
+
+      <div class="auth-gate-backend">
+        <label class="form-label" for="authApiUrlInput">Backend URL</label>
+        <input class="form-input" type="url" id="authApiUrlInput" placeholder="http://127.0.0.1:8000">
+        <div class="form-hint">Change this only if the backend is not on the default local address.</div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <script src="config.js"></script>
+  <script src="app.js?v=20260908-todo"></script>
+</body>
+
+</html>

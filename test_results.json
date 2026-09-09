@@ -1,0 +1,758 @@
+[
+  {
+    "module": "0. Session",
+    "name": "Authenticate Primary Account",
+    "status": "PASSED",
+    "duration_ms": 238.9,
+    "details": "Account: Legacy Workspace | User: Administrator"
+  },
+  {
+    "module": "0. Session",
+    "name": "Anonymous Requests Rejected",
+    "status": "PASSED",
+    "duration_ms": 47.2,
+    "details": "5 account-scoped endpoints refuse anonymous callers"
+  },
+  {
+    "module": "1. System Health",
+    "name": "Backend & GPU Health Check",
+    "status": "PASSED",
+    "duration_ms": 20.0,
+    "details": "GPU: NVIDIA GeForce RTX 3070 Laptop GPU, Chroma Pages: 52"
+  },
+  {
+    "module": "1. System Health",
+    "name": "CLIProxyAPI Gemini Connectivity",
+    "status": "PASSED",
+    "duration_ms": 9.8,
+    "details": "Proxy OK: None, Model: None"
+  },
+  {
+    "module": "1. System Health",
+    "name": "ChromaDB Vector Store Inspection",
+    "status": "PASSED",
+    "duration_ms": 8.4,
+    "details": "Total Indexed Pages: 52"
+  },
+  {
+    "module": "2. Ingestion",
+    "name": "Upload & Index PDF with ColPali",
+    "status": "PASSED",
+    "duration_ms": 1646.1,
+    "details": "Indexed Doc ID: test_doc_1788888555, Pages: 1"
+  },
+  {
+    "module": "2. Ingestion",
+    "name": "List Indexed Documents",
+    "status": "PASSED",
+    "duration_ms": 21.5,
+    "details": "Document Count: 12, Name Preserved: Test_Foundation_Spec.pdf"
+  },
+  {
+    "module": "3. RAG Chatbot",
+    "name": "ColPali Multi-Vector Retrieval & Gemini Generation",
+    "status": "PASSED",
+    "duration_ms": 5297.5,
+    "details": "Response Length: 357 chars, Sources: 3"
+  },
+  {
+    "module": "3. RAG Chatbot",
+    "name": "Export Chat Transcript to PDF",
+    "status": "PASSED",
+    "duration_ms": 36.5,
+    "details": "Generated Chat PDF Size: 1276 bytes"
+  },
+  {
+    "module": "4. Evidence & Feedback",
+    "name": "Fetch High-Res Page Evidence & Metadata",
+    "status": "PASSED",
+    "duration_ms": 6.0,
+    "details": "Evidence Doc: Test_Foundation_Spec.pdf, Endpoint: /api/pages/test_doc_1788888555/1"
+  },
+  {
+    "module": "4. Evidence & Feedback",
+    "name": "Submit Active Learning Retrieval Feedback",
+    "status": "PASSED",
+    "duration_ms": 9.0,
+    "details": "Feedback Saved ID: 0e21c3d7c86a4362bca40c806a02d72f"
+  },
+  {
+    "module": "4. Evidence & Feedback",
+    "name": "Inspect Feedback Analytics & Accuracy Stats",
+    "status": "PASSED",
+    "duration_ms": 14.0,
+    "details": "Feedback Metrics: {'total': 34, 'relevant': 34, 'not_relevant': 0}"
+  },
+  {
+    "module": "5. Projects & Tasks",
+    "name": "Create New Project",
+    "status": "PASSED",
+    "duration_ms": 11.0,
+    "details": "Created Project ID: 1d13ace1-56e3-4e52-ac01-8d5102fa0b73"
+  },
+  {
+    "module": "5. Projects & Tasks",
+    "name": "Read Project Details",
+    "status": "PASSED",
+    "duration_ms": 12.0,
+    "details": "Project Name: Skyline Commercial Center, Manager: Alex Smith"
+  },
+  {
+    "module": "5. Projects & Tasks",
+    "name": "Create Project Task",
+    "status": "PASSED",
+    "duration_ms": 15.7,
+    "details": "Created Task ID: 113ad939-5bf4-4b05-a497-86a7e06cb734"
+  },
+  {
+    "module": "5. Projects & Tasks",
+    "name": "List Project Tasks",
+    "status": "PASSED",
+    "duration_ms": 14.0,
+    "details": "Task Count for Project: 1"
+  },
+  {
+    "module": "5. Projects & Tasks",
+    "name": "Update Task Status",
+    "status": "PASSED",
+    "duration_ms": 7.0,
+    "details": "Task Status updated to: Completed"
+  },
+  {
+    "module": "5. Projects & Tasks",
+    "name": "Task Record Keeps Every Field",
+    "status": "PASSED",
+    "duration_ms": 15.5,
+    "details": "Task stored with 11 fields"
+  },
+  {
+    "module": "5. Projects & Tasks",
+    "name": "Subtasks & Task Detail View",
+    "status": "PASSED",
+    "duration_ms": 50.0,
+    "details": "Subtask linked; 2 root task(s)"
+  },
+  {
+    "module": "5. Projects & Tasks",
+    "name": "Task Filters & Archive",
+    "status": "PASSED",
+    "duration_ms": 66.2,
+    "details": "Name filter and archive round-trip work"
+  },
+  {
+    "module": "5. Projects & Tasks",
+    "name": "Task Validation Rejects Bad Input",
+    "status": "PASSED",
+    "duration_ms": 45.2,
+    "details": "Blank name, bad status, self-parent, and reversed times all rejected"
+  },
+  {
+    "module": "5. Projects & Tasks",
+    "name": "Task Types Directory",
+    "status": "PASSED",
+    "duration_ms": 14.3,
+    "details": "Task types: ['Task (workspace default)', 'Phase', 'Inspection']"
+  },
+  {
+    "module": "5. Projects & Tasks",
+    "name": "Project People, Cost, Timeline & Procurement",
+    "status": "PASSED",
+    "duration_ms": 158.2,
+    "details": "People, cost (total 1250.0), timeline, and procurement all work"
+  },
+  {
+    "module": "5. Projects & Tasks",
+    "name": "Project Delete Clears Its Data",
+    "status": "PASSED",
+    "duration_ms": 181.3,
+    "details": "Deleting a project clears its tasks and procurement"
+  },
+  {
+    "module": "6. AI Doc Generation",
+    "name": "List Construction Templates",
+    "status": "PASSED",
+    "duration_ms": 4.0,
+    "details": "Available Templates: ['Tender Summary', 'Project Brief', 'Schedule Summary', 'Addendum Summary']"
+  },
+  {
+    "module": "6. AI Doc Generation",
+    "name": "Upload Project Source PDF",
+    "status": "PASSED",
+    "duration_ms": 810.1,
+    "details": "Indexed project source src_1788888562 (tender_addendum, 1 page(s))"
+  },
+  {
+    "module": "6. AI Doc Generation",
+    "name": "List Project Source Documents",
+    "status": "PASSED",
+    "duration_ms": 14.0,
+    "details": "Project Sources: 1"
+  },
+  {
+    "module": "6. AI Doc Generation",
+    "name": "Synthesize & Generate AI Construction Report",
+    "status": "PASSED",
+    "duration_ms": 51544.4,
+    "details": "Generated Report ID: 7f6d3f7f5b704adc, Title: Tender Summary - Skyline Commercial Center, Cited Pages: 1"
+  },
+  {
+    "module": "6. AI Doc Generation",
+    "name": "Download Generated PDF Document",
+    "status": "PASSED",
+    "duration_ms": 44.3,
+    "details": "Downloaded AI Report Size: 80628 bytes"
+  },
+  {
+    "module": "6. AI Doc Generation",
+    "name": "Project Overview PDF Export",
+    "status": "PASSED",
+    "duration_ms": 47.5,
+    "details": "Project Overview PDF Size: 1441 bytes"
+  },
+  {
+    "module": "7. Company & Trades",
+    "name": "Trades Directory & Custom Trade Registration",
+    "status": "PASSED",
+    "duration_ms": 26.0,
+    "details": "Total Trades: 15"
+  },
+  {
+    "module": "7. Company & Trades",
+    "name": "External Companies / Vendors Management",
+    "status": "PASSED",
+    "duration_ms": 48.5,
+    "details": "Created vendor Apex Structural Concrete Ltd"
+  },
+  {
+    "module": "7. Company & Trades",
+    "name": "Internal Team Directory",
+    "status": "PASSED",
+    "duration_ms": 37.0,
+    "details": "Team Members Count: 2"
+  },
+  {
+    "module": "7. Company & Trades",
+    "name": "User Accounts Directory",
+    "status": "PASSED",
+    "duration_ms": 22.4,
+    "details": "Users Count: 13"
+  },
+  {
+    "module": "8. Google Workspace",
+    "name": "Google OAuth Configuration & Scopes",
+    "status": "PASSED",
+    "duration_ms": 4.0,
+    "details": "Google Client ID: 870570684817-oul9n3b5uetmjbcci5of1no8h7b4anpn.apps.googleusercontent.com, Scopes: 8"
+  },
+  {
+    "module": "8. Google Workspace",
+    "name": "Connected Google Account Tokens",
+    "status": "PASSED",
+    "duration_ms": 5.0,
+    "details": "Connected Account: viakuda324@gmail.com (ID: f6aebbcc9e94204dcdba)"
+  },
+  {
+    "module": "8. Google Workspace",
+    "name": "Google Drive File Indexing & Listing",
+    "status": "FAILED",
+    "duration_ms": 570.6,
+    "error": "Expected 200, got 401: {'detail': 'Google authorization expired; reconnect this account'}"
+  },
+  {
+    "module": "8. Google Workspace",
+    "name": "Google Calendar Events & Schedule",
+    "status": "FAILED",
+    "duration_ms": 640.3,
+    "error": "Expected 200, got 401: {'detail': 'Google authorization expired; reconnect this account'}"
+  },
+  {
+    "module": "8. Google Workspace",
+    "name": "Gmail Message Listing",
+    "status": "FAILED",
+    "duration_ms": 584.3,
+    "error": "Expected 200, got 401: {'detail': 'Google authorization expired; reconnect this account'}"
+  },
+  {
+    "module": "8. Google Workspace",
+    "name": "AI Email Composition (no send)",
+    "status": "PASSED",
+    "duration_ms": 6209.1,
+    "details": "Generated Email Subject: Confirmation Request: Upcoming Rebar Inspection Date"
+  },
+  {
+    "module": "8. Google Workspace",
+    "name": "Gmail Draft/Send Require Confirmation",
+    "status": "PASSED",
+    "duration_ms": 17.0,
+    "details": "Gmail draft and send both refuse to act without explicit confirmation"
+  },
+  {
+    "module": "8. Google Workspace",
+    "name": "Task-to-Calendar Requires Confirmation",
+    "status": "PASSED",
+    "duration_ms": 6.6,
+    "details": "Calendar proposal returned for review: Pour Level 1 Foundation Slab"
+  },
+  {
+    "module": "8. Google Workspace",
+    "name": "Calendar Assistant Proposal (no write)",
+    "status": "PASSED",
+    "duration_ms": 4250.5,
+    "details": "Assistant proposal supported=True"
+  },
+  {
+    "module": "8. Google Workspace",
+    "name": "Meet: Incomplete Request Asks A Question",
+    "status": "FAILED",
+    "duration_ms": 566.4,
+    "error": "Expected 200, got 401: {'detail': 'Google authorization expired; reconnect this account'}"
+  },
+  {
+    "module": "8. Google Workspace",
+    "name": "Meet: Proposal Before Creation",
+    "status": "FAILED",
+    "duration_ms": 532.5,
+    "error": "Expected 200, got 401: {'detail': 'Google authorization expired; reconnect this account'}"
+  },
+  {
+    "module": "8. Google Workspace",
+    "name": "Meet: Invalid Attendees Rejected",
+    "status": "FAILED",
+    "duration_ms": 565.8,
+    "error": "Expected 200, got 401: {'detail': 'Google authorization expired; reconnect this account'}"
+  },
+  {
+    "module": "8b. Microsoft 365",
+    "name": "Graph OAuth Configuration & Scopes",
+    "status": "PASSED",
+    "duration_ms": 4.0,
+    "details": "Configured: True, Tenant: consumers"
+  },
+  {
+    "module": "8b. Microsoft 365",
+    "name": "Connected Microsoft Account Tokens",
+    "status": "PASSED",
+    "duration_ms": 2.0,
+    "details": "Connected Microsoft accounts: 0"
+  },
+  {
+    "module": "8b. Microsoft 365",
+    "name": "OAuth Entry Points Are Guarded",
+    "status": "PASSED",
+    "duration_ms": 10.5,
+    "details": "OAuth start and code exchange require a session, an allowed origin, and a known state"
+  },
+  {
+    "module": "8b. Microsoft 365",
+    "name": "OneDrive File Listing",
+    "status": "PASSED",
+    "duration_ms": 0.0,
+    "details": "Skipped (no Microsoft account connected)"
+  },
+  {
+    "module": "8b. Microsoft 365",
+    "name": "Outlook Mail Listing",
+    "status": "PASSED",
+    "duration_ms": 0.0,
+    "details": "Skipped (no Microsoft account connected)"
+  },
+  {
+    "module": "8b. Microsoft 365",
+    "name": "Outlook Calendar Events",
+    "status": "PASSED",
+    "duration_ms": 0.0,
+    "details": "Skipped (no Microsoft account connected)"
+  },
+  {
+    "module": "8b. Microsoft 365",
+    "name": "Outlook Writes Require Confirmation",
+    "status": "PASSED",
+    "duration_ms": 0.0,
+    "details": "Skipped (no Microsoft account connected)"
+  },
+  {
+    "module": "9. Authentication",
+    "name": "Signed-In Session Identity",
+    "status": "PASSED",
+    "duration_ms": 3.0,
+    "details": "Session belongs to account 'Legacy Workspace'"
+  },
+  {
+    "module": "9. Authentication",
+    "name": "New Account Registration (/api/auth/register)",
+    "status": "PASSED",
+    "duration_ms": 188.6,
+    "details": "Created account 'Apex Structures' owned by test_engineer_1788888629@buildmarshal.com"
+  },
+  {
+    "module": "9. Authentication",
+    "name": "Duplicate Email Conflict Prevention",
+    "status": "PASSED",
+    "duration_ms": 3.0,
+    "details": "Duplicate email rejected with HTTP 409"
+  },
+  {
+    "module": "9. Authentication",
+    "name": "Weak Password Rejection",
+    "status": "PASSED",
+    "duration_ms": 1.0,
+    "details": "Passwords under 8 characters rejected with HTTP 422"
+  },
+  {
+    "module": "9. Authentication",
+    "name": "Invalid Password Authentication Rejection",
+    "status": "PASSED",
+    "duration_ms": 111.1,
+    "details": "Invalid password rejected with HTTP 401"
+  },
+  {
+    "module": "9. Authentication",
+    "name": "Registered User Session Login",
+    "status": "PASSED",
+    "duration_ms": 105.0,
+    "details": "New User Logged In: Jane Engineer (Super Admin)"
+  },
+  {
+    "module": "9. Authentication",
+    "name": "User Id Is Not A Credential",
+    "status": "PASSED",
+    "duration_ms": 29.0,
+    "details": "User ids and forged tokens are both rejected with HTTP 401"
+  },
+  {
+    "module": "9. Authentication",
+    "name": "Logout Revokes Session Token",
+    "status": "PASSED",
+    "duration_ms": 167.4,
+    "details": "Logout revokes the session token immediately"
+  },
+  {
+    "module": "9. Authentication",
+    "name": "Self-Service Profile Update",
+    "status": "PASSED",
+    "duration_ms": 22.0,
+    "details": "Profile updated for test_engineer_1788888629@buildmarshal.com"
+  },
+  {
+    "module": "9. Authentication",
+    "name": "Password Change Revokes Sessions",
+    "status": "PASSED",
+    "duration_ms": 794.9,
+    "details": "Password rotated; all prior sessions revoked"
+  },
+  {
+    "module": "9. Authentication",
+    "name": "Wrong Current Password Rejected",
+    "status": "PASSED",
+    "duration_ms": 153.4,
+    "details": "A wrong current password is rejected with HTTP 403"
+  },
+  {
+    "module": "10. Isolation",
+    "name": "New Account Starts Empty",
+    "status": "PASSED",
+    "duration_ms": 87.6,
+    "details": "New account starts with empty documents, projects, index, and history"
+  },
+  {
+    "module": "10. Isolation",
+    "name": "Documents, Pages & Evidence Are Private",
+    "status": "PASSED",
+    "duration_ms": 23.1,
+    "details": "Documents, page images, and evidence are unreachable across accounts"
+  },
+  {
+    "module": "10. Isolation",
+    "name": "Projects & Tasks Are Private",
+    "status": "PASSED",
+    "duration_ms": 11.0,
+    "details": "Projects and tasks are unreachable across accounts"
+  },
+  {
+    "module": "10. Isolation",
+    "name": "Task Detail & Edit Are Private",
+    "status": "PASSED",
+    "duration_ms": 11.0,
+    "details": "Task detail, edit, and delete are all private to the owning account"
+  },
+  {
+    "module": "10. Isolation",
+    "name": "Vector Retrieval Cannot Cross Accounts",
+    "status": "PASSED",
+    "duration_ms": 5381.1,
+    "details": "Retrieval in an empty account returns no pages from the populated one"
+  },
+  {
+    "module": "10. Isolation",
+    "name": "Settings & Member Directory Are Private",
+    "status": "PASSED",
+    "duration_ms": 76.9,
+    "details": "Settings and member directories are per-account"
+  },
+  {
+    "module": "10. Isolation",
+    "name": "Company Data & Generated Documents Are Private",
+    "status": "PASSED",
+    "duration_ms": 89.6,
+    "details": "Company data and generated documents do not cross accounts"
+  },
+  {
+    "module": "10. Isolation",
+    "name": "Connected Google Accounts Are Private",
+    "status": "PASSED",
+    "duration_ms": 2.0,
+    "details": "Connected Google accounts are scoped to the account that added them"
+  },
+  {
+    "module": "10. Isolation",
+    "name": "Project Sources & Generation Are Private",
+    "status": "PASSED",
+    "duration_ms": 44.9,
+    "details": "Project source documents and generation are private to the owning account"
+  },
+  {
+    "module": "10. Isolation",
+    "name": "Google Account Ids Do Not Cross Accounts",
+    "status": "PASSED",
+    "duration_ms": 60.4,
+    "details": "Another account's Google account id is rejected for Drive, Calendar, Gmail, and imports"
+  },
+  {
+    "module": "10. Isolation",
+    "name": "OAuth Code Exchange Is Guarded",
+    "status": "PASSED",
+    "duration_ms": 18.1,
+    "details": "OAuth code exchange requires a session, the CSRF header, and an allowed origin"
+  },
+  {
+    "module": "10. Isolation",
+    "name": "Microsoft Accounts Are Private",
+    "status": "PASSED",
+    "duration_ms": 12.4,
+    "details": "Microsoft accounts and their ids do not cross BuildMarshal accounts"
+  },
+  {
+    "module": "10. Isolation",
+    "name": "Meet Scheduling Respects Account Isolation",
+    "status": "PASSED",
+    "duration_ms": 2.0,
+    "details": "Meet scheduling refuses another account's Google connection"
+  },
+  {
+    "module": "12. Company Settings",
+    "name": "Member Account For Permission Checks",
+    "status": "PASSED",
+    "duration_ms": 155.0,
+    "details": "Member signed in to the same account with role User"
+  },
+  {
+    "module": "12. Company Settings",
+    "name": "Company Info Read & Edit",
+    "status": "PASSED",
+    "duration_ms": 37.0,
+    "details": "Company profile reads back what was saved"
+  },
+  {
+    "module": "12. Company Settings",
+    "name": "Company Info Validation",
+    "status": "PASSED",
+    "duration_ms": 26.0,
+    "details": "Blank names, bad emails and scheme-less websites are refused"
+  },
+  {
+    "module": "12. Company Settings",
+    "name": "Company Info Is Read-Only For Members",
+    "status": "PASSED",
+    "duration_ms": 30.0,
+    "details": "A member may read the company but the server refuses their writes"
+  },
+  {
+    "module": "12. Company Settings",
+    "name": "Task & Project Types CRUD",
+    "status": "PASSED",
+    "duration_ms": 133.2,
+    "details": "Administrators can list, add and edit both catalogs"
+  },
+  {
+    "module": "12. Company Settings",
+    "name": "Type Catalogs Reject Duplicates",
+    "status": "PASSED",
+    "duration_ms": 41.0,
+    "details": "Duplicate and blank names are refused in both catalogs"
+  },
+  {
+    "module": "12. Company Settings",
+    "name": "Type Catalogs Are Read-Only For Members",
+    "status": "PASSED",
+    "duration_ms": 55.2,
+    "details": "Members may list both catalogs but every write is refused"
+  },
+  {
+    "module": "12. Company Settings",
+    "name": "A Type In Use Cannot Be Deleted",
+    "status": "PASSED",
+    "duration_ms": 77.5,
+    "details": "A type in use is refused with a reason; an unused one deletes"
+  },
+  {
+    "module": "12. Company Settings",
+    "name": "Calendar Creation Requires Confirmation",
+    "status": "PASSED",
+    "duration_ms": 10.7,
+    "details": "Unconfirmed creates on google, microsoft return a proposal and write nothing"
+  },
+  {
+    "module": "12. Company Settings",
+    "name": "Teams Scheduling Respects Isolation",
+    "status": "PASSED",
+    "duration_ms": 4.0,
+    "details": "Teams scheduling resolves accounts through the caller's workspace only"
+  },
+  {
+    "module": "12. Company Settings",
+    "name": "Company Settings Are Account-Isolated",
+    "status": "PASSED",
+    "duration_ms": 7.1,
+    "details": "Company profile and catalogs stay inside their own account"
+  },
+  {
+    "module": "13. Roles & Costs",
+    "name": "Roles Come From The Account",
+    "status": "PASSED",
+    "duration_ms": 40.5,
+    "details": "Unknown roles refused; \"Project Manager\" accepted"
+  },
+  {
+    "module": "13. Roles & Costs",
+    "name": "Cost Permission Fixture",
+    "status": "PASSED",
+    "duration_ms": 71.7,
+    "details": "Project with one task per assignee"
+  },
+  {
+    "module": "13. Roles & Costs",
+    "name": "Administrator May Set Project Costs",
+    "status": "PASSED",
+    "duration_ms": 44.0,
+    "details": "An account administrator may set the baseline and add costs"
+  },
+  {
+    "module": "13. Roles & Costs",
+    "name": "Member Refused On Project Costs",
+    "status": "PASSED",
+    "duration_ms": 59.6,
+    "details": "A member is refused on the baseline and on additional costs"
+  },
+  {
+    "module": "13. Roles & Costs",
+    "name": "Member Told Which Task Costs Are Theirs",
+    "status": "PASSED",
+    "duration_ms": 20.0,
+    "details": "The breakdown reports exactly which task costs this user may set"
+  },
+  {
+    "module": "13. Roles & Costs",
+    "name": "Assignee May Price Their Own Task",
+    "status": "PASSED",
+    "duration_ms": 8.0,
+    "details": "The assigned user set the cost of their own task"
+  },
+  {
+    "module": "13. Roles & Costs",
+    "name": "Member Refused On Another's Task Cost",
+    "status": "PASSED",
+    "duration_ms": 28.1,
+    "details": "Only the cost is restricted; the rest of the task is not"
+  },
+  {
+    "module": "13. Roles & Costs",
+    "name": "Unchanged Cost Is Not A Change",
+    "status": "PASSED",
+    "duration_ms": 37.5,
+    "details": "Re-sending the existing cost is not a permission error"
+  },
+  {
+    "module": "13. Roles & Costs",
+    "name": "Task Costs Roll Into The Total",
+    "status": "PASSED",
+    "duration_ms": 17.0,
+    "details": "Total 54250.0 = baseline + additional + task costs"
+  },
+  {
+    "module": "14. User Roles",
+    "name": "Permission Catalogue Is Served",
+    "status": "PASSED",
+    "duration_ms": 4.0,
+    "details": "25 permissions across 6 groups"
+  },
+  {
+    "module": "14. User Roles",
+    "name": "Built-in Roles Listed And Locked",
+    "status": "PASSED",
+    "duration_ms": 6.0,
+    "details": "Super Admin and System Admin are present and not editable"
+  },
+  {
+    "module": "14. User Roles",
+    "name": "Super Admin Creates A Scoped Role",
+    "status": "PASSED",
+    "duration_ms": 7.0,
+    "details": "Created \"Scoped 1788888637\" with 1 permission; the bogus key was dropped"
+  },
+  {
+    "module": "14. User Roles",
+    "name": "Built-in, Duplicate & Blank Names Refused",
+    "status": "PASSED",
+    "duration_ms": 93.3,
+    "details": "Built-in names, duplicates, and blanks are all refused"
+  },
+  {
+    "module": "14. User Roles",
+    "name": "User Created With A Custom Role",
+    "status": "PASSED",
+    "duration_ms": 173.9,
+    "details": "Signed in holding \"Scoped 1788888637\""
+  },
+  {
+    "module": "14. User Roles",
+    "name": "Scoped Role Enforced Field By Field",
+    "status": "PASSED",
+    "duration_ms": 144.4,
+    "details": "Granted field allowed; every ungranted action refused"
+  },
+  {
+    "module": "14. User Roles",
+    "name": "Role Management Is Super Admin Only",
+    "status": "PASSED",
+    "duration_ms": 52.3,
+    "details": "Roles are readable by all and writable only by a Super Admin"
+  },
+  {
+    "module": "14. User Roles",
+    "name": "Editing A Role Reaches Its Holders",
+    "status": "PASSED",
+    "duration_ms": 101.0,
+    "details": "A permission granted on the role took effect immediately"
+  },
+  {
+    "module": "14. User Roles",
+    "name": "A Role In Use Cannot Be Deleted",
+    "status": "PASSED",
+    "duration_ms": 16.0,
+    "details": "A role someone still holds is refused with a reason"
+  },
+  {
+    "module": "14. User Roles",
+    "name": "Roles Are Account-Isolated",
+    "status": "PASSED",
+    "duration_ms": 6.0,
+    "details": "Roles stay inside the account that created them"
+  },
+  {
+    "module": "11. Cleanup",
+    "name": "Teardown Test Artifacts",
+    "status": "PASSED",
+    "duration_ms": 365.1,
+    "details": "Cleaned up temporary test artifacts and the isolation test account"
+  }
+]

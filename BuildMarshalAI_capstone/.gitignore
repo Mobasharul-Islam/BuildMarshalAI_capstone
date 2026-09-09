@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+.venv-gpu/
+ENV/
+
+# Testing & Cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local BuildMarshal Runtime & Model Weights (offline models, ChromaDB, uploaded files)
+.buildmarshal_runtime/
+*.sqlite
+*.db
+
+# Temporary & Log files
+tmp/
+*.log
+
+# Test & Validation Output
+output/
+
+# Local Backups
+backend/backup/
+backend/rollback_backups/
+*.bak
+
+# Environment variables & secrets
+.env
+.env.*
+secrets/
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

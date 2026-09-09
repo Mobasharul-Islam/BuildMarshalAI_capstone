@@ -1,0 +1,48 @@
+# BuildMarshalAI local runtime (Python 3.13)
+# CUDA PyTorch and torchvision are installed separately by CREATE-ENVIRONMENT.ps1.
+
+# ColPali visual retrieval
+accelerate==1.14.0
+colpali_engine==0.3.1
+peft==0.20.0
+safetensors==0.8.0
+torchao==0.18.0
+transformers==4.57.6
+
+# Backend and persistence
+chromadb==1.5.9
+fastapi==0.115.6
+nest-asyncio==1.6.0
+python-multipart==0.0.20
+uvicorn[standard]==0.34.0
+
+# Google Workspace OAuth, Drive, Gmail, and Calendar
+cryptography==45.0.5
+google-api-python-client==2.176.0
+google-auth==2.40.3
+google-auth-httplib2==0.4.1
+requests-oauthlib==2.0.0
+
+# Documents, images, and report generation
+fpdf2==2.8.1
+openpyxl==3.1.5
+pandas==2.2.3
+pillow==11.1.0
+pymupdf==1.28.2
+pypdf==5.7.0
+python-docx==1.1.2
+reportlab==4.4.3
+
+# Notebook, HTTP clients, tests, and utilities
+httpx==0.28.1
+huggingface_hub==0.36.2
+ipykernel==7.3.0
+ipython==9.16.1
+nbclient==0.11.0
+nbformat==5.11.1
+numpy==2.5.2
+pyngrok==7.2.2
+pytest==9.1.1
+requests==2.34.2
+tqdm==4.70.0
+

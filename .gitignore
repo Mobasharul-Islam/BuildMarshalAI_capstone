@@ -1,0 +1,59 @@
+# Credentials and Secrets
+secrets/
+google-oauth/
+cliproxyapi/auth/
+cliproxyapi/config.yaml
+.env
+.env.*
+
+# Executables & Binaries
+*.exe
+cliproxyapi/*.exe
+
+# Runtime Data, Offline Model Weights, ChromaDB & SQLite
+.buildmarshal_runtime/
+**/.buildmarshal_runtime/
+*.sqlite
+*.db
+
+# Python Virtual Environments
+.venv*/
+venv/
+env/
+**/.venv*/
+
+# Python Caches & Compiled Files
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Testing & Cache
+.pytest_cache/
+**/.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs and Temporary files
+tmp/
+**/tmp/
+*.log
+
+# Outputs & Backups
+output/
+**/output/
+backup/
+**/backup/
+rollback_backups/
+**/rollback_backups/
+*.bak
+
+# Scratch scripts
+scratch/
+
+# OS & Editor Files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

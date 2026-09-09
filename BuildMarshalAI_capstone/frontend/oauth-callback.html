@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Finishing sign-in — BuildMarshal</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: #f8fafc;
+      color: #0f172a;
+    }
+
+    .panel {
+      max-width: 380px;
+      padding: 28px;
+      text-align: center;
+      background: #ffffff;
+      border: 1px solid #e5e7eb;
+      border-radius: 14px;
+      box-shadow: 0 10px 25px -10px rgba(0, 0, 0, 0.2);
+    }
+
+    h1 { margin: 0 0 8px; font-size: 17px; }
+    p { margin: 0; font-size: 13px; line-height: 1.5; color: #475569; }
+    .error { color: #b91c1c; }
+  </style>
+</head>
+
+<body>
+  <div class="panel">
+    <h1 id="heading">Finishing sign-in…</h1>
+    <p id="detail">You can close this window if it does not close on its own.</p>
+  </div>
+
+  <script>
+    // The Microsoft popup lands here with ?code=&state= (or an error). Hand the
+    // values back to the window that opened it and close.
+    //
+    // The authorization code is single-use and is redeemed server-side with the
+    // client secret and PKCE verifier, so it is only ever posted to this exact
+    // origin — never to a wildcard target.
+    (function () {
+      var params = new URLSearchParams(window.location.search);
+      var payload = {
+        source: 'buildmarshal-oauth',
+        provider: params.get('provider') || 'microsoft',
+        code: params.get('code') || '',
+        state: params.get('state') || '',
+        error: params.get('error') || '',
+        errorDescription: params.get('error_description') || ''
+      };
+
+      if (payload.error) {
+        document.getElementById('heading').textContent = 'Sign-in failed';
+        document.getElementById('heading').className = 'error';
+        document.getElementById('detail').textContent =
+          payload.errorDescription || payload.error;
+      }
+
+      try {
+        if (window.opener && !window.opener.closed) {
+          window.opener.postMessage(payload, window.location.origin);
+          if (!payload.error) { window.close(); }
+        } else {
+          document.getElementById('heading').textContent = 'Sign-in window lost';
+          document.getElementById('detail').textContent =
+            'Close this window and start the connection again from BuildMarshal.';
+        }
+      } catch (e) {
+        document.getElementById('heading').textContent = 'Sign-in could not complete';
+        document.getElementById('detail').textContent = e.message;
+      }
+    })();
+  </script>
+</body>
+
+</html>
