@@ -254,6 +254,7 @@ class AccountWorkspace:
         self.company_file = self.root / "company.json"
         self.roles_file = self.root / "user_roles.json"
         self.conversations_file = self.root / "conversations.json"
+        self.onboarding_file = self.root / "onboarding.json"
         self.evidence_file = self.root / "evidence_feedback.json"
         self.generated_registry = self.root / "generated_documents.json"
         self.google_store_file = self.root / "google_workspace_accounts.enc"
@@ -397,6 +398,14 @@ class AccountWorkspace:
 
     def save_conversations(self, data: Mapping[str, Any]) -> None:
         write_json(self.conversations_file, data)
+
+    def load_onboarding(self) -> dict[str, Any]:
+        """Onboarding drafts, keyed by draft id."""
+        data = read_json(self.onboarding_file, {})
+        return data if isinstance(data, dict) else {}
+
+    def save_onboarding(self, data: Mapping[str, Any]) -> None:
+        write_json(self.onboarding_file, data)
 
     def delete(self) -> None:
         self.close_index()

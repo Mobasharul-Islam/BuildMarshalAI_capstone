@@ -433,6 +433,12 @@ class PdfDocumentRenderer:
                 self.font_name, self.bold_font_name = family, f"{family}-Bold"
                 break
 
+    #: What the cover and footer say a document is grounded in.  A document
+    #: generated from source PDFs cites them; a report generated from the
+    #: workspace's own records cites those, so callers may say which.
+    EVIDENCE_POLICY = "Only project-linked source PDFs; citations identify document and page."
+    FOOTER_NOTE = "BuildMarshalAI - evidence-grounded project document"
+
     def render(
         self,
         output_path: str | Path,
@@ -441,6 +447,8 @@ class PdfDocumentRenderer:
         project: Mapping[str, Any],
         sections: Sequence[SectionResult],
         generated_at: str,
+        evidence_policy: str | None = None,
+        footer_note: str | None = None,
     ) -> None:
         from reportlab.lib import colors
         from reportlab.lib.enums import TA_CENTER
@@ -482,7 +490,7 @@ class PdfDocumentRenderer:
             ["Project", str(project.get("name") or project.get("id") or "Not specified")],
             ["Project code", str(project.get("project_code") or "Not specified")],
             ["Generated", generated_at],
-            ["Evidence policy", "Only project-linked source PDFs; citations identify document and page."],
+            ["Evidence policy", evidence_policy or self.EVIDENCE_POLICY],
         ]
         metadata_table = Table(
             [[Paragraph(f"<b>{html.escape(k)}</b>", body), Paragraph(html.escape(v), body)] for k, v in project_rows],
@@ -556,7 +564,7 @@ class PdfDocumentRenderer:
             canvas.line(18 * mm, 12 * mm, page_size[0] - 18 * mm, 12 * mm)
             canvas.setFont(self.font_name, 7.5)
             canvas.setFillColor(muted)
-            canvas.drawString(18 * mm, 8 * mm, "BuildMarshalAI - evidence-grounded project document")
+            canvas.drawString(18 * mm, 8 * mm, footer_note or self.FOOTER_NOTE)
             canvas.drawRightString(page_size[0] - 18 * mm, 8 * mm, f"Page {document.page}")
             canvas.restoreState()
 

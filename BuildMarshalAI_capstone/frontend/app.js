@@ -32,6 +32,9 @@
     voiceStream: null,
     voiceChunks: [],
     voiceStopTimer: null,
+    // Which box a dictated phrase lands in, and which button shows the
+    // recording state. Defaults to the chat composer.
+    voiceTarget: null,
     // One slice per connected-workspace provider; see WORKSPACE_PROVIDERS.
     providers: {},
     activeWorkspaceProvider: 'google',
@@ -47,11 +50,18 @@
     // The to-do list being composed: its filters, the preview the server
     // returned, and whether a send is awaiting confirmation.
     todo: null,
+    // The onboarding draft being built from uploaded documents, and the
+    // step of the flow on screen. Nothing here is live data.
+    onboarding: null,
     // Company Settings catalogs and profile, with whether this user may edit
     // them. The server decides; this only chooses what to draw.
     catalogsEditable: false,
     company: null,
     projectTab: null,
+    // Computed project figures, the report built from them, and what the
+    // document store costs. All read-only views over server-side numbers.
+    stats: null,
+    storage: null,
     calendar: null,
     // Deadline notifications: open state and the poll that keeps "next two
     // days" true as the clock moves.
@@ -309,15 +319,28 @@
   }
 
   // ═══ Voice input (separate Whisper service) ═══
+  /** The box a dictated phrase lands in: the chat composer unless another asked. */
+  function voiceInput() {
+    const target = state.voiceTarget && $(`#${state.voiceTarget.inputId}`);
+    return target || DOM.chatInput;
+  }
+
+  function voiceButton() {
+    const target = state.voiceTarget && $(`#${state.voiceTarget.buttonId}`);
+    return target || DOM.btnVoiceInput;
+  }
+
   function setVoiceButton(mode) {
-    if (!DOM.btnVoiceInput) return;
-    const icon = DOM.btnVoiceInput.querySelector('.material-icons-outlined');
-    DOM.btnVoiceInput.classList.toggle('recording', mode === 'recording');
-    DOM.btnVoiceInput.classList.toggle('transcribing', mode === 'transcribing');
-    DOM.btnVoiceInput.disabled = mode === 'transcribing';
+    const button = voiceButton();
+    if (!button) return;
+    const icon = button.querySelector('.material-icons-outlined');
+    button.classList.toggle('recording', mode === 'recording');
+    button.classList.toggle('transcribing', mode === 'transcribing');
+    button.disabled = mode === 'transcribing';
     if (icon) icon.textContent = mode === 'recording' ? 'stop' : (mode === 'transcribing' ? 'hourglass_top' : 'mic');
-    DOM.btnVoiceInput.title = mode === 'recording' ? 'Stop recording' : (mode === 'transcribing' ? 'Transcribing…' : 'Record voice message');
-    DOM.btnVoiceInput.setAttribute('aria-label', DOM.btnVoiceInput.title);
+    button.title = mode === 'recording' ? 'Stop recording' : (mode === 'transcribing' ? 'Transcribing…' : 'Record voice message');
+    button.setAttribute('aria-label', button.title);
+    if (mode === 'idle') state.voiceTarget = null;
   }
 
   function stopVoiceTracks() {
@@ -346,9 +369,10 @@
       if (!response.ok) throw new Error(data.detail || `Voice API error: ${response.status}`);
       const transcript = (data.text || '').trim();
       if (!transcript) throw new Error('No speech was detected. Please try again closer to the microphone.');
-      DOM.chatInput.value = `${DOM.chatInput.value.trim()}${DOM.chatInput.value.trim() ? ' ' : ''}${transcript}`;
-      autoResize(DOM.chatInput);
-      DOM.chatInput.focus();
+      const target = voiceInput();
+      target.value = `${target.value.trim()}${target.value.trim() ? ' ' : ''}${transcript}`;
+      if (target === DOM.chatInput) autoResize(target);
+      target.focus();
       const language = data.language ? ` (${String(data.language).toUpperCase()})` : '';
       showToast(`Voice transcribed${language}. Review it, then press Send.`, 'success', 5000);
     } finally {
@@ -525,6 +549,7 @@
     'company-info': 'Company Info', 'project-types': 'Project Types',
     'user-roles': 'User Roles', 'todo-lists': 'To-Do Lists',
     'task-types': 'Task Types', 'tasks': 'Tasks', 'calendar': 'Calendar',
+    'onboarding': 'Project Onboarding',
     'account': 'My Account'
   };
 
@@ -544,6 +569,10 @@
   }
 
   function updateNavGroups() {
+    // Onboarding creates projects, people, types, and roles, so it is offered
+    // only to administrators. The API refuses everyone else regardless.
+    const onboardingNav = $('#navOnboarding');
+    if (onboardingNav) onboardingNav.hidden = !isAccountAdmin();
     document.querySelectorAll('.nav-group').forEach(g => {
       const hdr = g.querySelector('.nav-group-header');
       const key = hdr?.dataset.group;
@@ -559,7 +588,9 @@
       case 'project-details': renderProjectDashboard(state.activeProjectId); break;
       case 'trades': DOM.contentArea.innerHTML = renderTradesPage(); break;
       case 'vendors': DOM.contentArea.innerHTML = renderVendorsPage(); break;
-      case 'documents': DOM.contentArea.innerHTML = renderDocumentsPage(); break;
+      case 'documents':
+        DOM.contentArea.innerHTML = renderDocumentsPage() + renderStoragePanel();
+        break;
       case 'google-workspace': DOM.contentArea.innerHTML = renderWorkspacePage('google'); break;
       case 'microsoft-workspace': DOM.contentArea.innerHTML = renderWorkspacePage('microsoft'); break;
       case 'marshal-chat': DOM.contentArea.innerHTML = renderChatFullPage(); showChat(); break;
@@ -573,6 +604,7 @@
       case 'task-types': DOM.contentArea.innerHTML = renderTypeCatalogPage('task'); break;
       case 'user-roles': DOM.contentArea.innerHTML = renderUserRolesPage(); break;
       case 'todo-lists': DOM.contentArea.innerHTML = renderTodoListPage(); break;
+      case 'onboarding': DOM.contentArea.innerHTML = renderOnboardingPage(); break;
       case 'project-types': DOM.contentArea.innerHTML = renderTypeCatalogPage('project'); break;
       case 'contact': case 'my-feedback':
         DOM.contentArea.innerHTML = `<div class="empty-state"><span class="material-icons-outlined">construction</span><h3>${PAGE_TITLES[page] || page}</h3><p>This section is coming soon.</p></div>`; break;
@@ -586,6 +618,16 @@
       fetchCompany().finally(() => { state._companyLoading = false; renderPage(); });
     }
     if (page === 'todo-lists' && !todoState().loaded && !todoState().loading) refreshTodoPreview();
+    if (page === 'documents' && !storageState().data && !storageState().loading
+        && getApiUrl() && state.session) loadStorage();
+    if (page === 'onboarding' && isAccountAdmin() && !onboarding().loaded && !onboarding().loading
+        && getApiUrl() && state.session) {
+      fetchOnboardingDrafts().then(() => { if (state.currentPage === 'onboarding') renderPage(); });
+    }
+    // The role editor reuses the permission catalogue, so make sure it is there.
+    if (page === 'onboarding' && !state.permissionGroups.length && getApiUrl() && state.session) {
+      fetchPermissionCatalogue();
+    }
     if (page === 'user-roles' && !state.permissionGroups.length && getApiUrl() && state.session) {
       fetchPermissionCatalogue().then(() => { if (state.currentPage === 'user-roles') renderPage(); });
     }
@@ -1350,6 +1392,7 @@
           <button class="btn btn-ghost btn-sm" data-action="edit-project" data-id="${p.id}"><span class="material-icons-outlined">edit</span> Edit</button>
           <button class="btn btn-ghost btn-sm" data-action="upload-project-sources" data-id="${p.id}"><span class="material-icons-outlined">upload_file</span> Upload Sources</button>
           <button class="btn btn-ghost btn-sm" data-action="generate-report" data-id="${p.id}"><span class="material-icons-outlined">picture_as_pdf</span> Generate Doc</button>
+          <button class="btn btn-ghost btn-sm" data-action="project-report" data-id="${p.id}"><span class="material-icons-outlined">description</span> Report</button>
           <span class="badge ${p.status === 'Active' ? 'badge-active' : 'badge-inactive'} badge-lg">${esc(p.status)}</span>
           ${!p.archived
         ? `<button class="btn btn-ghost btn-sm" data-action="archive-project" data-id="${p.id}"><span class="material-icons-outlined">archive</span> Archive</button>`
@@ -1363,6 +1406,7 @@
         <button class="tab-btn ${activeTab === 'cost' ? 'active' : ''}" data-tab="cost">Cost</button>
         <button class="tab-btn ${activeTab === 'timeline' ? 'active' : ''}" data-tab="timeline">Timeline</button>
         <button class="tab-btn ${activeTab === 'procore' ? 'active' : ''}" data-tab="procore">Procurement</button>
+        <button class="tab-btn ${activeTab === 'stats' ? 'active' : ''}" data-tab="stats">Statistics</button>
       </div>
       <div class="project-dashboard-content" id="dashTabContent">
         ${activeTab === 'overview' ? renderDashOverview(p, tasksHtml) : renderDashTab(activeTab, p)}
@@ -2067,6 +2111,8 @@
     };
   }
 
+  const STATS_TAB = 'stats';
+
   const TAB_ENDPOINTS = {
     people: 'members', cost: 'costs', timeline: 'timeline', procore: 'procurement'
   };
@@ -2076,6 +2122,9 @@
   async function loadProjectTab(tab, projectId, { force = false } = {}) {
     const slice = projectTab();
     if (slice.projectId !== projectId) resetProjectTabData(projectId);
+    // Statistics is computed rather than fetched from a tab endpoint, and
+    // it carries its own slice so switching tabs does not discard it.
+    if (tab === STATS_TAB) { loadProjectStatistics(projectId); return; }
     const key = TAB_KEYS[tab];
     if (!key) return;
     if (!force && projectTab()[key]) return;
@@ -2105,6 +2154,7 @@
 
   function renderDashTab(tab, project) {
     const slice = projectTab();
+    if (tab === STATS_TAB) return renderStatsTab(project);
     if (slice.loading) return `<div class="empty-msg">Loading…</div>`;
     if (slice.error) {
       return `<div class="connection-banner warning"><span class="material-icons-outlined">warning</span>
@@ -2115,12 +2165,58 @@
     if (tab === 'cost') return renderCostTab(project);
     if (tab === 'timeline') return renderTimelineTab(project);
     if (tab === 'procore') return renderProcurementTab(project);
+    if (tab === STATS_TAB) return renderStatsTab(project);
     return '';
+  }
+
+  /** The symbols for the currency codes a project may be priced in. */
+  const CURRENCY_SYMBOLS = {
+    USD: '$', GBP: '£', EUR: '€', JPY: '¥', INR: '₹', ZAR: 'R',
+    BDT: '৳', PKR: 'Rs ', LKR: 'Rs ', NPR: 'Rs ',
+    CAD: 'CA$', AUD: 'A$', NZD: 'NZ$', AED: 'AED ', SAR: 'SAR ', SGD: 'S$'
+  };
+
+  /** The currency of the project on screen.
+   *
+   * A project carries its own currency, so a sterling job must not be
+   * reported in dollars. Away from a project there is nothing to read it
+   * from, and the account default stands.
+   */
+  function activeCurrency() {
+    const open = (state.projects || []).find(p => p.id === state.activeProjectId);
+    const code = String((open && open.currency) || '').toUpperCase();
+    return CURRENCY_SYMBOLS[code] ? code : 'USD';
+  }
+
+  function currencyMark() { return CURRENCY_SYMBOLS[activeCurrency()] || '$'; }
+
+  /** Currencies counted in lakh and crore rather than thousands and millions.
+   *
+   * ৳6,00,00,000 groups in twos after the first thousand and is spoken as
+   * “6 crore”, so both the separators and the abbreviation differ from the
+   * western scale — not a formatting preference, a different counting system.
+   */
+  const LAKH_CRORE = new Set(['BDT', 'INR', 'PKR', 'LKR', 'NPR']);
+
+  /** Group digits South Asian style: 6,00,00,000 rather than 600,000,000. */
+  function groupSouthAsian(value) {
+    const digits = String(Math.round(Math.abs(value)));
+    if (digits.length <= 3) return digits;
+    let head = digits.slice(0, -3);
+    const parts = [digits.slice(-3)];
+    while (head.length > 2) { parts.unshift(head.slice(-2)); head = head.slice(0, -2); }
+    if (head) parts.unshift(head);
+    return parts.join(',');
   }
 
   function money(value) {
     const amount = Number(value || 0);
-    return amount.toLocaleString(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
+    const code = activeCurrency();
+    if (LAKH_CRORE.has(code)) {
+      return `${amount < 0 ? '-' : ''}${CURRENCY_SYMBOLS[code]}${groupSouthAsian(amount)}`;
+    }
+    return amount.toLocaleString(undefined,
+      { style: 'currency', currency: code, maximumFractionDigits: 2 });
   }
 
   // ── People ────────────────────────────────────────────────────────────────
@@ -2472,6 +2568,7 @@
   // ── Tab events ────────────────────────────────────────────────────────────
 
   function bindDashTabEvents(tab, project) {
+    if (tab === STATS_TAB) { bindStatsEvents(project); return; }
     $$('[data-dash-refresh]').forEach(b => b.addEventListener('click', () =>
       loadProjectTab(b.dataset.dashRefresh, project.id, { force: true })));
     $$('[data-dash-retry]').forEach(b => b.addEventListener('click', () =>
@@ -3599,9 +3696,15 @@
   }
 
   // ── Project Modal (Create / Edit) ───────────────────────────────────────────
-  function openProjectModal(pid = null) {
-    const p = pid ? state.projects.find(x => x.id === pid) : null;
-    const title = p ? 'Edit Project' : 'New Project';
+  /** The project form.
+   *
+   * `seed` prefills a new project from something already understood -- a chat
+   * sentence, say -- and `missing` names the fields that still have to be
+   * filled, so the form can point at them instead of leaving them to be found.
+   */
+  function openProjectModal(pid = null, seed = null, missing = []) {
+    const p = pid ? state.projects.find(x => x.id === pid) : seed;
+    const title = pid ? 'Edit Project' : 'New Project';
     DOM.crudModalTitle.textContent = title;
     DOM.crudModalBody.innerHTML = `
       <div class="form-grid-2">
@@ -3675,6 +3778,28 @@
     DOM.btnSaveCrud.dataset.crudAction = pid ? 'save-edit-project' : 'save-new-project';
     DOM.btnSaveCrud.dataset.crudId = pid || '';
     DOM.crudModal.classList.add('open');
+    markMissingFields({ name: 'projFName', project_code: 'projFCode', manager: 'projFMgr',
+                        type: 'projFType', status: 'projFStatus', start_date: 'projFStart',
+                        end_date: 'projFEnd', description: 'projFDesc' }, missing);
+  }
+
+  /** Ring the fields still to be filled, and put the caret in the first.
+   *
+   * The form already says which fields are required; this says which ones are
+   * required *and still empty right now*, which is the only question the person
+   * in front of it has.
+   */
+  function markMissingFields(idsByField, missing) {
+    const wanted = (missing || []).map(row => (typeof row === 'string' ? row : row.name));
+    let first = null;
+    wanted.forEach(field => {
+      const element = idsByField[field] && $(`#${idsByField[field]}`);
+      if (!element) return;
+      element.classList.add('field-needed');
+      element.closest('.form-group')?.classList.add('is-needed');
+      if (!first) first = element;
+    });
+    if (first) setTimeout(() => first.focus(), 60);
   }
 
 
@@ -3839,6 +3964,8 @@
     const url = (DOM.authApiUrlInput && DOM.authApiUrlInput.value.trim()) || 'http://127.0.0.1:8000';
     APP_CONFIG.API_URL = url;
     localStorage.setItem(APP_CONFIG.STORAGE_KEYS.API_URL, url);
+    // Typed by hand, so it outranks the port the launcher announces.
+    localStorage.setItem('bmarshal_api_url_pinned', '1');
     return url;
   }
 
@@ -4367,21 +4494,22 @@
     applyUserFilters();
   }
 
-  function renderCreateUserPage() {
-    DOM.contentArea.innerHTML = `
-    <div class="user-form-page" >
-        <div class="page-header" style="margin-bottom:24px">
-          <h1 class="page-title">Create User</h1>
-        </div>
-        <div class="user-form-card">
+  /** The fields a new user is made of.
+   *
+   * One definition, used by the Create User page and by the dialog chat opens,
+   * so the two can never drift apart -- and the element ids are shared, so one
+   * submit function serves both.
+   */
+  function userFormFields(seed = null) {
+    return `
           <div class="user-form-grid">
             <div class="form-group">
               <label class="form-label required-label">Name</label>
-              <input class="form-input" id="ufName" placeholder="Full name">
+              <input class="form-input" id="ufName" placeholder="Full name" value="${esc(seed?.name || '')}">
             </div>
             <div class="form-group">
               <label class="form-label required-label">Email</label>
-              <input class="form-input" id="ufEmail" type="email" placeholder="email@example.com">
+              <input class="form-input" id="ufEmail" type="email" placeholder="email@example.com" value="${esc(seed?.email || '')}">
             </div>
             <div class="form-group">
               <label class="form-label required-label">Password</label>
@@ -4399,20 +4527,45 @@
             </div>
             <div class="form-group">
               <label class="form-label">Phone</label>
-              <input class="form-input" id="ufPhone" placeholder="Phone number">
+              <input class="form-input" id="ufPhone" placeholder="Phone number" value="${esc(seed?.phone || '')}">
             </div>
             <div class="form-group">
               <label class="form-label">Address</label>
-              <input class="form-input" id="ufAddress" placeholder="Address">
+              <input class="form-input" id="ufAddress" placeholder="Address" value="${esc(seed?.address || '')}">
             </div>
             <div class="form-group">
               <label class="form-label required-label">Role</label>
               <select class="form-input" id="ufRole">
                 <option value="">Select role...</option>
-                ${roleOptions()}
+                ${roleOptions(seed?.role || '')}
               </select>
             </div>
-          </div>
+          </div>`;
+  }
+
+  /** Show/hide on every password field currently on screen. */
+  function bindPasswordToggles() {
+    $$('.pw-toggle').forEach(button => {
+      if (button.dataset.bound) return;
+      button.dataset.bound = '1';
+      button.addEventListener('click', () => {
+        const field = button.previousElementSibling;
+        if (!field) return;
+        field.type = field.type === 'password' ? 'text' : 'password';
+        button.querySelector('span.material-icons-outlined').textContent =
+          field.type === 'password' ? 'visibility_off' : 'visibility';
+      });
+    });
+  }
+
+  function renderCreateUserPage() {
+    DOM.contentArea.innerHTML = `
+    <div class="user-form-page" >
+        <div class="page-header" style="margin-bottom:24px">
+          <h1 class="page-title">Create User</h1>
+        </div>
+        <div class="user-form-card">
+          ${userFormFields()}
           <div class="user-form-actions">
             <button class="btn btn-primary" id="btnCreateUserSubmit">Create</button>
             <button class="btn btn-secondary" id="btnCancelCreate">Cancel</button>
@@ -4421,7 +4574,7 @@
       </div> `;
   }
 
-  async function submitCreateUser() {
+  async function submitCreateUser({ onDone = null } = {}) {
     const name = $('#ufName')?.value.trim();
     const email = $('#ufEmail')?.value.trim();
     const pw = $('#ufPassword')?.value;
@@ -4445,7 +4598,8 @@
       });
       await fetchUsers();
       showToast('User created successfully', 'success');
-      navigateTo('users');
+      if (onDone) onDone({ name, email, role });
+      else navigateTo('users');
     } catch (err) { showToast(err.message, 'error'); }
   }
 
@@ -4600,6 +4754,8 @@
     $$('[data-type-delete]').forEach(el => el.addEventListener('click', () =>
       deleteCatalogEntry(el.dataset.typeDelete, el.dataset.id, el.dataset.name)));
     if (state.currentPage === 'todo-lists') bindTodoEvents();
+    if (state.currentPage === 'onboarding') bindOnboardingEvents();
+    if (state.currentPage === 'documents') bindStorageEvents();
     $('#btnCreateRole')?.addEventListener('click', () => openRoleModal(null));
     $$('[data-role-edit]').forEach(el => el.addEventListener('click', () =>
       openRoleModal(el.dataset.roleEdit)));
@@ -4620,15 +4776,7 @@
     const btnCancelCreate = $('#btnCancelCreate');
     if (btnCancelCreate) btnCancelCreate.addEventListener('click', () => navigateTo('users'));
 
-    // Password show/hide toggles
-    $$('.pw-toggle').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const inp = btn.previousElementSibling;
-        if (!inp) return;
-        inp.type = inp.type === 'password' ? 'text' : 'password';
-        btn.querySelector('span.material-icons-outlined').textContent = inp.type === 'password' ? 'visibility_off' : 'visibility';
-      });
-    });
+    bindPasswordToggles();
 
     // Edit user form
     const btnUpdateUser = $('#btnUpdateUser');
@@ -5123,6 +5271,10 @@
     else if (action === 'generate-report') {
       openDocumentGenerationModal(id);
     }
+    else if (action === 'project-report') {
+      const project = state.projects.find(row => row.id === id);
+      if (project) openReportModal(project);
+    }
     else if (action === 'upload-project-sources') {
       openUploadPanel(id);
     }
@@ -5363,16 +5515,2567 @@
   }
   function closeCrudModal() {
     DOM.crudModal.classList.remove('open'); crudCallback = null;
+    // The report dialog hides Save; every other user of this modal needs it.
+    DOM.btnSaveCrud.hidden = false;
     DOM.btnSaveCrud.textContent = 'Save';
     DOM.btnSaveCrud.disabled = false;
     delete DOM.btnSaveCrud.dataset.crudAction;
     delete DOM.btnSaveCrud.dataset.crudId;
   }
 
-  // ═══ Chat Panel ═══
-  function showChat() { DOM.chatPanel.classList.add('visible'); DOM.chatPanel.classList.remove('collapsed'); DOM.chatOverlay.classList.add('open'); }
-  function hideChat() { DOM.chatPanel.classList.remove('visible'); DOM.chatPanel.classList.add('collapsed'); DOM.chatOverlay.classList.remove('open'); }
-  function toggleChat() { DOM.chatPanel.classList.contains('visible') ? hideChat() : showChat(); }
+  /* ═══════════════════════════════════════════════════════════════════════
+     Project Onboarding
+
+     Read an existing project out of the documents it already has, correct
+     what the AI got wrong, choose what is real, and only then create it.
+
+     Everything before the final confirmation is a draft on the server; this
+     module never writes a project, task, user, type, or role directly.
+     ═══════════════════════════════════════════════════════════════════════ */
+
+  /* The entity definitions come from the server, so the mandatory fields this
+     page enforces are the ones the server enforces. Nothing about what a
+     project or a task is lives in this file. */
+  const ONBOARDING_ICONS = {
+    project: 'folder', task: 'task_alt', user: 'person',
+    task_type: 'label', project_type: 'category', role_type: 'badge',
+    trade: 'handyman', vendor: 'store',
+    project_cost: 'payments', task_cost: 'request_quote', procurement: 'local_shipping'
+  };
+
+  function onboardingSchema() {
+    return onboarding().schema;
+  }
+
+  function entitySpec(kind) {
+    return (onboardingSchema()?.byKind || {})[kind] || null;
+  }
+
+  function onboardingKinds() {
+    return onboardingSchema()?.order || [];
+  }
+
+  function kindLabel(kind, plural = false) {
+    const spec = entitySpec(kind);
+    if (!spec) return kind;
+    return plural ? spec.plural : spec.label;
+  }
+
+  function kindIcon(kind) {
+    return ONBOARDING_ICONS[kind] || 'inventory_2';
+  }
+
+  function onboarding() {
+    if (!state.onboarding) {
+      state.onboarding = {
+        loaded: false, loading: false, drafts: [],
+        draft: null, step: 1,
+        // The entity definitions and the live records a reference field
+        // may point at, both served by /api/onboarding/schema.
+        schema: null, schemaLoading: false,
+        instructions: '', pendingFiles: [], uploading: false, analyzing: false,
+        plan: null, planLoading: false, result: null, committing: false,
+        commandBusy: false, commandLog: [], collapsed: {}, busyItem: ''
+      };
+    }
+    return state.onboarding;
+  }
+
+  function onboardingItems(kind) {
+    const draft = onboarding().draft;
+    if (!draft) return [];
+    return draft.items.filter(item => !kind || item.kind === kind);
+  }
+
+  function onboardingItem(itemId) {
+    return (onboarding().draft?.items || []).find(item => item.id === itemId) || null;
+  }
+
+  // ── Server calls ────────────────────────────────────────────────────────
+
+  async function onboardingJson(path, options) {
+    const response = await apiReq(`/api/onboarding${path}`, options);
+    return response.json();
+  }
+
+  function onboardingBody(payload) {
+    return { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) };
+  }
+
+  function adoptDraft(view) {
+    const slice = onboarding();
+    slice.draft = view;
+    // Any plan or result on screen described the draft as it was.
+    slice.plan = null;
+    return view;
+  }
+
+  /**
+   * Load the entity definitions and the records a reference field can name.
+   *
+   * Re-read after a commit, because what was just created is now something
+   * the next draft can point at.
+   */
+  async function fetchOnboardingSchema() {
+    const slice = onboarding();
+    if (slice.schemaLoading) return;
+    slice.schemaLoading = true;
+    try {
+      const data = await onboardingJson('/schema');
+      slice.schema = {
+        entities: data.entities || [],
+        order: (data.entities || []).map(row => row.kind),
+        byKind: Object.fromEntries((data.entities || []).map(row => [row.kind, row])),
+        choices: data.choices || {},
+        permissions: data.permissions || []
+      };
+    } catch (error) {
+      showToast(`Could not load the entity definitions: ${error.message}`, 'error', 7000);
+    } finally {
+      slice.schemaLoading = false;
+    }
+  }
+
+  async function fetchOnboardingDrafts() {
+    const slice = onboarding();
+    slice.loading = true;
+    try {
+      const data = await onboardingJson('/drafts');
+      slice.drafts = data.drafts || [];
+      slice.loaded = true;
+    } catch (error) {
+      slice.drafts = [];
+      slice.loaded = true;
+      showToast(error.message, 'error');
+    } finally {
+      slice.loading = false;
+    }
+  }
+
+  async function createOnboardingDraft() {
+    const name = (prompt('Name this onboarding, so you can come back to it:', 'Project onboarding') || '').trim();
+    if (!name) return;
+    try {
+      const slice = onboarding();
+      if (!slice.schema) await fetchOnboardingSchema();
+      const view = await onboardingJson('/drafts', onboardingBody({ name }));
+      adoptDraft(view);
+      slice.step = 1;
+      slice.result = null;
+      slice.commandLog = [];
+      await fetchOnboardingDrafts();
+      renderPage();
+    } catch (error) { showToast(error.message, 'error'); }
+  }
+
+  async function openOnboardingDraft(draftId) {
+    const slice = onboarding();
+    if (!slice.schema) await fetchOnboardingSchema();
+    try {
+      const view = await onboardingJson(`/drafts/${draftId}`);
+      adoptDraft(view);
+      slice.result = view.status === 'committed' ? view.commit : null;
+      slice.commandLog = [];
+      slice.step = view.status === 'committed' ? 3 : (view.summary.total ? 2 : 1);
+      renderPage();
+    } catch (error) { showToast(error.message, 'error'); }
+  }
+
+  async function deleteOnboardingDraft(draftId, name) {
+    if (!confirm(`Delete the draft “${name}”? Nothing that was already onboarded is affected.`)) return;
+    try {
+      await onboardingJson(`/drafts/${draftId}`, { method: 'DELETE' });
+      const slice = onboarding();
+      if (slice.draft?.id === draftId) slice.draft = null;
+      await fetchOnboardingDrafts();
+      renderPage();
+      showToast('Draft deleted', 'success');
+    } catch (error) { showToast(error.message, 'error'); }
+  }
+
+  async function uploadOnboardingFiles(files) {
+    const slice = onboarding();
+    const draft = slice.draft;
+    if (!draft || !files.length) return;
+    slice.uploading = true;
+    renderPage();
+    let uploaded = 0;
+    for (const file of files) {
+      try {
+        const form = new FormData();
+        form.append('file', file);
+        form.append('doc_id', genId());
+        await apiReq(`/api/onboarding/drafts/${draft.id}/documents`, { method: 'POST', body: form });
+        uploaded += 1;
+      } catch (error) {
+        showToast(`${file.name}: ${error.message}`, 'error', 6000);
+      }
+    }
+    slice.uploading = false;
+    try { adoptDraft(await onboardingJson(`/drafts/${draft.id}`)); } catch (error) { /* keep what we have */ }
+    if (uploaded) showToast(`Indexed ${uploaded} document${uploaded === 1 ? '' : 's'}`, 'success');
+    fetchDocuments();
+    renderPage();
+  }
+
+  async function detachOnboardingDocument(docId) {
+    const draft = onboarding().draft;
+    if (!draft) return;
+    try {
+      adoptDraft(await onboardingJson(`/drafts/${draft.id}/documents/${docId}`, { method: 'DELETE' }));
+      renderPage();
+    } catch (error) { showToast(error.message, 'error'); }
+  }
+
+  async function analyzeOnboardingDraft() {
+    const slice = onboarding();
+    const draft = slice.draft;
+    if (!draft || !draft.documents.length) return;
+    slice.analyzing = true;
+    renderPage();
+    try {
+      const view = await onboardingJson(`/drafts/${draft.id}/analyze`,
+        onboardingBody({ instructions: slice.instructions }));
+      adoptDraft(view);
+      slice.step = 2;
+      const warnings = view.analysis?.warnings || [];
+      warnings.forEach(warning => showToast(warning, 'warning', 7000));
+      showToast(`Marshal drafted ${view.summary.total} item${view.summary.total === 1 ? '' : 's'}. Nothing has been created yet.`,
+        'success', 6000);
+    } catch (error) {
+      showToast(error.message, 'error', 7000);
+    } finally {
+      slice.analyzing = false;
+      renderPage();
+    }
+  }
+
+  async function saveOnboardingItem(itemId, payload) {
+    const draft = onboarding().draft;
+    if (!draft) return null;
+    const view = itemId
+      ? await onboardingJson(`/drafts/${draft.id}/items/${itemId}`, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+        })
+      : await onboardingJson(`/drafts/${draft.id}/items`, onboardingBody(payload));
+    adoptDraft(view);
+    return view;
+  }
+
+  async function deleteOnboardingItem(itemId) {
+    const draft = onboarding().draft;
+    const item = onboardingItem(itemId);
+    if (!draft || !item) return;
+    const dependents = item.dependents.length;
+    const label = kindLabel(item.kind).toLowerCase();
+    const extra = dependents ? ` and ${dependents} item${dependents === 1 ? '' : 's'} under it` : '';
+    if (!confirm(`Remove the ${label} “${item.fields.name}”${extra} from the draft?`)) return;
+    try {
+      adoptDraft(await onboardingJson(`/drafts/${draft.id}/items/${itemId}`, { method: 'DELETE' }));
+      renderPage();
+    } catch (error) { showToast(error.message, 'error'); }
+  }
+
+  /**
+   * Send a new selection.
+   *
+   * Ticking a subtask needs its parent chain, and the server closes over that
+   * and says what it added. Unticking a parent is closed here first, so the
+   * page never shows a child ticked under an unticked parent even for a frame.
+   */
+  async function setOnboardingSelection(nextSelection) {
+    const slice = onboarding();
+    const draft = slice.draft;
+    if (!draft) return;
+    try {
+      const view = await onboardingJson(`/drafts/${draft.id}/selection`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ selection: nextSelection })
+      });
+      const added = view.added_parents || [];
+      adoptDraft(view);
+      renderPage();
+      if (added.length) {
+        const names = added.map(id => onboardingItem(id)?.fields.name).filter(Boolean);
+        showToast(`Also selected ${names.join(', ')} — a task cannot be created without them.`, 'info', 6000);
+      }
+    } catch (error) { showToast(error.message, 'error'); }
+  }
+
+  function toggleOnboardingItem(itemId, wanted) {
+    const item = onboardingItem(itemId);
+    if (!item) return;
+    const selected = new Set(onboardingItems().filter(row => row.selected).map(row => row.id));
+    if (wanted) {
+      selected.add(itemId);
+    } else {
+      selected.delete(itemId);
+      // Everything that depends on it has to come off with it.
+      item.dependents.forEach(id => selected.delete(id));
+    }
+    setOnboardingSelection([...selected]);
+  }
+
+  function selectAllOnboarding(kind, wanted) {
+    const selected = new Set(onboardingItems().filter(row => row.selected).map(row => row.id));
+    onboardingItems(kind).forEach(item => {
+      if (wanted) selected.add(item.id);
+      else {
+        selected.delete(item.id);
+        item.dependents.forEach(id => selected.delete(id));
+      }
+    });
+    setOnboardingSelection([...selected]);
+  }
+
+  async function sendOnboardingCommand() {
+    const slice = onboarding();
+    const input = $('#onbCommandInput');
+    const text = (input?.value || '').trim();
+    if (!slice.draft || !text || slice.commandBusy) return;
+    slice.commandBusy = true;
+    slice.commandLog.push({ role: 'user', text });
+    renderPage();
+    try {
+      const view = await onboardingJson(`/drafts/${slice.draft.id}/command`, onboardingBody({ text }));
+      adoptDraft(view);
+      slice.commandLog.push({
+        role: 'bot', text: view.reply,
+        applied: view.applied || [], skipped: view.skipped || []
+      });
+    } catch (error) {
+      slice.commandLog.push({ role: 'bot', text: `Could not apply that: ${error.message}` });
+    } finally {
+      slice.commandBusy = false;
+      renderPage();
+      const log = $('#onbCommandLog');
+      if (log) log.scrollTop = log.scrollHeight;
+      $('#onbCommandInput')?.focus();
+    }
+  }
+
+  async function loadOnboardingPlan() {
+    const slice = onboarding();
+    if (!slice.draft) return;
+    slice.planLoading = true;
+    renderPage();
+    try {
+      slice.plan = await onboardingJson(`/drafts/${slice.draft.id}/plan`);
+    } catch (error) {
+      slice.plan = null;
+      showToast(error.message, 'error');
+    } finally {
+      slice.planLoading = false;
+      renderPage();
+    }
+  }
+
+  async function commitOnboardingDraft() {
+    const slice = onboarding();
+    const draft = slice.draft;
+    const plan = slice.plan;
+    if (!draft || !plan || slice.committing) return;
+    const creating = plan.total_creating;
+    if (!creating && !plan.total_reusing) return;
+    if (!confirm(`Create ${creating} record${creating === 1 ? '' : 's'} in this workspace now? This cannot be undone from here.`)) return;
+
+    slice.committing = true;
+    renderPage();
+    try {
+      const result = await onboardingJson(`/drafts/${draft.id}/commit`, onboardingBody({ confirm: true }));
+      slice.result = result;
+      slice.draft = result.draft || slice.draft;
+      showToast(`Onboarded ${result.total_created} record${result.total_created === 1 ? '' : 's'}`, 'success', 6000);
+      await Promise.all([fetchProjects(), fetchUsers(), fetchTaskTypes(), fetchProjectTypes(),
+                         fetchUserRoles(), fetchTrades(), fetchVendors()]);
+      // What was just created is now something the next draft can point at.
+      await Promise.all([fetchOnboardingSchema(), fetchOnboardingDrafts()]);
+    } catch (error) {
+      showToast(error.message, 'error', 8000);
+    } finally {
+      slice.committing = false;
+      renderPage();
+    }
+  }
+
+  // ── Rendering ───────────────────────────────────────────────────────────
+
+  // ── Rendering ───────────────────────────────────────────────────────────
+
+  function onboardingChip(text, tone = '') {
+    return `<span class="onb-chip ${tone}">${esc(text)}</span>`;
+  }
+
+  function onboardingMoney(value) {
+    if (value === '' || value === null || value === undefined) return '';
+    const amount = Number(value);
+    return Number.isFinite(amount) ? amount.toLocaleString() : String(value);
+  }
+
+  /** The few chips worth showing on a row, chosen from the entity's own fields. */
+  function onboardingItemMeta(item) {
+    const spec = entitySpec(item.kind);
+    const fields = item.fields || {};
+    const chips = [];
+    if (item.kind === 'task_cost' || item.kind === 'project_cost') {
+      // A task cost has no name of its own, so the row title is already the
+      // figure; repeating it as a chip would say the same thing twice.
+      if (fields.name) chips.push(onboardingChip(onboardingMoney(fields.amount), 'money'));
+      if (fields.details) chips.push(onboardingChip(fields.details));
+    } else if (item.kind === 'user') {
+      chips.push(fields.email ? onboardingChip(fields.email) : '');
+      if (fields.role) chips.push(onboardingChip(fields.role));
+      if (fields.department) chips.push(onboardingChip(fields.department));
+    } else if (item.kind === 'role_type') {
+      const count = (fields.permissions || []).length;
+      chips.push(onboardingChip(`${count} permission${count === 1 ? '' : 's'}`, count ? '' : 'warn'));
+    } else if (spec) {
+      // Everything else: the first few filled fields that are not the name.
+      spec.fields.filter(field => field.name !== 'name' && field.name !== 'description')
+        .forEach(field => {
+          const value = fields[field.name];
+          if (value === '' || value === null || value === undefined) return;
+          if (chips.length >= 4) return;
+          chips.push(onboardingChip(field.type === 'money' ? onboardingMoney(value) : value));
+        });
+    }
+    if (item.source?.doc_name) chips.push(onboardingChip(`from ${item.source.doc_name}`, 'muted'));
+    if (item.origin === 'manual') chips.push(onboardingChip('added by you', 'muted'));
+    return chips.filter(Boolean).join('');
+  }
+
+  function renderOnboardingRow(item, depth = 0) {
+    const blocked = (item.blocked_by || []).length > 0;
+    const blockedNames = (item.blocked_by || [])
+      .map(id => onboardingItem(id)?.fields.name).filter(Boolean).join(', ');
+    const name = item.fields.name || (item.kind === 'task_cost'
+      ? onboardingMoney(item.fields.amount) : '(unnamed)');
+    const missing = item.missing || [];
+    return `<div class="onb-row ${item.selected ? 'is-selected' : ''} ${item.complete ? '' : 'is-incomplete'}"
+        data-item-row="${esc(item.id)}" style="--onb-depth:${depth}">
+      <label class="onb-check-wrap" title="${item.selected ? 'Selected for onboarding' : 'Not selected'}">
+        <input type="checkbox" class="onb-check" data-onb-toggle="${esc(item.id)}" ${item.selected ? 'checked' : ''}>
+      </label>
+      <span class="material-icons-outlined onb-row-icon" aria-hidden="true">${kindIcon(item.kind)}</span>
+      <div class="onb-row-main">
+        <div class="onb-row-name">
+          ${esc(name)}
+          ${item.complete ? '' : '<span class="onb-flag">⚠ Incomplete</span>'}
+        </div>
+        <div class="onb-row-meta">${onboardingItemMeta(item)}</div>
+        ${missing.length ? `<div class="onb-row-missing">
+          Missing required field${missing.length === 1 ? '' : 's'}:
+          ${missing.map(field => `<button class="onb-missing-chip" data-onb-edit="${esc(item.id)}"
+              data-onb-focus="${esc(field.name)}">${esc(field.label)}</button>`).join('')}
+        </div>` : ''}
+        ${(item.issues || []).length ? `<div class="onb-row-issue">${item.issues.map(esc).join(' · ')}</div>` : ''}
+        ${blocked && !item.selected ? `<div class="onb-row-note">Selecting this also selects ${esc(blockedNames)}</div>` : ''}
+      </div>
+      <div class="onb-row-actions">
+        ${onboardingChildActions(item)}
+        <button class="btn-table-action" data-onb-edit="${esc(item.id)}" title="Edit"><span class="material-icons-outlined">edit</span></button>
+        <button class="btn-table-action delete" data-onb-delete="${esc(item.id)}" title="Remove from draft"><span class="material-icons-outlined">delete</span></button>
+      </div>
+    </div>`;
+  }
+
+  /** "Add a child" buttons for whatever this kind can be a parent of. */
+  function onboardingChildActions(item) {
+    const children = onboardingKinds().filter(kind => entitySpec(kind)?.parent === item.kind);
+    const buttons = children.map(kind => `<button class="btn-table-action"
+      data-onb-add-child="${kind}" data-onb-parent="${esc(item.id)}"
+      title="Add a ${kindLabel(kind).toLowerCase()}"><span class="material-icons-outlined">${kindIcon(kind)}</span></button>`);
+    if (entitySpec(item.kind)?.self_parent) {
+      buttons.unshift(`<button class="btn-table-action" data-onb-add-nested="${esc(item.id)}"
+        title="Add a sub${kindLabel(item.kind).toLowerCase()}"><span class="material-icons-outlined">subdirectory_arrow_right</span></button>`);
+    }
+    return buttons.join('');
+  }
+
+  /** Everything hanging off one item, recursively: the draft's hierarchy. */
+  function renderOnboardingChildren(parentId, depth) {
+    const items = onboardingItems();
+    const children = items.filter(row => row.parent_ref === parentId);
+    // Nested children of the same kind are drawn by their own parent, not here.
+    return children.filter(row => !row.parent_id).map(row =>
+      renderOnboardingRow(row, depth)
+      + renderOnboardingNested(row, depth + 1)
+      + renderOnboardingChildren(row.id, depth + 1)).join('');
+  }
+
+  function renderOnboardingNested(item, depth) {
+    if (!entitySpec(item.kind)?.self_parent) return '';
+    return onboardingItems(item.kind)
+      .filter(row => row.parent_id === item.id)
+      .map(row => renderOnboardingRow(row, depth)
+        + renderOnboardingNested(row, depth + 1)
+        + renderOnboardingChildren(row.id, depth + 1)).join('');
+  }
+
+  function renderOnboardingProjectTree(project) {
+    const people = onboardingItems('user').filter(user => (user.project_refs || []).includes(project.id));
+    return `${renderOnboardingRow(project, 0)}
+      ${renderOnboardingChildren(project.id, 1)}
+      ${people.length ? `<div class="onb-subhead" style="--onb-depth:1">People on this project</div>${people.map(user => renderOnboardingRow(user, 1)).join('')}` : ''}`;
+  }
+
+  function renderOnboardingGroup(kind) {
+    const slice = onboarding();
+    const spec = entitySpec(kind);
+    const items = onboardingItems(kind);
+    if (!items.length || !spec) return '';
+    const selected = items.filter(item => item.selected).length;
+    const incomplete = items.filter(item => !item.complete).length;
+    const collapsed = !!slice.collapsed[kind];
+
+    let body = '';
+    let heading = spec.plural;
+    if (kind === 'project') {
+      body = items.map(renderOnboardingProjectTree).join('');
+    } else if (spec.parent) {
+      // Drawn inside their parent; only orphans need a section of their own.
+      const loose = items.filter(item => !onboardingItem(item.parent_ref));
+      if (!loose.length) return '';
+      heading = `${spec.plural} with no ${spec.parent_label.toLowerCase()} yet`;
+      body = loose.map(item => renderOnboardingRow(item, 0)).join('');
+    } else if (kind === 'user') {
+      const loose = items.filter(item => !(item.project_refs || []).some(ref => onboardingItem(ref)));
+      if (!loose.length) return '';
+      heading = 'People not tied to a project';
+      body = loose.map(item => renderOnboardingRow(item, 0)).join('');
+    } else {
+      body = items.map(item => renderOnboardingRow(item, 0)).join('');
+    }
+    if (!body) return '';
+
+    return `<section class="onb-group ${collapsed ? 'is-collapsed' : ''}">
+      <header class="onb-group-head">
+        <button class="onb-group-toggle" data-onb-collapse="${kind}" aria-expanded="${!collapsed}">
+          <span class="material-icons-outlined">${collapsed ? 'chevron_right' : 'expand_more'}</span>
+          <span class="material-icons-outlined onb-group-icon">${kindIcon(kind)}</span>
+          <h3>${esc(heading)}</h3>
+          <span class="onb-count">${selected}/${items.length} selected</span>
+          ${incomplete ? `<span class="onb-flag">${incomplete} incomplete</span>` : ''}
+        </button>
+        <div class="onb-group-actions">
+          <button class="btn btn-ghost btn-sm" data-onb-all="${kind}">Select all</button>
+          <button class="btn btn-ghost btn-sm" data-onb-none="${kind}">Clear</button>
+          <button class="btn btn-secondary btn-sm" data-onb-add="${kind}"><span class="material-icons-outlined" style="font-size:16px">add</span> Add</button>
+        </div>
+      </header>
+      <div class="onb-group-body">${body}</div>
+    </section>`;
+  }
+
+  function renderOnboardingStepper() {
+    const slice = onboarding();
+    const steps = [
+      { n: 1, label: 'Upload & analyze' },
+      { n: 2, label: 'Review & complete' },
+      { n: 3, label: 'Confirm & onboard' }
+    ];
+    const done = slice.draft?.status === 'committed';
+    return `<ol class="onb-stepper">${steps.map(step => `
+      <li class="onb-step ${slice.step === step.n ? 'is-active' : ''} ${slice.step > step.n || done ? 'is-done' : ''}">
+        <button data-onb-step="${step.n}">
+          <span class="onb-step-num">${slice.step > step.n || done ? '<span class="material-icons-outlined" style="font-size:16px">check</span>' : step.n}</span>
+          <span class="onb-step-label">${step.label}</span>
+        </button>
+      </li>`).join('')}</ol>`;
+  }
+
+  function renderOnboardingUploadStep() {
+    const slice = onboarding();
+    const draft = slice.draft;
+    const documents = draft.documents || [];
+    return `
+      <div class="onb-panel">
+        <h3 class="onb-panel-title">1 — Upload the project's documents</h3>
+        <p class="onb-panel-blurb">Schedules, tender packages, scopes, contact lists, cost sheets — whatever the project already has, at whatever stage it has reached. PDF, Excel, CSV, Word, images, and text are all read. You can also skip this and build the draft by talking to Marshal on the next step.</p>
+        <div class="onb-dropzone" id="onbDropZone">
+          <span class="material-icons-outlined">cloud_upload</span>
+          <p><strong>Drop files here</strong> or click to choose</p>
+          <span class="onb-dropzone-hint">Each file is indexed into this workspace, so Marshal can cite it later.</span>
+          <input type="file" id="onbFileInput" multiple hidden>
+        </div>
+        ${slice.uploading ? '<div class="onb-progress">Indexing documents…</div>' : ''}
+        ${documents.length ? `<ul class="onb-doc-list">${documents.map(doc => `
+          <li class="onb-doc">
+            <span class="material-icons-outlined">description</span>
+            <div class="onb-doc-main">
+              <div class="onb-doc-name">${esc(doc.name)}</div>
+              <div class="onb-doc-meta">${doc.pages} page${doc.pages === 1 ? '' : 's'}${doc.analyzed ? ' · analyzed' : ''}</div>
+            </div>
+            <button class="btn-table-action delete" data-onb-doc-remove="${esc(doc.doc_id)}" title="Remove from this draft"><span class="material-icons-outlined">close</span></button>
+          </li>`).join('')}</ul>` : '<div class="onb-empty-inline">No documents attached yet.</div>'}
+
+        <div class="form-group" style="margin-top:16px">
+          <label class="form-label" for="onbInstructions">Anything Marshal should know (optional)</label>
+          <textarea class="form-input" id="onbInstructions" rows="2" placeholder="e.g. Only onboard the tower package; ignore the sitework schedule.">${esc(slice.instructions)}</textarea>
+        </div>
+        <div class="onb-actions">
+          <button class="btn btn-primary" id="btnOnbAnalyze" ${documents.length && !slice.analyzing ? '' : 'disabled'}>
+            <span class="material-icons-outlined">auto_awesome</span>
+            ${slice.analyzing ? 'Analyzing…' : 'Analyze documents'}
+          </button>
+          <button class="btn btn-secondary" data-onb-step="2">
+            ${draft.summary.total ? `Back to the draft (${draft.summary.total} items)` : 'Skip — build the draft by hand'}
+          </button>
+        </div>
+        <p class="onb-safety"><span class="material-icons-outlined">lock</span> Analysis only writes to this draft. Nothing is created in the workspace until you confirm at step 3.</p>
+      </div>`;
+  }
+
+  function renderOnboardingCommandBar() {
+    const slice = onboarding();
+    const examples = 'Create a project called Website Redesign · Add a task called Database Migration · '
+      + 'Set a cost of 50000 on Database Migration · Delete the Sitework project';
+    return `<div class="onb-command">
+      <div class="onb-command-head">
+        <span class="material-icons-outlined">smart_toy</span>
+        <div>
+          <strong>Create or change anything by asking</strong>
+          <span class="onb-command-hint">${esc(examples)}</span>
+        </div>
+      </div>
+      ${slice.commandLog.length ? `<div class="onb-command-log" id="onbCommandLog">${slice.commandLog.slice(-8).map(entry => `
+        <div class="onb-command-msg ${entry.role}">
+          <div>${entry.role === 'bot' ? mdLite(entry.text) : esc(entry.text)}</div>
+          ${(entry.applied || []).length ? `<div class="onb-command-applied">${entry.applied.map(row => onboardingChip(`${row.op} ${row.label || ''} ${row.name || ''}`.trim())).join('')}</div>` : ''}
+          ${(entry.skipped || []).length ? `<div class="onb-command-skipped">${entry.skipped.map(row => onboardingChip(row.reason, 'warn')).join('')}</div>` : ''}
+        </div>`).join('')}</div>` : ''}
+      <div class="onb-command-row">
+        <input class="form-input" id="onbCommandInput" placeholder="Tell Marshal what to create or change…" ${slice.commandBusy ? 'disabled' : ''}>
+        <button class="btn-icon-only btn-voice" id="onbVoiceBtn" title="Dictate" aria-label="Dictate">
+          <span class="material-icons-outlined">mic</span>
+        </button>
+        <button class="btn btn-primary" id="btnOnbCommand" ${slice.commandBusy ? 'disabled' : ''}>
+          <span class="material-icons-outlined">${slice.commandBusy ? 'hourglass_top' : 'send'}</span>
+        </button>
+      </div>
+    </div>`;
+  }
+
+  /** Just enough Markdown for the assistant's replies: **bold** and bullets. */
+  function mdLite(text) {
+    return esc(text || '')
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/^- (.*)$/gm, '<span class="onb-bullet">$1</span>')
+      .replace(/\n/g, '<br>');
+  }
+
+  function renderOnboardingDraftStep() {
+    const slice = onboarding();
+    const draft = slice.draft;
+    const summary = draft.summary;
+    const kinds = onboardingKinds();
+    if (!summary.total) {
+      return `<div class="onb-panel"><div class="empty-state">
+        <span class="material-icons-outlined">auto_awesome</span>
+        <h3>Nothing drafted yet</h3>
+        <p>Upload the project's documents and run the analysis, tell Marshal what to create below, or add a record yourself.</p>
+        <div class="onb-actions" style="justify-content:center">
+          <button class="btn btn-primary" id="btnOnbAddAny"><span class="material-icons-outlined">add</span> Add a record</button>
+          <button class="btn btn-secondary" data-onb-step="1">Go to upload</button>
+        </div>
+      </div></div>${renderOnboardingCommandBar()}`;
+    }
+    return `
+      <div class="onb-summary-bar">
+        ${kinds.filter(kind => summary.counts[kind]).map(kind => `
+          <div class="onb-summary-tile">
+            <span class="onb-summary-num">${summary.selected[kind]}<span class="onb-summary-of">/${summary.counts[kind]}</span></span>
+            <span class="onb-summary-label">${esc(kindLabel(kind, true))}</span>
+          </div>`).join('')}
+        <div class="onb-summary-actions">
+          ${summary.incomplete ? `<span class="onb-flag onb-flag-lg">${summary.incomplete} incomplete</span>` : ''}
+          <button class="btn btn-ghost btn-sm" data-onb-all="">Select everything</button>
+          <button class="btn btn-ghost btn-sm" data-onb-none="">Clear all</button>
+          <button class="btn btn-secondary btn-sm" id="btnOnbAddAny"><span class="material-icons-outlined" style="font-size:16px">add</span> Add record</button>
+        </div>
+      </div>
+      ${summary.incomplete_selected ? `<div class="onb-blocked">
+        <strong>${summary.incomplete_selected} selected record${summary.incomplete_selected === 1 ? '' : 's'} cannot be onboarded yet</strong>
+        <span>Each one is marked below with the required fields it still needs. Fill them in, or clear their checkbox.</span>
+      </div>` : ''}
+      <div class="onb-draft">${kinds.map(renderOnboardingGroup).join('')}</div>
+      ${renderOnboardingCommandBar()}
+      <div class="onb-actions">
+        <button class="btn btn-secondary" data-onb-step="1"><span class="material-icons-outlined">arrow_back</span> Documents</button>
+        <button class="btn btn-primary" data-onb-step="3" ${summary.ready_to_onboard ? '' : 'disabled'}>
+          Review ${summary.total_selected} selected record${summary.total_selected === 1 ? '' : 's'}
+          <span class="material-icons-outlined">arrow_forward</span>
+        </button>
+      </div>`;
+  }
+
+  function renderOnboardingResult() {
+    const result = onboarding().result;
+    if (!result) return '';
+    const credentials = result.credentials || [];
+    return `<div class="onb-panel onb-result">
+      <h3 class="onb-panel-title"><span class="material-icons-outlined">check_circle</span> Onboarded</h3>
+      <p class="onb-panel-blurb">${result.total_created} record${result.total_created === 1 ? '' : 's'} created, ${result.total_reused} matched to something that already existed${result.memberships ? `, ${result.memberships} project membership${result.memberships === 1 ? '' : 's'} added` : ''}.</p>
+      ${credentials.length ? `<div class="onb-credentials">
+        <div class="onb-credentials-head">
+          <span class="material-icons-outlined">key</span>
+          <div><strong>First-login passwords</strong>
+          <span>Shown once, and never stored. Pass them on, and have each person change theirs.</span></div>
+          <button class="btn btn-secondary btn-sm" id="btnOnbCopyCreds"><span class="material-icons-outlined" style="font-size:16px">content_copy</span> Copy</button>
+        </div>
+        <div class="data-table-container"><table class="data-table"><thead><tr><th>Name</th><th>Email</th><th>Password</th></tr></thead>
+        <tbody>${credentials.map(row => `<tr><td>${esc(row.name)}</td><td>${esc(row.email)}</td><td><code>${esc(row.password)}</code></td></tr>`).join('')}</tbody></table></div>
+      </div>` : ''}
+      <div class="data-table-container"><table class="data-table"><thead><tr><th>Type</th><th>Name</th><th>Outcome</th></tr></thead><tbody>
+        ${(result.created || []).map(row => `<tr><td>${esc(row.label || row.kind)}</td><td>${esc(row.name)}</td><td><span class="badge badge-active">Created</span> <span class="onb-note">${esc(row.detail || '')}</span></td></tr>`).join('')}
+        ${(result.reused || []).map(row => `<tr><td>${esc(row.label || row.kind)}</td><td>${esc(row.name)}</td><td><span class="badge badge-blue">Matched existing</span> <span class="onb-note">${esc(row.detail || '')}</span></td></tr>`).join('')}
+      </tbody></table></div>
+      ${(result.skipped || []).length ? `<div class="onb-blocked">
+        <strong>Not created</strong>
+        <ul>${result.skipped.map(row => `<li>${esc(row.name)} — ${esc(row.reason)}</li>`).join('')}</ul>
+      </div>` : ''}
+      <div class="onb-actions">
+        <button class="btn btn-primary" data-nav="all-projects">Open Projects</button>
+        <button class="btn btn-secondary" id="btnOnbClose">Back to drafts</button>
+      </div>
+    </div>`;
+  }
+
+  function renderOnboardingConfirmStep() {
+    const slice = onboarding();
+    if (slice.result) return renderOnboardingResult();
+    if (slice.planLoading || !slice.plan) {
+      return `<div class="onb-panel"><div class="onb-progress">Re-checking the draft against the workspace…</div></div>`;
+    }
+    const plan = slice.plan;
+    const grouped = onboardingKinds()
+      .map(kind => ({ kind, rows: plan.rows.filter(row => row.kind === kind) }))
+      .filter(group => group.rows.length);
+    const roleRows = plan.rows.filter(row => row.kind === 'role_type' && row.action === 'create');
+    return `<div class="onb-panel">
+      <h3 class="onb-panel-title">3 — Confirm what will be created</h3>
+      <p class="onb-panel-blurb">Checked again on the server just now. ${plan.total_creating} record${plan.total_creating === 1 ? '' : 's'} will be created; ${plan.total_reusing} already exist${plan.total_reusing === 1 ? 's' : ''} and will be reused rather than duplicated.</p>
+
+      ${plan.blocked.length ? `<div class="onb-blocked">
+        <strong>${plan.blocked.length} selected record${plan.blocked.length === 1 ? '' : 's'} cannot be created</strong>
+        <ul>${plan.blocked.map(row => `<li><strong>${esc(row.label || row.kind)}: ${esc(row.name || '(unnamed)')}</strong> — ${esc(row.reason)}${(row.missing || []).length ? `: ${row.missing.map(field => esc(field.label)).join(', ')}` : ''}</li>`).join('')}</ul>
+        <span>Nothing is created while any of these are selected. Go back, complete them, or clear their checkbox.</span>
+      </div>` : ''}
+      ${roleRows.length && !plan.can_create_roles ? `<div class="onb-blocked">
+        <strong>Roles need a Super Admin</strong>
+        <ul>${roleRows.map(row => `<li>${esc(row.name)} will be skipped</li>`).join('')}</ul>
+      </div>` : ''}
+
+      ${grouped.map(group => `
+        <h4 class="onb-plan-head">${esc(kindLabel(group.kind, true))}</h4>
+        <div class="data-table-container"><table class="data-table"><thead><tr><th>Name</th><th class="hide-mobile">Where</th><th>Outcome</th></tr></thead>
+        <tbody>${group.rows.map(row => `<tr>
+          <td>${esc(row.name || '(unnamed)')}</td>
+          <td class="hide-mobile">${esc([row.parent, row.nested_under].filter(Boolean).join(' › ') || row.stored_in || '—')}</td>
+          <td>${row.action === 'create'
+            ? '<span class="badge badge-active">Create</span>'
+            : `<span class="badge badge-blue">Reuse ${esc(row.match?.label || '')}</span> <span class="onb-note">matched on ${esc(row.match?.on || 'name')}</span>`}</td>
+        </tr>`).join('')}</tbody></table></div>`).join('')}
+
+      <div class="onb-actions">
+        <button class="btn btn-secondary" data-onb-step="2"><span class="material-icons-outlined">arrow_back</span> Back to the draft</button>
+        <button class="btn btn-primary" id="btnOnbCommit" ${slice.committing || !plan.can_commit ? 'disabled' : ''}>
+          <span class="material-icons-outlined">rocket_launch</span>
+          ${slice.committing ? 'Onboarding…' : `Onboard ${plan.total_creating} record${plan.total_creating === 1 ? '' : 's'}`}
+        </button>
+      </div>
+    </div>`;
+  }
+
+  function renderOnboardingDraftList() {
+    const slice = onboarding();
+    if (slice.loading && !slice.loaded) {
+      return '<div class="onb-panel"><div class="onb-progress">Loading drafts…</div></div>';
+    }
+    if (!slice.drafts.length) {
+      return `<div class="empty-state">
+        <span class="material-icons-outlined">auto_awesome_motion</span>
+        <h3>Onboard a project you already have</h3>
+        <p>Upload its documents, or just tell Marshal what to create. Either way it lands in a draft first: you complete it, correct it, pick what is real, and only then is anything created.</p>
+        <button class="btn btn-primary" id="btnOnbNew"><span class="material-icons-outlined">add</span> Start an onboarding</button>
+      </div>`;
+    }
+    return `<div class="data-table-container"><table class="data-table">
+      <thead><tr><th>Draft</th><th class="hide-mobile">Documents</th><th>Drafted</th><th>Status</th><th>Actions</th></tr></thead>
+      <tbody>${slice.drafts.map(draft => `<tr>
+        <td><button class="onb-link" data-onb-open="${esc(draft.id)}">${esc(draft.name)}</button>
+          <div class="onb-row-meta">${esc((draft.created_at || '').slice(0, 10))}${draft.created_by_name ? ` · ${esc(draft.created_by_name)}` : ''}</div></td>
+        <td class="hide-mobile">${draft.document_count}</td>
+        <td>${draft.summary.total_selected}/${draft.summary.total} selected
+          ${draft.summary.incomplete ? `<span class="onb-flag">${draft.summary.incomplete} incomplete</span>` : ''}</td>
+        <td><span class="badge ${draft.status === 'committed' ? 'badge-blue' : 'badge-active'}">${draft.status === 'committed' ? 'Onboarded' : 'Draft'}</span></td>
+        <td><div class="table-actions">
+          <button class="btn-table-action" data-onb-open="${esc(draft.id)}" title="Open"><span class="material-icons-outlined">open_in_new</span></button>
+          <button class="btn-table-action delete" data-onb-delete-draft="${esc(draft.id)}" data-name="${esc(draft.name)}" title="Delete draft"><span class="material-icons-outlined">delete</span></button>
+        </div></td>
+      </tr>`).join('')}</tbody></table></div>`;
+  }
+
+  function renderOnboardingPage() {
+    const slice = onboarding();
+    if (!isAccountAdmin()) {
+      return `${notConnectedMsg()}<div class="empty-state">
+        <span class="material-icons-outlined">lock</span>
+        <h3>Onboarding is an administrator action</h3>
+        <p>It creates projects, tasks, people, costs, types, and roles, so only an account administrator can run it.</p>
+      </div>`;
+    }
+    const draft = slice.draft;
+    const header = `<div class="page-header">
+      <div>
+        <h1 class="page-title">${draft ? esc(draft.name) : 'Project Onboarding'}</h1>
+        <p class="page-subtitle">${draft
+          ? 'A draft of what will be created. Nothing here exists in the workspace until you confirm it.'
+          : 'Bring an existing project into BuildMarshal from its documents, or build one by talking to Marshal.'}</p>
+      </div>
+      <div class="onb-header-actions">
+        ${draft ? '<button class="btn btn-secondary" id="btnOnbClose"><span class="material-icons-outlined">arrow_back</span> All drafts</button>' : ''}
+        <button class="btn btn-primary" id="btnOnbNew"><span class="material-icons-outlined">add</span> New onboarding</button>
+      </div>
+    </div>`;
+
+    if (!draft) return `${notConnectedMsg()}${header}${renderOnboardingDraftList()}`;
+    if (!slice.schema) return `${notConnectedMsg()}${header}<div class="onb-panel"><div class="onb-progress">Loading the workspace's record definitions…</div></div>`;
+
+    const step = slice.draft.status === 'committed' && slice.result ? 3 : slice.step;
+    const body = step === 1 ? renderOnboardingUploadStep()
+      : step === 2 ? renderOnboardingDraftStep()
+      : renderOnboardingConfirmStep();
+    return `${notConnectedMsg()}${header}${renderOnboardingStepper()}${body}`;
+  }
+
+  // ── The record editor ───────────────────────────────────────────────────
+  //
+  // Every control is generated from the entity definition the server sent, so
+  // the form offers exactly the fields the application has and marks exactly
+  // the ones it will refuse to create without.
+
+  function onboardingChoicesFor(kind) {
+    const live = (onboardingSchema()?.choices || {})[kind] || [];
+    const drafted = onboardingItems(kind)
+      .map(item => ({ id: item.id, label: item.fields.name || '', detail: 'in this draft' }))
+      .filter(row => row.label);
+    const seen = new Set();
+    return [...live, ...drafted].filter(row => {
+      const key = row.label.toLowerCase();
+      if (!row.label || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  function onboardingFieldControl(field, value) {
+    const id = `onbField_${field.name}`;
+    const required = field.required ? 'data-onb-required="1"' : '';
+    if (field.type === 'textarea') {
+      return `<textarea class="form-input" id="${id}" data-onb-field="${field.name}" ${required} rows="3">${esc(value)}</textarea>`;
+    }
+    if (field.type === 'select') {
+      return `<select class="form-input" id="${id}" data-onb-field="${field.name}" ${required}>
+        <option value=""${value ? '' : ' selected'}>— not set —</option>
+        ${field.options.map(option => `<option ${option === value ? 'selected' : ''}>${esc(option)}</option>`).join('')}
+      </select>`;
+    }
+    if (field.type === 'reference') {
+      // Only records that actually exist; free text would be a way to invent one.
+      const options = onboardingChoicesFor(field.reference);
+      const known = options.some(row => row.label === value);
+      return `<select class="form-input" id="${id}" data-onb-field="${field.name}" ${required}>
+        <option value=""${value ? '' : ' selected'}>— not set —</option>
+        ${options.map(row => `<option value="${esc(row.label)}" ${row.label === value ? 'selected' : ''}>${esc(row.label)}${row.detail ? ` — ${esc(row.detail)}` : ''}</option>`).join('')}
+        ${value && !known ? `<option value="${esc(value)}" selected>${esc(value)} (not in this workspace)</option>` : ''}
+      </select>`;
+    }
+    const type = field.type === 'date' ? 'date'
+      : (field.type === 'money' || field.type === 'number') ? 'number'
+      : (field.type === 'datetime' ? 'datetime-local' : 'text');
+    const step = field.type === 'money' ? ' step="0.01" min="0"' : '';
+    return `<input class="form-input" type="${type}"${step} id="${id}" data-onb-field="${field.name}" ${required} value="${esc(value)}">`;
+  }
+
+  /**
+   * Edit a draft record, or add a new one.
+   *
+   * ``preset`` carries the links a new record needs — which project a task
+   * joins, which task a cost belongs to — so the hierarchy is set before it is
+   * saved.
+   */
+  function openOnboardingItemModal(kind, itemId, preset = {}) {
+    const item = itemId ? onboardingItem(itemId) : null;
+    if (itemId && !item) return;
+    const actualKind = item ? item.kind : kind;
+    const spec = entitySpec(actualKind);
+    if (!spec) return;
+    const fields = item ? item.fields : {};
+    const parentRef = item?.parent_ref ?? preset.parent_ref ?? null;
+    const parents = spec.parent ? onboardingItems(spec.parent) : [];
+    const nestedChoices = spec.self_parent
+      ? onboardingItems(actualKind).filter(row =>
+          row.id !== itemId && row.parent_ref === parentRef
+          && !(item ? item.dependents.includes(row.id) : false))
+      : [];
+    const held = new Set(fields.permissions || []);
+    const permissionGroups = onboardingSchema()?.permissions || [];
+    const grouped = permissionGroups.reduce((acc, entry) => {
+      (acc[entry.group] = acc[entry.group] || []).push(entry);
+      return acc;
+    }, {});
+
+    DOM.crudModalTitle.textContent = item ? `Edit ${spec.label.toLowerCase()}` : `Add ${spec.label.toLowerCase()}`;
+    DOM.crudModalBody.innerHTML = `
+      <p class="form-hint">This edits the draft only. Nothing is created until you confirm at step 3.</p>
+
+      ${spec.parent ? `<div class="form-group">
+        <label class="form-label required-label" for="onbLinkParent">${esc(spec.parent_label)}</label>
+        <select class="form-input" id="onbLinkParent">
+          <option value="">— choose —</option>
+          ${parents.map(row => `<option value="${esc(row.id)}" ${row.id === parentRef ? 'selected' : ''}>${esc(row.fields.name || '(unnamed)')}</option>`).join('')}
+        </select>
+        ${parents.length ? '' : `<div class="form-hint">Add a ${esc(spec.parent_label.toLowerCase())} to the draft first.</div>`}
+      </div>` : ''}
+
+      ${spec.self_parent ? `<div class="form-group">
+        <label class="form-label" for="onbLinkNested">Sits under</label>
+        <select class="form-input" id="onbLinkNested">
+          <option value="">— top level —</option>
+          ${nestedChoices.map(row => `<option value="${esc(row.id)}" ${row.id === (item?.parent_id ?? preset.parent_id) ? 'selected' : ''}>${esc(row.fields.name)}</option>`).join('')}
+        </select>
+        <div class="form-hint">Changing the ${esc((spec.parent_label || 'parent').toLowerCase())} clears this, since it has to stay in the same one.</div>
+      </div>` : ''}
+
+      ${spec.fields.filter(field => field.type !== 'permissions').map(field => `
+        <div class="form-group">
+          <label class="form-label ${field.required ? 'required-label' : ''}" for="onbField_${field.name}">${esc(field.label)}</label>
+          ${onboardingFieldControl(field, fields[field.name] ?? '')}
+          ${field.help ? `<div class="form-hint">${esc(field.help)}</div>` : ''}
+        </div>`).join('')}
+
+      ${actualKind === 'user' && onboardingItems('project').length ? `
+        <div class="form-group"><label class="form-label">Projects to join</label>
+          ${onboardingItems('project').map(project => `<label class="perm-row">
+            <input type="checkbox" class="onb-project-ref" value="${esc(project.id)}" ${(item?.project_refs || preset.project_refs || []).includes(project.id) ? 'checked' : ''}>
+            <span><strong class="perm-name">${esc(project.fields.name || '(unnamed)')}</strong></span>
+          </label>`).join('')}
+          <div class="form-hint">Membership is only added for projects you also select for onboarding.</div></div>` : ''}
+
+      ${spec.fields.some(field => field.type === 'permissions') ? `
+        <div class="form-hint" style="margin-bottom:10px">A role grants real authority. Check these before onboarding — Marshal proposes them, it does not decide them.</div>
+        ${Object.entries(grouped).map(([group, entries]) => `
+          <div class="perm-group">
+            <div class="perm-group-head">
+              <h4 class="perm-group-title">${esc(group)}</h4>
+              <button type="button" class="btn btn-ghost btn-sm" data-perm-group="${esc(group)}">Select all</button>
+            </div>
+            ${entries.map(entry => `
+              <label class="perm-row">
+                <input type="checkbox" class="perm-check" value="${esc(entry.key)}" data-group="${esc(group)}" ${held.has(entry.key) ? 'checked' : ''}>
+                <span><strong class="perm-name">${esc(entry.name)}</strong>
+                <span class="perm-desc">${esc(entry.description)}</span></span>
+              </label>`).join('')}
+          </div>`).join('')}` : ''}`;
+
+    DOM.crudModalBody.querySelectorAll('[data-perm-group]').forEach(button =>
+      button.addEventListener('click', () => {
+        const boxes = [...DOM.crudModalBody.querySelectorAll(`.perm-check[data-group="${CSS.escape(button.dataset.permGroup)}"]`)];
+        const turnOn = boxes.some(box => !box.checked);
+        boxes.forEach(box => { box.checked = turnOn; });
+        button.textContent = turnOn ? 'Clear all' : 'Select all';
+      }));
+    // Moving to another parent cannot keep a nesting from the old one.
+    $('#onbLinkParent')?.addEventListener('change', () => {
+      const select = $('#onbLinkNested');
+      if (select) select.value = '';
+    });
+    // Open focused on the field the admin clicked in the missing-fields list.
+    const focus = preset.focus ? $(`#onbField_${preset.focus}`) : null;
+    (focus || DOM.crudModalBody.querySelector('.form-input'))?.focus();
+
+    DOM.btnSaveCrud.dataset.crudAction = 'save-onboarding-item';
+    DOM.btnSaveCrud.dataset.crudId = itemId || '';
+    DOM.btnSaveCrud.dataset.onbKind = actualKind;
+    DOM.btnSaveCrud.dataset.onbPreset = JSON.stringify(preset);
+    DOM.crudModal.classList.add('open');
+  }
+
+  async function submitOnboardingItem(itemId, kind, preset) {
+    const spec = entitySpec(kind);
+    if (!spec) return false;
+    const fields = {};
+    spec.fields.forEach(field => {
+      const element = DOM.crudModalBody.querySelector(`[data-onb-field="${field.name}"]`);
+      if (element) fields[field.name] = element.value.trim();
+    });
+    if (spec.fields.some(field => field.type === 'permissions')) {
+      fields.permissions = [...DOM.crudModalBody.querySelectorAll('.perm-check:checked')].map(box => box.value);
+    }
+
+    const payload = { kind, fields };
+    if (spec.parent) payload.parent_ref = $('#onbLinkParent')?.value || preset.parent_ref || null;
+    if (spec.self_parent) payload.parent_id = $('#onbLinkNested')?.value || null;
+    if (kind === 'user') {
+      payload.project_refs = [...DOM.crudModalBody.querySelectorAll('.onb-project-ref:checked')].map(box => box.value);
+    }
+
+    try {
+      await saveOnboardingItem(itemId, itemId ? {
+        fields: payload.fields,
+        ...(spec.parent ? { parent_ref: payload.parent_ref || '' } : {}),
+        ...(spec.self_parent ? { parent_id: payload.parent_id || '' } : {}),
+        ...(kind === 'user' ? { project_refs: payload.project_refs } : {})
+      } : payload);
+      renderPage();
+      return true;
+    } catch (error) {
+      showToast(error.message, 'error', 6000);
+      return false;
+    }
+  }
+
+  /** Pick a record type to add, when the admin has not already said which. */
+  function openOnboardingKindPicker() {
+    DOM.crudModalTitle.textContent = 'Add a record to the draft';
+    DOM.crudModalBody.innerHTML = `
+      <p class="form-hint">Everything lands in the draft. Nothing is created until you confirm at step 3.</p>
+      <div class="onb-kind-grid">
+        ${onboardingKinds().map(kind => {
+          const spec = entitySpec(kind);
+          return `<button class="onb-kind-card" data-onb-pick="${kind}">
+            <span class="material-icons-outlined">${kindIcon(kind)}</span>
+            <strong>${esc(spec.label)}</strong>
+            <span>${esc(spec.parent ? `Belongs to a ${spec.parent_label.toLowerCase()}` : spec.stored_in || '')}</span>
+          </button>`;
+        }).join('')}
+      </div>`;
+    DOM.crudModalBody.querySelectorAll('[data-onb-pick]').forEach(button =>
+      button.addEventListener('click', () => openOnboardingItemModal(button.dataset.onbPick, null)));
+    delete DOM.btnSaveCrud.dataset.crudAction;
+    DOM.crudModal.classList.add('open');
+  }
+
+  // ── Events ──────────────────────────────────────────────────────────────
+
+  function bindOnboardingEvents() {
+    const slice = onboarding();
+
+    $('#btnOnbNew')?.addEventListener('click', createOnboardingDraft);
+    $('#btnOnbClose')?.addEventListener('click', () => {
+      slice.draft = null; slice.plan = null; slice.result = null; slice.commandLog = [];
+      fetchOnboardingDrafts().then(renderPage);
+    });
+    $$('[data-onb-open]').forEach(element =>
+      element.addEventListener('click', () => openOnboardingDraft(element.dataset.onbOpen)));
+    $$('[data-onb-delete-draft]').forEach(element =>
+      element.addEventListener('click', () =>
+        deleteOnboardingDraft(element.dataset.onbDeleteDraft, element.dataset.name)));
+
+    $$('[data-onb-step]').forEach(element => element.addEventListener('click', () => {
+      const step = Number(element.dataset.onbStep);
+      if (step === 3 && !slice.draft?.summary.total_selected) {
+        showToast('Select at least one item to onboard', 'warning');
+        return;
+      }
+      slice.step = step;
+      renderPage();
+      if (step === 3 && !slice.result) loadOnboardingPlan();
+    }));
+
+    // Upload
+    const dropZone = $('#onbDropZone');
+    const fileInput = $('#onbFileInput');
+    if (dropZone && fileInput) {
+      dropZone.addEventListener('click', () => fileInput.click());
+      fileInput.addEventListener('change', () => {
+        uploadOnboardingFiles([...fileInput.files]);
+        fileInput.value = '';
+      });
+      ['dragenter', 'dragover'].forEach(name => dropZone.addEventListener(name, event => {
+        event.preventDefault(); dropZone.classList.add('is-over');
+      }));
+      ['dragleave', 'drop'].forEach(name => dropZone.addEventListener(name, event => {
+        event.preventDefault(); dropZone.classList.remove('is-over');
+      }));
+      dropZone.addEventListener('drop', event => uploadOnboardingFiles([...(event.dataTransfer?.files || [])]));
+    }
+    $('#onbInstructions')?.addEventListener('input', event => { slice.instructions = event.target.value; });
+    $('#btnOnbAnalyze')?.addEventListener('click', analyzeOnboardingDraft);
+    $$('[data-onb-doc-remove]').forEach(element =>
+      element.addEventListener('click', () => detachOnboardingDocument(element.dataset.onbDocRemove)));
+
+    // Draft editing and selection
+    $$('[data-onb-toggle]').forEach(element => element.addEventListener('change', () =>
+      toggleOnboardingItem(element.dataset.onbToggle, element.checked)));
+    $$('[data-onb-all]').forEach(element => element.addEventListener('click', () =>
+      selectAllOnboarding(element.dataset.onbAll, true)));
+    $$('[data-onb-none]').forEach(element => element.addEventListener('click', () =>
+      selectAllOnboarding(element.dataset.onbNone, false)));
+    $$('[data-onb-collapse]').forEach(element => element.addEventListener('click', () => {
+      slice.collapsed[element.dataset.onbCollapse] = !slice.collapsed[element.dataset.onbCollapse];
+      renderPage();
+    }));
+    $$('[data-onb-edit]').forEach(element => element.addEventListener('click', () =>
+      openOnboardingItemModal(null, element.dataset.onbEdit,
+        element.dataset.onbFocus ? { focus: element.dataset.onbFocus } : {})));
+    $$('[data-onb-delete]').forEach(element => element.addEventListener('click', () =>
+      deleteOnboardingItem(element.dataset.onbDelete)));
+    $('#btnOnbAddAny')?.addEventListener('click', openOnboardingKindPicker);
+    $$('[data-onb-add]').forEach(element => element.addEventListener('click', () =>
+      openOnboardingItemModal(element.dataset.onbAdd, null)));
+    // Add whatever hangs off this record: a task or a cost on a project, a cost
+    // on a task. Which of those is possible comes from the schema.
+    $$('[data-onb-add-child]').forEach(element => element.addEventListener('click', () =>
+      openOnboardingItemModal(element.dataset.onbAddChild, null,
+        { parent_ref: element.dataset.onbParent })));
+    $$('[data-onb-add-nested]').forEach(element => element.addEventListener('click', () => {
+      const parent = onboardingItem(element.dataset.onbAddNested);
+      if (parent) openOnboardingItemModal(parent.kind, null,
+        { parent_ref: parent.parent_ref, parent_id: parent.id });
+    }));
+
+    // Command bar
+    $('#btnOnbCommand')?.addEventListener('click', sendOnboardingCommand);
+    $('#onbCommandInput')?.addEventListener('keydown', event => {
+      if (event.key === 'Enter') { event.preventDefault(); sendOnboardingCommand(); }
+    });
+    const voiceButton = $('#onbVoiceBtn');
+    if (voiceButton) {
+      voiceButton.addEventListener('click', () => {
+        // Point the shared recorder at this box for the length of the take.
+        state.voiceTarget = { inputId: 'onbCommandInput', buttonId: 'onbVoiceBtn' };
+        toggleVoiceRecording();
+      });
+    }
+
+    // Confirm and commit
+    $('#btnOnbCommit')?.addEventListener('click', commitOnboardingDraft);
+    $('#btnOnbCopyCreds')?.addEventListener('click', () => {
+      const rows = (slice.result?.credentials || [])
+        .map(row => `${row.name}\t${row.email}\t${row.password}`).join('\n');
+      navigator.clipboard?.writeText(`Name\tEmail\tFirst-login password\n${rows}`)
+        .then(() => showToast('Copied. Share them privately, and have each person change theirs.', 'success', 6000))
+        .catch(() => showToast('Could not copy — select the table instead.', 'warning'));
+    });
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════════
+     Charts
+
+     Plain inline SVG — no chart library, in keeping with the rest of the app.
+
+     The series colours are the validated categorical slots, assigned in fixed
+     order and never cycled: a ninth series would be indistinguishable from an
+     existing one under colour-vision deficiency, so the forms here cap at four
+     and fold the tail into "Other". The first thing tried here was the obvious
+     one — green for done, red for blocked — and it failed the CVD check
+     outright (ΔE 4.1 under deuteranopia: a red-green reader cannot tell them
+     apart at all). Hence these hues, plus a label on every mark so identity is
+     never carried by colour alone.
+     ═══════════════════════════════════════════════════════════════════════ */
+
+  const VIZ = {
+    // Categorical slots 1-4, light-surface steps. The app has no dark mode; the
+    // matching validated dark steps are #3987e5 #d95926 #199e70 #c98500 for
+    // whoever adds one.
+    series: ['#2a78d6', '#eb6834', '#1baf7a', '#eda100'],
+    muted: '#898781',
+    grid: '#e1e0d9',
+    axis: '#c3c2b7',
+    ink: '#52514e'
+  };
+
+  // Status -> slot, so a status is the same colour in every chart that draws it.
+  const VIZ_STATUS = { 'Open': 0, 'In Progress': 1, 'Blocked': 2, 'Completed': 3 };
+
+  function vizColor(index) { return VIZ.series[index % VIZ.series.length]; }
+
+  /** Escape for an SVG/HTML attribute used as tooltip text. */
+  function tip(text) { return `data-viz-tip="${esc(String(text))}"`; }
+
+  function vizEmpty(message) {
+    return `<div class="viz-empty">${esc(message)}</div>`;
+  }
+
+  function vizLegend(entries) {
+    return `<div class="viz-legend">${entries.map(entry => `
+      <span class="viz-legend-item">
+        <span class="viz-swatch" style="background:${entry.color}"></span>
+        ${esc(entry.label)}${entry.value !== undefined ? ` <b>${esc(entry.value)}</b>` : ''}
+      </span>`).join('')}</div>`;
+  }
+
+  /**
+   * A line chart of one or more series over time.
+   *
+   * Used for the planned-versus-earned value curve, which is the one chart an
+   * earned-value report is really about.
+   */
+  function vizLine(points, series, options = {}) {
+    if (!points.length) return vizEmpty(options.empty || 'Nothing to plot yet.');
+    const W = 720, H = 240, padL = 56, padR = 16, padT = 12, padB = 28;
+    const values = series.flatMap(s => points.map(p => p[s.key]).filter(v => v !== undefined && v !== null));
+    const max = Math.max(1, ...values);
+    const xs = index => padL + (index / Math.max(1, points.length - 1)) * (W - padL - padR);
+    const ys = value => H - padB - (value / max) * (H - padT - padB);
+
+    const ticks = [0, 0.25, 0.5, 0.75, 1].map(fraction => {
+      const value = max * fraction;
+      return `<line x1="${padL}" y1="${ys(value)}" x2="${W - padR}" y2="${ys(value)}" stroke="${VIZ.grid}" stroke-width="1"/>
+        <text x="${padL - 8}" y="${ys(value) + 4}" text-anchor="end" class="viz-tick">${esc(options.format ? options.format(value) : Math.round(value))}</text>`;
+    }).join('');
+
+    const paths = series.map((s, index) => {
+      const drawn = points.map((point, i) => ({ point, i }))
+        .filter(({ point }) => point[s.key] !== undefined && point[s.key] !== null);
+      if (!drawn.length) return '';
+      const d = drawn.map(({ point, i }, order) =>
+        `${order ? 'L' : 'M'}${xs(i).toFixed(1)} ${ys(point[s.key]).toFixed(1)}`).join(' ');
+      return `<path d="${d}" fill="none" stroke="${vizColor(index)}" stroke-width="2"
+        stroke-linecap="round" stroke-linejoin="round"/>`;
+    }).join('');
+
+    // One hit target per x position, so the crosshair is easy to hit.
+    const hits = points.map((point, i) => {
+      const lines = series
+        .filter(s => point[s.key] !== undefined && point[s.key] !== null)
+        .map(s => `${s.label}: ${options.format ? options.format(point[s.key]) : point[s.key]}`);
+      return `<rect x="${(xs(i) - (W / points.length) / 2).toFixed(1)}" y="${padT}"
+        width="${(W / points.length).toFixed(1)}" height="${H - padT - padB}" fill="transparent"
+        class="viz-hit" ${tip(`${point.date}\n${lines.join('\n')}`)}/>`;
+    }).join('');
+
+    const markers = series.map((s, index) => points.map((point, i) =>
+      point[s.key] === undefined || point[s.key] === null ? '' :
+        `<circle cx="${xs(i).toFixed(1)}" cy="${ys(point[s.key]).toFixed(1)}" r="2.5"
+          fill="${vizColor(index)}" opacity="0.9"/>`).join('')).join('');
+
+    const todayIndex = points.findIndex(point => point.date === options.today);
+    const todayLine = todayIndex >= 0 ? `
+      <line x1="${xs(todayIndex)}" y1="${padT}" x2="${xs(todayIndex)}" y2="${H - padB}"
+        stroke="${VIZ.axis}" stroke-width="1" stroke-dasharray="3 3"/>
+      <text x="${xs(todayIndex)}" y="${padT - 2}" text-anchor="middle" class="viz-tick">today</text>` : '';
+
+    const first = points[0]?.date || '';
+    const last = points[points.length - 1]?.date || '';
+    return `${vizLegend(series.map((s, index) => ({ label: s.label, color: vizColor(index) })))}
+      <svg viewBox="0 0 ${W} ${H}" class="viz-svg" role="img"
+        aria-label="${esc(options.label || 'Line chart')}">
+        ${ticks}${todayLine}${paths}${markers}${hits}
+        <line x1="${padL}" y1="${H - padB}" x2="${W - padR}" y2="${H - padB}" stroke="${VIZ.axis}" stroke-width="1"/>
+        <text x="${padL}" y="${H - 8}" class="viz-tick">${esc(first)}</text>
+        <text x="${W - padR}" y="${H - 8}" text-anchor="end" class="viz-tick">${esc(last)}</text>
+      </svg>`;
+  }
+
+  /** Columns over time — one series, so no legend: the title names it. */
+  function vizColumns(rows, options = {}) {
+    if (!rows.length) return vizEmpty(options.empty || 'Nothing to plot yet.');
+    const W = 720, H = 180, padL = 40, padR = 12, padT = 14, padB = 30;
+    const max = Math.max(1, ...rows.map(row => row.value));
+    const band = (W - padL - padR) / rows.length;
+    // Thin marks: a 2px gap between adjacent fills, and a ceiling so a
+    // chart of few weeks draws columns rather than blocks.
+    const width = Math.max(4, Math.min(30, band - 6));
+    const bars = rows.map((row, index) => {
+      const height = (row.value / max) * (H - padT - padB);
+      const x = padL + index * band + (band - width) / 2;
+      const y = H - padB - height;
+      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${width.toFixed(1)}"
+        height="${Math.max(0, height).toFixed(1)}" rx="3" fill="${vizColor(0)}"
+        class="viz-hit" ${tip(`${row.label}: ${row.value}`)}/>
+        ${row.value ? `<text x="${(x + width / 2).toFixed(1)}" y="${(y - 4).toFixed(1)}"
+          text-anchor="middle" class="viz-value">${row.value}</text>` : ''}`;
+    }).join('');
+    return `<svg viewBox="0 0 ${W} ${H}" class="viz-svg" role="img"
+        aria-label="${esc(options.label || 'Column chart')}">
+        <line x1="${padL}" y1="${H - padB}" x2="${W - padR}" y2="${H - padB}" stroke="${VIZ.axis}" stroke-width="1"/>
+        ${bars}
+        ${rows.map((row, index) => index % Math.ceil(rows.length / 8) ? '' :
+          `<text x="${(padL + index * band + band / 2).toFixed(1)}" y="${H - 10}"
+            text-anchor="middle" class="viz-tick">${esc(row.short || row.label)}</text>`).join('')}
+      </svg>`;
+  }
+
+  /** Horizontal bars for comparing magnitude — one hue; length carries the size. */
+  function vizBars(rows, options = {}) {
+    if (!rows.length) return vizEmpty(options.empty || 'Nothing to show yet.');
+    const max = Math.max(1, ...rows.map(row => row.value));
+    return `<div class="viz-bars">${rows.map(row => `
+      <div class="viz-bar-row" ${tip(`${row.label}: ${options.format ? options.format(row.value) : row.value}`)}>
+        <span class="viz-bar-label" title="${esc(row.label)}">${esc(row.label)}</span>
+        <span class="viz-bar-track">
+          <span class="viz-bar-fill" style="width:${Math.max(1, (row.value / max) * 100)}%;
+            background:${row.color || vizColor(0)}"></span>
+        </span>
+        <span class="viz-bar-value">${esc(options.format ? options.format(row.value) : row.value)}</span>
+      </div>`).join('')}</div>`;
+  }
+
+  /**
+   * One stacked bar for part-to-whole.
+   *
+   * Every segment is directly labelled, which is what the colour check requires
+   * of the lighter slots and what makes the chart readable without the legend.
+   */
+  function vizStack(segments, options = {}) {
+    const total = segments.reduce((sum, row) => sum + row.value, 0);
+    if (!total) return vizEmpty(options.empty || 'Nothing to show yet.');
+    return `<div class="viz-stack">${segments.filter(row => row.value).map(row => `
+      <span class="viz-stack-seg" style="flex-grow:${row.value};background:${row.color}"
+        ${tip(`${row.label}: ${row.value} (${Math.round((row.value / total) * 100)}%)`)}>
+        <span class="viz-stack-label">${row.value}</span>
+      </span>`).join('')}</div>
+      ${vizLegend(segments.map(row => ({ label: row.label, color: row.color, value: row.value })))}`;
+  }
+
+  /** A single ratio against a limit. A meter, not a two-slice pie. */
+  function vizMeter(value, limit, options = {}) {
+    const share = limit ? Math.min(1.5, value / limit) : 0;
+    const over = share > 1;
+    return `<div class="viz-meter" ${tip(`${options.label || ''} ${options.format ? options.format(value) : value} of ${options.format ? options.format(limit) : limit}`)}>
+      <div class="viz-meter-track">
+        <div class="viz-meter-fill ${over ? 'is-over' : ''}" style="width:${Math.min(100, share * 100)}%"></div>
+        ${over ? '<div class="viz-meter-over" style="left:100%"></div>' : ''}
+      </div>
+      <div class="viz-meter-scale">
+        <span>${esc(options.format ? options.format(value) : value)}</span>
+        <span class="viz-meter-limit">of ${esc(options.format ? options.format(limit) : limit)}
+          ${limit ? `(${Math.round((value / limit) * 100)}%)` : ''}</span>
+      </div>
+    </div>`;
+  }
+
+  /** A shared tooltip, attached once and driven by data-viz-tip. */
+  function bindVizTooltips(root) {
+    const host = root || document;
+    let bubble = document.getElementById('vizTooltip');
+    if (!bubble) {
+      bubble = document.createElement('div');
+      bubble.id = 'vizTooltip';
+      bubble.className = 'viz-tooltip';
+      bubble.hidden = true;
+      document.body.appendChild(bubble);
+    }
+    const show = event => {
+      const target = event.target.closest('[data-viz-tip]');
+      if (!target) { bubble.hidden = true; return; }
+      bubble.textContent = target.getAttribute('data-viz-tip');
+      bubble.hidden = false;
+      const width = bubble.offsetWidth;
+      bubble.style.left = `${Math.min(window.innerWidth - width - 8, Math.max(8, event.clientX - width / 2))}px`;
+      bubble.style.top = `${Math.max(8, event.clientY - bubble.offsetHeight - 12)}px`;
+    };
+    host.querySelectorAll('[data-viz-tip]').forEach(element => {
+      element.addEventListener('mousemove', show);
+      element.addEventListener('mouseleave', () => { bubble.hidden = true; });
+    });
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════════
+     Statistics, the report that reads them, and the storage panel
+     ═══════════════════════════════════════════════════════════════════════ */
+
+  function statsState() {
+    if (!state.stats) {
+      state.stats = {
+        projectId: null, data: null, loading: false, error: '',
+        insights: null, insightsLoading: false,
+        rule: 'fixed_50_50', table: false,
+        report: { open: false, preview: null, busy: false, result: null, list: [], narrative: true }
+      };
+    }
+    return state.stats;
+  }
+
+  function fmtMoney(value) {
+    const amount = Number(value || 0);
+    const mark = currencyMark();
+    if (LAKH_CRORE.has(activeCurrency())) {
+      if (Math.abs(amount) >= 10000000) return `${mark}${(amount / 10000000).toFixed(2)} Cr`;
+      if (Math.abs(amount) >= 100000) return `${mark}${(amount / 100000).toFixed(1)} L`;
+      return `${mark}${groupSouthAsian(amount)}`;
+    }
+    if (Math.abs(amount) >= 1000000) return `${mark}${(amount / 1000000).toFixed(1)}M`;
+    if (Math.abs(amount) >= 1000) return `${mark}${Math.round(amount / 1000)}k`;
+    return `${mark}${amount.toLocaleString()}`;
+  }
+
+  function fmtPercent(value) {
+    return value === null || value === undefined ? '—' : `${Math.round(value * 100)}%`;
+  }
+
+  const STAT_FORMATS = {
+    percent: fmtPercent,
+    money: value => (value === null || value === undefined ? '—' : fmtMoney(value)),
+    index: value => (value === null || value === undefined ? '—' : Number(value).toFixed(2)),
+    number: value => (value === null || value === undefined ? '—' : `${Number(value)}`),
+    count: value => (value === null || value === undefined ? '—' : `${Number(value)}`)
+  };
+
+  async function loadProjectStatistics(projectId, { force = false } = {}) {
+    const slice = statsState();
+    if (slice.projectId !== projectId) {
+      state.stats = null;
+      statsState().projectId = projectId;
+    }
+    if (!force && statsState().data) return;
+    statsState().loading = true;
+    statsState().error = '';
+    paintDashTab('stats');
+    try {
+      const response = await apiReq(`/api/projects/${projectId}/statistics?rule=${statsState().rule}`);
+      statsState().data = await response.json();
+    } catch (error) {
+      statsState().error = error.message;
+    } finally {
+      statsState().loading = false;
+      paintDashTab('stats');
+    }
+  }
+
+  async function loadProjectInsights(projectId) {
+    const slice = statsState();
+    if (slice.insightsLoading) return;
+    slice.insightsLoading = true;
+    paintDashTab('stats');
+    try {
+      const response = await apiReq(`/api/projects/${projectId}/statistics/insights`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rule: slice.rule })
+      });
+      slice.insights = (await response.json()).insights;
+    } catch (error) {
+      showToast(error.message, 'error', 6000);
+    } finally {
+      slice.insightsLoading = false;
+      paintDashTab('stats');
+    }
+  }
+
+  // ── Statistics tab ──────────────────────────────────────────────────────
+
+  function renderStatsTab(project) {
+    const slice = statsState();
+    if (slice.loading && !slice.data) return `<div class="empty-msg">Working out where this project stands…</div>`;
+    if (slice.error) {
+      return `<div class="connection-banner warning"><span class="material-icons-outlined">warning</span>
+        <span>${esc(slice.error)}</span>
+        <button class="btn btn-secondary btn-sm" data-stats-retry="1">Retry</button></div>`;
+    }
+    const data = slice.data;
+    if (!data) return `<div class="empty-msg">Loading statistics…</div>`;
+
+    return `
+      ${renderStatsHeader(data, slice)}
+      ${renderStatsHeadline(data)}
+      ${slice.table ? renderStatsTables(data) : renderStatsCharts(data)}
+      ${renderStatsRisks(data)}
+      ${renderStatsInsights(slice)}`;
+  }
+
+  function renderStatsHeader(data, slice) {
+    const phase = data.phase || {};
+    return `<div class="stats-header">
+      <div class="stats-phase">
+        <span class="stats-phase-badge">${esc(phase.label || '—')}</span>
+        <div>
+          <div class="stats-phase-line">Stage ${phase.index} of ${phase.of}</div>
+          <div class="stats-phase-reason">${esc(phase.reason || '')}</div>
+        </div>
+      </div>
+      <div class="stats-header-controls">
+        <label class="stats-rule">
+          <span>Credit progress by</span>
+          <select class="filter-input" id="statsRule">
+            ${(data.rules || []).map(rule => `<option value="${rule}" ${rule === slice.rule ? 'selected' : ''}>
+              ${esc(rule.replace('fixed_', '').replace('_', '/'))} rule</option>`).join('')}
+          </select>
+        </label>
+        <button class="btn btn-ghost btn-sm" id="statsToggleTable">
+          <span class="material-icons-outlined" style="font-size:16px">${slice.table ? 'insert_chart' : 'table_rows'}</span>
+          ${slice.table ? 'Charts' : 'Table view'}
+        </button>
+        <button class="btn btn-secondary btn-sm" id="statsRefresh">
+          <span class="material-icons-outlined" style="font-size:16px">refresh</span> Refresh
+        </button>
+        <button class="btn btn-primary btn-sm" id="statsReport">
+          <span class="material-icons-outlined" style="font-size:16px">description</span> Generate report
+        </button>
+      </div>
+    </div>
+    <div class="stats-asof">Figures as at ${esc(data.as_of || '')}.</div>`;
+  }
+
+  function renderStatsHeadline(data) {
+    return `<div class="stat-row">${(data.headline || []).map(row => `
+      <div class="stat-tile tone-${esc(row.tone || 'muted')}">
+        <div class="stat-tile-label">${esc(row.label)}</div>
+        <div class="stat-tile-value">${esc((STAT_FORMATS[row.format] || String)(row.value))}</div>
+        ${row.note ? `<div class="stat-tile-note">${esc(row.note)}</div>` : ''}
+      </div>`).join('')}</div>`;
+  }
+
+  function renderStatsCharts(data) {
+    const value = data.value || {};
+    const cost = data.cost || {};
+    const flow = data.flow || {};
+    const dist = data.distributions || {};
+    const curve = data.curve || { points: [] };
+
+    const statusSegments = (dist.status || []).map(row => ({
+      label: row.label, value: row.value, color: vizColor(VIZ_STATUS[row.label] ?? 0)
+    }));
+    const loadRows = (dist.assignee_load || []).slice(0, 8);
+
+    return `
+      <div class="viz-card">
+        <div class="viz-head">
+          <h3>Planned against earned value</h3>
+          <p>What the programme said would be earned by each date, against what has been.
+             Earned value stops at today — projecting it forward would be a forecast, not a measurement.</p>
+        </div>
+        ${vizLine(curve.points || [], [
+          { key: 'planned', label: 'Planned value' },
+          { key: 'earned', label: 'Earned value' }
+        ], { today: curve.today, format: fmtMoney, label: 'Planned against earned value',
+             empty: 'No task has dates yet, so there is no curve to draw.' })}
+        ${value.caveat ? `<p class="viz-note">${esc(value.caveat)}</p>` : ''}
+      </div>
+
+      <div class="viz-grid">
+        <div class="viz-card">
+          <div class="viz-head"><h3>Where the work stands</h3>
+            <p>Every task on this project by status.</p></div>
+          ${vizStack(statusSegments, { empty: 'No tasks on this project yet.' })}
+        </div>
+        <div class="viz-card">
+          <div class="viz-head"><h3>Budget and commitment</h3>
+            <p>What is committed through procurement against the budget.
+               There is no cost performance index: that needs recorded actual spend.</p></div>
+          ${vizMeter(cost.committed_procurement || 0, cost.budget || 0,
+                     { format: fmtMoney, label: 'Committed against budget' })}
+          <div class="viz-split">
+            <span>Baseline <b>${fmtMoney(cost.baseline)}</b></span>
+            <span>Additional <b>${fmtMoney(cost.additional)}</b></span>
+            <span>Tasks <b>${fmtMoney(cost.tasks)}</b></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="viz-card">
+        <div class="viz-head"><h3>Tasks completed per week</h3>
+          <p>The last eight weeks. The trend is ${esc(flow.throughput_trend || 'flat')}${
+            flow.cycle_time_days ? `, and a task takes a median ${flow.cycle_time_days} days once started` : ''}.</p></div>
+        ${vizColumns((flow.throughput || []).map(row => ({
+          label: row.week_ending, short: row.week_ending.slice(5), value: row.completed
+        })), { label: 'Tasks completed per week', empty: 'Nothing finished yet.' })}
+        ${flow.caveat ? `<p class="viz-note">${esc(flow.caveat)}</p>` : ''}
+      </div>
+
+      <div class="viz-grid">
+        <div class="viz-card">
+          <div class="viz-head"><h3>Cost by trade</h3>
+            <p>Where the priced work sits.</p></div>
+          ${vizBars((cost.by_trade || []).slice(0, 8), { format: fmtMoney,
+            empty: 'No task carries a cost yet.' })}
+        </div>
+        <div class="viz-card">
+          <div class="viz-head"><h3>Who is carrying the work</h3>
+            <p>Open and finished tasks per person.</p></div>
+          ${loadRows.length ? `<div class="viz-bars">${loadRows.map(row => {
+            const total = row.open + row.done || 1;
+            return `<div class="viz-bar-row">
+              <span class="viz-bar-label" title="${esc(row.label)}">${esc(row.label)}</span>
+              <span class="viz-bar-track">
+                <span class="viz-stack" style="height:100%">
+                  ${row.open ? `<span class="viz-stack-seg" style="flex-grow:${row.open};background:${vizColor(VIZ_STATUS.Open)}"
+                    ${tip(`${row.label} — open: ${row.open}`)}></span>` : ''}
+                  ${row.done ? `<span class="viz-stack-seg" style="flex-grow:${row.done};background:${vizColor(VIZ_STATUS.Completed)}"
+                    ${tip(`${row.label} — completed: ${row.done}`)}></span>` : ''}
+                </span>
+              </span>
+              <span class="viz-bar-value">${row.open}/${total}</span>
+            </div>`;
+          }).join('')}</div>
+          ${vizLegend([
+            { label: 'Open', color: vizColor(VIZ_STATUS.Open) },
+            { label: 'Completed', color: vizColor(VIZ_STATUS.Completed) }
+          ])}` : vizEmpty('Nobody is assigned yet.')}
+        </div>
+      </div>`;
+  }
+
+  /** The same figures as a table — the accessible view, and the printable one. */
+  function renderStatsTables(data) {
+    const rows = [
+      ['Phase', data.phase?.label],
+      ['Budget at completion', fmtMoney(data.value?.budget_at_completion)],
+      ['Planned value to date', fmtMoney(data.value?.planned_value)],
+      ['Earned value to date', fmtMoney(data.value?.earned_value)],
+      ['Schedule variance', fmtMoney(data.value?.schedule_variance)],
+      ['Schedule performance index', STAT_FORMATS.index(data.value?.schedule_performance_index)],
+      ['Projected finish', data.value?.projected_finish || '—'],
+      ['Committed (procurement)', fmtMoney(data.cost?.committed_procurement)],
+      ['Tasks completed per week', data.flow?.throughput_per_week],
+      ['Cycle time (median days)', data.flow?.cycle_time_days ?? '—'],
+      ['Work in progress', data.flow?.work_in_progress],
+      ['Blocked', data.flow?.blocked],
+      ['Overdue', data.schedule?.overdue_count],
+      ['Open tasks with no dates', data.schedule?.unscheduled_count]
+    ];
+    return `<div class="viz-card"><div class="viz-head"><h3>Every figure</h3>
+      <p>The same numbers the charts draw.</p></div>
+      <div class="data-table-container"><table class="data-table">
+        <thead><tr><th>Measure</th><th>Value</th></tr></thead>
+        <tbody>${rows.map(([label, value]) => `<tr><td>${esc(label)}</td>
+          <td>${esc(value === undefined || value === null ? '—' : String(value))}</td></tr>`).join('')}</tbody>
+      </table></div>
+      <div class="data-table-container" style="margin-top:12px"><table class="data-table">
+        <thead><tr><th>Status</th><th>Tasks</th></tr></thead>
+        <tbody>${(data.distributions?.status || []).map(row =>
+          `<tr><td>${esc(row.label)}</td><td>${row.value}</td></tr>`).join('')}</tbody>
+      </table></div></div>`;
+  }
+
+  function renderStatsRisks(data) {
+    const risks = data.risks || [];
+    if (!risks.length) {
+      return `<div class="viz-card"><div class="viz-head"><h3>Attention</h3></div>
+        <div class="viz-empty">Nothing was flagged against this project.</div></div>`;
+    }
+    return `<div class="viz-card"><div class="viz-head"><h3>Attention</h3>
+      <p>Raised from the figures by rule, not by model. Each one names the number behind it.</p></div>
+      <ul class="risk-list">${risks.map(row => `
+        <li class="risk-row sev-${esc(row.severity)}">
+          <span class="risk-dot" aria-hidden="true"></span>
+          <div>
+            <div class="risk-title">${esc(row.title)}
+              <span class="risk-sev">${esc(row.severity)}</span></div>
+            <div class="risk-detail">${esc(row.detail)}</div>
+          </div>
+        </li>`).join('')}</ul></div>`;
+  }
+
+  function renderStatsInsights(slice) {
+    const insights = slice.insights;
+    return `<div class="viz-card insight-card">
+      <div class="viz-head">
+        <h3><span class="material-icons-outlined">smart_toy</span> Marshal's reading</h3>
+        <p>Marshal is given the figures above and asked to explain them. It is told not to
+           state a number it was not given, and not to invent a cause.</p>
+      </div>
+      ${insights ? `
+        <p class="insight-summary">${esc(insights.summary || '')}</p>
+        ${insights.note ? `<p class="viz-note">${esc(insights.note)}</p>` : ''}
+        <div class="insight-cols">
+          ${insights.highlights?.length ? `<div><h4>Going well</h4><ul>${
+            insights.highlights.map(line => `<li>${esc(line)}</li>`).join('')}</ul></div>` : ''}
+          ${insights.concerns?.length ? `<div><h4>To watch</h4><ul>${
+            insights.concerns.map(line => `<li>${esc(line)}</li>`).join('')}</ul></div>` : ''}
+        </div>
+        ${insights.actions?.length ? `<h4>Suggested next steps</h4>
+          <ul class="insight-actions">${insights.actions.map(row =>
+            `<li><strong>${esc(row.title)}</strong><span>${esc(row.why)}</span></li>`).join('')}</ul>` : ''}
+        ${insights.outlook ? `<p class="insight-outlook">${esc(insights.outlook)}</p>` : ''}
+        <button class="btn btn-ghost btn-sm" id="statsAskMarshal">
+          <span class="material-icons-outlined" style="font-size:16px">refresh</span> Ask again
+        </button>`
+      : `<button class="btn btn-secondary" id="statsAskMarshal" ${slice.insightsLoading ? 'disabled' : ''}>
+          <span class="material-icons-outlined">auto_awesome</span>
+          ${slice.insightsLoading ? 'Reading the figures…' : 'Ask Marshal to read the figures'}
+        </button>`}
+    </div>`;
+  }
+
+  function bindStatsEvents(project) {
+    const slice = statsState();
+    $('#statsRefresh')?.addEventListener('click', () =>
+      loadProjectStatistics(project.id, { force: true }));
+    $('[data-stats-retry]')?.addEventListener('click', () =>
+      loadProjectStatistics(project.id, { force: true }));
+    $('#statsToggleTable')?.addEventListener('click', () => {
+      slice.table = !slice.table;
+      paintDashTab('stats');
+    });
+    $('#statsRule')?.addEventListener('change', event => {
+      slice.rule = event.target.value;
+      slice.insights = null;
+      loadProjectStatistics(project.id, { force: true });
+    });
+    $('#statsAskMarshal')?.addEventListener('click', () => loadProjectInsights(project.id));
+    $('#statsReport')?.addEventListener('click', () => openReportModal(project));
+    bindVizTooltips(document.getElementById('dashTabContent'));
+  }
+
+  // ── The report ──────────────────────────────────────────────────────────
+
+  async function openReportModal(project) {
+    const slice = statsState().report;
+    slice.open = true;
+    slice.result = null;
+    DOM.crudModalTitle.textContent = 'Generate a project report';
+    DOM.crudModalBody.innerHTML = '<div class="empty-msg">Working out what the report would contain…</div>';
+    delete DOM.btnSaveCrud.dataset.crudAction;
+    DOM.btnSaveCrud.hidden = true;
+    DOM.crudModal.classList.add('open');
+    try {
+      const [preview, listed] = await Promise.all([
+        apiReq(`/api/projects/${project.id}/report/preview?rule=${statsState().rule}`).then(r => r.json()),
+        apiReq(`/api/projects/${project.id}/reports`).then(r => r.json()).catch(() => ({ reports: [] }))
+      ]);
+      slice.preview = preview;
+      slice.list = listed.reports || [];
+      paintReportModal(project);
+    } catch (error) {
+      DOM.crudModalBody.innerHTML = `<div class="connection-banner warning">
+        <span class="material-icons-outlined">warning</span><span>${esc(error.message)}</span></div>`;
+    }
+  }
+
+  function paintReportModal(project) {
+    const slice = statsState().report;
+    const preview = slice.preview || {};
+    if (slice.result) {
+      const result = slice.result;
+      DOM.crudModalBody.innerHTML = `
+        <div class="report-done">
+          <span class="material-icons-outlined">check_circle</span>
+          <div>
+            <strong>${esc(result.title)}</strong>
+            <span>${esc(result.phase_label || '')} · ${result.sections.length} sections ·
+              ${Math.round((result.size_bytes || 0) / 1024)} KB</span>
+          </div>
+        </div>
+        ${result.narrative ? '' : `<p class="viz-note">${esc(result.insights?.note
+          || 'Written from the figures alone; Marshal was not reachable.')}</p>`}
+        <div class="onb-actions">
+          <button class="btn btn-primary" id="reportDownload">
+            <span class="material-icons-outlined">download</span> Download PDF</button>
+          <button class="btn btn-secondary" id="reportAnother">Generate another</button>
+        </div>`;
+      $('#reportDownload')?.addEventListener('click', () => downloadReport(result.id, result.title));
+      $('#reportAnother')?.addEventListener('click', () => {
+        slice.result = null;
+        paintReportModal(project);
+      });
+      return;
+    }
+
+    DOM.crudModalBody.innerHTML = `
+      <p class="form-hint">The report suits the stage the project has reached. Everything in it is
+        computed from this workspace's own records; the Basis section says exactly how.</p>
+      <div class="report-phase">
+        <span class="stats-phase-badge">${esc(preview.phase?.label || '')}</span>
+        <span>${esc(preview.phase?.reason || '')}</span>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="reportTitle">Title</label>
+        <input class="form-input" id="reportTitle" value="${esc(preview.title || '')}">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Sections</label>
+        <div class="report-sections">${(preview.sections || []).map(row =>
+          `<span class="onb-chip">${esc(row.heading)}</span>`).join('')}</div>
+        <div class="form-hint">Chosen for this stage. A section with nothing to report is left out.</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="reportInstructions">Anything Marshal should focus on (optional)</label>
+        <input class="form-input" id="reportInstructions" placeholder="e.g. explain the glazing delay">
+      </div>
+      <label class="perm-row">
+        <input type="checkbox" id="reportNarrative" ${slice.narrative ? 'checked' : ''}>
+        <span><strong class="perm-name">Let Marshal write the commentary</strong>
+        <span class="perm-desc">Off writes the report from the figures alone.</span></span>
+      </label>
+      ${slice.list.length ? `<h4 class="onb-plan-head">Earlier reports</h4>
+        <div class="data-table-container"><table class="data-table">
+          <thead><tr><th>Report</th><th>Stage</th><th>When</th><th></th></tr></thead>
+          <tbody>${slice.list.slice(0, 6).map(row => `<tr>
+            <td>${esc(row.title)}</td><td>${esc(row.phase_label || '—')}</td>
+            <td>${esc((row.generated_at || '').slice(0, 10))}</td>
+            <td><button class="btn-table-action" data-report-download="${esc(row.id)}"
+              data-title="${esc(row.title)}" title="Download">
+              <span class="material-icons-outlined">download</span></button></td>
+          </tr>`).join('')}</tbody></table></div>` : ''}
+      <div class="onb-actions">
+        <button class="btn btn-primary" id="reportGenerate" ${slice.busy ? 'disabled' : ''}>
+          <span class="material-icons-outlined">${slice.busy ? 'hourglass_top' : 'description'}</span>
+          ${slice.busy ? 'Writing…' : 'Generate report'}
+        </button>
+      </div>`;
+
+    $('#reportGenerate')?.addEventListener('click', () => generateReport(project));
+    $$('[data-report-download]').forEach(button => button.addEventListener('click', () =>
+      downloadReport(button.dataset.reportDownload, button.dataset.title)));
+  }
+
+  async function generateReport(project) {
+    const slice = statsState().report;
+    slice.busy = true;
+    slice.narrative = !!$('#reportNarrative')?.checked;
+    const payload = {
+      title: $('#reportTitle')?.value.trim() || '',
+      instructions: $('#reportInstructions')?.value.trim() || '',
+      rule: statsState().rule,
+      narrative: slice.narrative
+    };
+    paintReportModal(project);
+    try {
+      const response = await apiReq(`/api/projects/${project.id}/report`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      slice.result = await response.json();
+      showToast('Report ready', 'success');
+    } catch (error) {
+      showToast(error.message, 'error', 7000);
+    } finally {
+      slice.busy = false;
+      paintReportModal(project);
+    }
+  }
+
+  /** Fetch through apiReq so the download carries the session, then save it. */
+  async function downloadReport(reportId, title) {
+    try {
+      const response = await apiReq(`/api/generated-documents/${reportId}/download`);
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `${(title || 'project-report').replace(/[^A-Za-z0-9._-]+/g, '_')}.pdf`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    } catch (error) {
+      showToast(error.message, 'error', 6000);
+    }
+  }
+
+  // ── Document storage ────────────────────────────────────────────────────
+
+  function storageState() {
+    if (!state.storage) {
+      state.storage = { data: null, loading: false, error: '', busy: false,
+                        chosen: ['orphans'], open: false };
+    }
+    return state.storage;
+  }
+
+  async function loadStorage({ force = false } = {}) {
+    const slice = storageState();
+    if (slice.loading || (slice.data && !force)) return;
+    slice.loading = true;
+    try {
+      slice.data = await apiReq('/api/storage').then(response => response.json());
+      slice.error = '';
+    } catch (error) {
+      slice.error = error.message;
+    } finally {
+      slice.loading = false;
+      if (state.currentPage === 'documents') renderPage();
+    }
+  }
+
+  function renderStoragePanel() {
+    const slice = storageState();
+    if (!slice.open) {
+      return `<div class="storage-teaser">
+        <span class="material-icons-outlined">hard_drive</span>
+        <div>
+          <strong>Document storage</strong>
+          <span>${slice.data
+            ? `${esc(slice.data.total_human)} used${slice.data.reclaimable_bytes
+                ? ` · ${esc(slice.data.reclaimable_human)} reclaimable` : ''}`
+            : 'See what the indexed documents cost, and reclaim what is no longer needed.'}</span>
+        </div>
+        <button class="btn btn-secondary btn-sm" id="btnStorageOpen">Manage</button>
+      </div>`;
+    }
+    if (slice.error) {
+      return `<div class="connection-banner warning"><span class="material-icons-outlined">warning</span>
+        <span>${esc(slice.error)}</span>
+        <button class="btn btn-secondary btn-sm" id="btnStorageRefresh">Retry</button></div>`;
+    }
+    const data = slice.data;
+    if (!data) return '<div class="storage-panel"><div class="empty-msg">Measuring the workspace…</div></div>';
+
+    const areas = (data.areas || []).filter(row => row.bytes > 0);
+    const largest = Math.max(1, ...areas.map(row => row.bytes));
+    const canEdit = isAccountAdmin();
+
+    return `<div class="storage-panel">
+      <div class="storage-head">
+        <div>
+          <h3>Document storage</h3>
+          <p>Indexing a page costs far more than the page: an original, a rendered image,
+             a ColPali vector, a pooled vector and often a tile. This is where that has gone.</p>
+        </div>
+        <div class="storage-head-actions">
+          <button class="btn btn-ghost btn-sm" id="btnStorageRefresh">
+            <span class="material-icons-outlined" style="font-size:16px">refresh</span> Refresh</button>
+          <button class="btn btn-ghost btn-sm" id="btnStorageClose">Close</button>
+        </div>
+      </div>
+
+      <div class="stat-row">
+        <div class="stat-tile"><div class="stat-tile-label">Used</div>
+          <div class="stat-tile-value">${esc(data.total_human)}</div></div>
+        <div class="stat-tile ${data.over_budget ? 'tone-bad' : ''}">
+          <div class="stat-tile-label">Budget</div>
+          <div class="stat-tile-value">${esc(data.budget_human)}</div>
+          <div class="stat-tile-note">${data.budget_used !== null
+            ? `${Math.round(data.budget_used * 100)}% used` : 'no budget set'}</div></div>
+        <div class="stat-tile ${data.reclaimable_bytes ? 'tone-good' : ''}">
+          <div class="stat-tile-label">Reclaimable</div>
+          <div class="stat-tile-value">${esc(data.reclaimable_human)}</div></div>
+        <div class="stat-tile"><div class="stat-tile-label">Documents</div>
+          <div class="stat-tile-value">${data.document_count}</div></div>
+      </div>
+
+      <div class="viz-card">
+        <div class="viz-head"><h3>Where the space is</h3>
+          <p>Only the rebuildable areas can be reclaimed; an original upload never is.</p></div>
+        <div class="viz-bars">${areas.map(row => `
+          <div class="viz-bar-row" ${tip(`${row.label}: ${row.human} across ${row.files} file(s). ${row.detail}`)}>
+            <span class="viz-bar-label" title="${esc(row.detail)}">${esc(row.label)}</span>
+            <span class="viz-bar-track">
+              <span class="viz-bar-fill" style="width:${Math.max(1, (row.bytes / largest) * 100)}%;
+                background:${row.reclaimable ? vizColor(2) : vizColor(0)}"></span>
+            </span>
+            <span class="viz-bar-value">${esc(row.human)}</span>
+          </div>`).join('')}</div>
+        ${vizLegend([
+          { label: 'Cannot be rebuilt', color: vizColor(0) },
+          { label: 'Rebuildable — safe to reclaim', color: vizColor(2) }
+        ])}
+      </div>
+
+      <div class="viz-card">
+        <div class="viz-head"><h3>Reclaim space</h3>
+          <p>Nothing is removed until you confirm, and the confirmation lists exactly what goes.</p></div>
+        <div class="sweep-actions">${(data.plan?.actions || []).map(action => `
+          <label class="perm-row">
+            <input type="checkbox" class="sweep-action" value="${esc(action.key)}"
+              ${slice.chosen.includes(action.key) ? 'checked' : ''} ${canEdit ? '' : 'disabled'}>
+            <span>
+              <strong class="perm-name">${esc(action.label)}
+                ${action.safe ? '<span class="onb-chip">always safe</span>' : ''}</strong>
+              <span class="perm-desc">Would reclaim ${esc(action.human)}${
+                action.count ? ` across ${action.count} item(s)` : ''}.${
+                action.detail?.note ? ` ${esc(action.detail.note)}` : ''}</span>
+            </span>
+          </label>`).join('')}</div>
+        ${canEdit ? `<div class="onb-actions">
+          <button class="btn btn-primary" id="btnStorageSweep" ${slice.busy ? 'disabled' : ''}>
+            <span class="material-icons-outlined">cleaning_services</span>
+            ${slice.busy ? 'Reclaiming…' : 'Review and reclaim'}
+          </button>
+        </div>` : '<p class="viz-note">Only an administrator can reclaim space.</p>'}
+      </div>
+
+      ${canEdit ? `<div class="viz-card">
+        <div class="viz-head"><h3>Policy</h3>
+          <p>What "too big" and "cold" mean for this workspace.</p></div>
+        <div class="storage-policy">
+          <label class="form-group"><span class="form-label">Budget (MB)</span>
+            <input class="form-input" type="number" min="0" id="policyBudget"
+              value="${data.policy.budget_mb}"></label>
+          <label class="form-group"><span class="form-label">Keep warm (days)</span>
+            <input class="form-input" type="number" min="0" id="policyWarm"
+              value="${data.policy.keep_warm_days}"></label>
+          <label class="form-group"><span class="form-label">Page max edge (px)</span>
+            <input class="form-input" type="number" min="256" max="4096" id="policyEdge"
+              value="${data.policy.page_max_edge}"></label>
+          <label class="form-group"><span class="form-label">Page quality</span>
+            <input class="form-input" type="number" min="30" max="100" id="policyQuality"
+              value="${data.policy.page_quality}"></label>
+        </div>
+        <label class="perm-row">
+          <input type="checkbox" id="policyDedupe" ${data.policy.deduplicate ? 'checked' : ''}>
+          <span><strong class="perm-name">Reuse an identical upload</strong>
+          <span class="perm-desc">The same file uploaded twice is matched by content
+            and the existing copy is reused, rather than indexed again.</span></span>
+        </label>
+        <div class="onb-actions"><button class="btn btn-secondary" id="btnStoragePolicy">Save policy</button></div>
+      </div>` : ''}
+
+      ${(data.documents || []).length ? `<div class="viz-card">
+        <div class="viz-head"><h3>Largest documents</h3></div>
+        <div class="data-table-container"><table class="data-table">
+          <thead><tr><th>Document</th><th>Pages</th><th>Total</th>
+            <th class="hide-mobile">Rebuildable</th><th class="hide-mobile">Last read</th></tr></thead>
+          <tbody>${data.documents.slice(0, 12).map(row => `<tr>
+            <td>${esc(row.name)}</td><td>${row.pages}</td><td>${esc(row.human)}</td>
+            <td class="hide-mobile">${esc(humanBytesJs(row.reclaimable))}</td>
+            <td class="hide-mobile">${esc((row.last_used || '').slice(0, 10) || '—')}</td>
+          </tr>`).join('')}</tbody></table></div>
+      </div>` : ''}
+    </div>`;
+  }
+
+  function humanBytesJs(size) {
+    let value = Number(size || 0);
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let index = 0;
+    while (Math.abs(value) >= 1024 && index < units.length - 1) { value /= 1024; index += 1; }
+    return index === 0 ? `${Math.round(value)} B` : `${value.toFixed(1)} ${units[index]}`;
+  }
+
+  async function sweepStorage() {
+    const slice = storageState();
+    const actions = [...document.querySelectorAll('.sweep-action:checked')].map(box => box.value);
+    if (!actions.length) { showToast('Choose at least one thing to reclaim', 'warning'); return; }
+    slice.chosen = actions;
+    slice.busy = true;
+    renderPage();
+    try {
+      const plan = await apiReq('/api/storage/sweep', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ actions })
+      }).then(response => response.json());
+
+      const lines = (plan.actions || [])
+        .filter(row => row.bytes || row.count)
+        .map(row => `• ${row.label}: ${row.human}${row.count ? ` (${row.count} item(s))` : ''}`);
+      if (!lines.length) { showToast('There is nothing to reclaim right now', 'info'); return; }
+      if (!confirm(`This will reclaim ${plan.human}:\n\n${lines.join('\n')}\n\nOriginal uploads are never touched. Continue?`)) return;
+
+      const done = await apiReq('/api/storage/sweep', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ actions, confirm: true })
+      }).then(response => response.json());
+      slice.data = done.storage;
+      showToast(`Reclaimed ${done.human}`, 'success', 6000);
+      fetchDocuments();
+    } catch (error) {
+      showToast(error.message, 'error', 7000);
+    } finally {
+      slice.busy = false;
+      renderPage();
+    }
+  }
+
+  async function saveStoragePolicy() {
+    try {
+      await apiReq('/api/storage/policy', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          budget_mb: Number($('#policyBudget')?.value || 0),
+          keep_warm_days: Number($('#policyWarm')?.value || 0),
+          page_max_edge: Number($('#policyEdge')?.value || 1400),
+          page_quality: Number($('#policyQuality')?.value || 82),
+          deduplicate: !!$('#policyDedupe')?.checked
+        })
+      });
+      showToast('Policy saved', 'success');
+      loadStorage({ force: true });
+    } catch (error) {
+      showToast(error.message, 'error', 6000);
+    }
+  }
+
+  function bindStorageEvents() {
+    const slice = storageState();
+    $('#btnStorageOpen')?.addEventListener('click', () => {
+      slice.open = true;
+      renderPage();
+      loadStorage();
+    });
+    $('#btnStorageClose')?.addEventListener('click', () => { slice.open = false; renderPage(); });
+    $('#btnStorageRefresh')?.addEventListener('click', () => loadStorage({ force: true }));
+    $('#btnStorageSweep')?.addEventListener('click', sweepStorage);
+    $('#btnStoragePolicy')?.addEventListener('click', saveStoragePolicy);
+    bindVizTooltips(DOM.contentArea);
+  }
+
+  // ── Creating a project or a user from a chat sentence ───────────────────
+  //
+  // The sentence is read by the server, which knows the schema; this side only
+  // shows what came back and lets the ordinary create routes do the creating.
+
+  /** A cheap superset of the server's own create verbs.
+   *
+   * Only here to avoid a round trip on every document question -- the server
+   * decides what is really a creation request.
+   */
+  const MIGHT_CREATE = /\b(?:creat\w*|add|make|set\s*up|setup|register|open|start|new)\b/i;
+
+  /** A temporary password for a brand-new account, generated in the browser.
+   *
+   * Shown to the administrator to pass on, never stored here, and meant to be
+   * changed on first sign-in.
+   */
+  function temporaryPassword() {
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+    const bytes = new Uint32Array(16);
+    crypto.getRandomValues(bytes);
+    return [...bytes].map(value => alphabet[value % alphabet.length]).join('');
+  }
+
+  //: The record being collected, while any mandatory field is still missing.
+  //: Null the rest of the time, and every message goes through it while it is
+  //: not: that is what lets "October 1" be read as an answer to a question.
+  let entityCollection = null;
+
+  const GIVE_UP = /^\s*(?:cancel|stop|never\s*mind|nevermind|forget\s+it|abort|leave\s+it)\b/i;
+
+  /** The question to ask for what is still outstanding.
+   *
+   * `moved` says whether the last message added anything. Repeating a question
+   * verbatim after a reply that was not understood reads as if the reply never
+   * arrived, so that case says so instead.
+   */
+  function askForMissing(result, moved, collecting) {
+    const rows = result.chat_missing || [];
+    const labels = rows.map(row => `**${esc(row.label)}**`);
+    const list = labels.length > 1
+      ? `${labels.slice(0, -1).join(', ')} and ${labels[labels.length - 1]}`
+      : labels[0];
+
+    // A reference is answered with the name of a record that exists, so the
+    // ones that exist are offered rather than left to be guessed at.
+    const choices = result.choices || {};
+    const hints = rows.map(row => {
+      const rowsFor = row.name === result.parent_field
+        ? ((result.parent && result.parent.options) || [])
+        : (choices[row.name] || []);
+      if (!rowsFor.length || rowsFor.length > 8) return '';
+      return `\n- **${esc(row.label)}** — one of: ${
+        rowsFor.map(one => esc(one.label)).join(', ')}`;
+    }).filter(Boolean).join('');
+
+    const opening = moved ? 'Got it.'
+      : collecting ? 'I did not catch that.'
+      : `Sure — I can create a ${esc(String(result.label).toLowerCase())}.`;
+    const settled = result.summary ? `\n\nSo far: ${esc(result.summary)}` : '';
+    return `${opening} I still need ${list}.${settled}${hints}`;
+  }
+
+  async function handleEntityCreateRequest(text) {
+    const collecting = !!entityCollection;
+    if (!collecting && (!text || !MIGHT_CREATE.test(text))) return null;
+
+    if (collecting && GIVE_UP.test(text)) {
+      const what = String(entityCollection.label || 'record').toLowerCase();
+      entityCollection = null;
+      return `Stopped — no ${esc(what)} was created. Nothing was saved.`;
+    }
+
+    const payload = collecting
+      ? { text, kind: entityCollection.kind, known: entityCollection.known,
+          asking: entityCollection.asking, parent_id: entityCollection.parentId }
+      : { text, parent_id: state.activeProjectId || '' };
+
+    let result;
+    try {
+      const response = await apiReq('/api/assistant/entities/interpret', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      result = await response.json();
+    } catch (error) {
+      // A refusal here is about permission, and saying so beats a document search.
+      if (/permission|administrator|Sign in/i.test(error.message)) {
+        entityCollection = null;
+        return error.message;
+      }
+      return null;
+    }
+
+    if (!result.supported) {
+      if (result.reason === 'use_onboarding') {
+        entityCollection = null;
+        return `A **${esc(result.label || result.kind)}** belongs to a draft you can review ` +
+          `first — open **Onboarding**, start one, and tell me the same thing there and I ` +
+          `will build it with everything it depends on.`;
+      }
+      return null;   // not a creation request; let the document search answer
+    }
+
+    const fields = result.fields || {};
+    const parentId = (result.parent && result.parent.id) || '';
+    const known = entityCollection ? entityCollection.known : {};
+    const moved = Object.keys(fields).length > Object.keys(known).length
+      || (!!parentId && parentId !== (entityCollection && entityCollection.parentId));
+
+    if (!result.ready) {
+      // A message that answered nothing, and is a question of its own, belongs
+      // to the document search — a half-filled form must not swallow it.
+      if (collecting && !moved && /\?\s*$/.test(text)) {
+        entityCollection = null;
+        return null;
+      }
+      entityCollection = {
+        kind: result.kind, label: result.label, known: fields, parentId,
+        asking: (result.chat_missing || []).map(row => row.name),
+      };
+      return askForMissing(result, collecting && moved, collecting);
+    }
+
+    entityCollection = null;
+    if (result.kind === 'project') openChatProjectForm(result);
+    else if (result.kind === 'user') openChatUserForm(result);
+    else openChatEntityForm(result);
+
+    const understood = result.summary
+      ? `That is everything — **${esc(result.label)}**\n\n${esc(result.summary)}`
+      : `That is everything I need for a **${esc(String(result.label).toLowerCase())}**.`;
+    return `${understood}\n\nI have opened the form with it all filled in. ` +
+      `Check it over and press Create.`;
+  }
+
+  function openChatProjectForm(result) {
+    openProjectModal(null, { ...result.fields, status: result.fields.status || 'Active' },
+                     result.missing);
+  }
+
+  function openChatUserForm(result) {
+    const seed = result.fields || {};
+    DOM.crudModalTitle.textContent = 'Create User';
+    DOM.crudModalBody.innerHTML = `
+      <p class="viz-note" style="margin-bottom:12px">Marshal filled in what your message gave.
+        A temporary password has been generated — copy it now, it is not shown again, and
+        the person should change it when they first sign in.</p>
+      ${userFormFields(seed)}`;
+    DOM.btnSaveCrud.hidden = false;
+    DOM.btnSaveCrud.textContent = 'Create user';
+    DOM.btnSaveCrud.dataset.crudAction = 'save-chat-user';
+    DOM.btnSaveCrud.dataset.crudId = '';
+    DOM.crudModal.classList.add('open');
+
+    // A new account still needs a first password; generating one is kinder than
+    // asking an administrator to invent it, and it is visible so it can be passed on.
+    const generated = temporaryPassword();
+    const password = $('#ufPassword');
+    const confirmField = $('#ufConfirmPassword');
+    if (password && confirmField) {
+      password.value = generated;
+      confirmField.value = generated;
+      password.type = 'text';
+      confirmField.type = 'text';
+    }
+    bindPasswordToggles();
+    markMissingFields({ name: 'ufName', email: 'ufEmail', role: 'ufRole',
+                        phone: 'ufPhone', address: 'ufAddress' }, result.missing);
+  }
+
+  // ═══ Creating any other record from chat ═══════════════════════════════
+  //
+  // One form for every kind that is not a project or a user, built from the
+  // schema the server sends rather than from a layout written per kind: eight
+  // bespoke forms would be eight places to forget a field when the schema
+  // gains one. Nothing here decides what is mandatory — the server says which
+  // fields are missing and the create route has the final word.
+
+  /** Where each kind is written. `parent` is the chosen parent row, whose
+   *  `detail` carries the project a task belongs to. */
+  const CHAT_ENTITY_ROUTES = {
+    task:         parent => ({ path: `/api/projects/${parent.id}/tasks` }),
+    project_cost: parent => ({ path: `/api/projects/${parent.id}/costs` }),
+    procurement:  parent => ({ path: `/api/projects/${parent.id}/procurement` }),
+    // A task's cost is a field of the task, not a record of its own, so it is
+    // written by updating the task it belongs to.
+    task_cost:    parent => ({ path: `/api/projects/${parent.detail}/tasks/${parent.id}`,
+                               method: 'PUT' }),
+    task_type:    () => ({ path: '/api/task-types' }),
+    project_type: () => ({ path: '/api/project-types' }),
+    trade:        () => ({ path: '/api/trades' }),
+    vendor:       () => ({ path: '/api/vendors' }),
+    role_type:    () => ({ path: '/api/user-roles' }),
+  };
+
+  /** Kinds whose form fields are not the create route's field names. */
+  const CHAT_ENTITY_PAYLOAD = {
+    task_cost: body => ({ cost: body.amount }),
+  };
+
+  /** What to reload once the record exists, so the rest of the app catches up. */
+  const CHAT_ENTITY_REFRESH = {
+    task_type: () => fetchTaskTypes(),
+    project_type: () => fetchProjectTypes(),
+    role_type: () => fetchUserRoles(),
+    trade: () => fetchTrades(),
+    vendor: () => fetchVendors(),
+  };
+
+  //: Held here rather than on a data attribute: the reply carries every
+  //: reference list, which is far more than an attribute should hold.
+  let pendingChatEntity = null;
+
+  const chatFieldId = name => `ce_${String(name).replace(/[^\w]/g, '')}`;
+
+  /** A datetime input needs a time; a date read from a sentence has none. */
+  function forDateTimeInput(value) {
+    const text = String(value || '');
+    if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return `${text}T09:00`;
+    return text.replace(' ', 'T').slice(0, 16);
+  }
+
+  function chatFieldControl(field, value, choices) {
+    const id = chatFieldId(field.name);
+    if (field.type === 'textarea') {
+      return `<textarea class="form-input" id="${id}" rows="3">${esc(value || '')}</textarea>`;
+    }
+    if (field.type === 'select' || field.type === 'reference') {
+      const rows = field.type === 'reference'
+        ? (choices[field.name] || []).map(row => String(row.label))
+        : (field.options || []);
+      const chosen = String(value == null ? '' : value);
+      const options = rows.map(row =>
+        `<option value="${esc(row)}"${chosen === String(row) ? ' selected' : ''}>${esc(row)}</option>`).join('');
+      // An empty reference list is stated, not left as a blank dropdown that
+      // looks broken. Nothing can be invented to fill it.
+      const empty = (field.type === 'reference' && !rows.length)
+        ? '<option value="" disabled>none exist yet — add one first</option>' : '';
+      return `<select class="form-input" id="${id}">` +
+        `<option value="">${field.required ? 'Select…' : '—'}</option>${empty}${options}</select>`;
+    }
+    const inputType = { number: 'number', money: 'number',
+                        date: 'date', datetime: 'datetime-local' }[field.type] || 'text';
+    const shown = field.type === 'datetime' ? forDateTimeInput(value) : (value == null ? '' : value);
+    const step = field.type === 'money' ? ' step="0.01"' : '';
+    return `<input class="form-input" type="${inputType}" id="${id}" value="${esc(shown)}"${step}>`;
+  }
+
+  function chatEntityFormHtml(result) {
+    const fields = ((result.spec && result.spec.fields) || [])
+      // A permission set is chosen in the role editor, which is built for it.
+      .filter(field => field.type !== 'permissions');
+    const values = result.fields || {};
+    const choices = result.choices || {};
+    const parent = result.parent;
+
+    const parentRow = parent ? `
+      <div class="form-group">
+        <label class="form-label required-label">${esc(parent.label)}</label>
+        <select class="form-input" id="ce_parent">
+          <option value="">Select…</option>
+          ${(parent.options || []).map(row => `<option value="${esc(row.id)}" data-detail="${
+            esc(row.detail || '')}"${row.id === parent.id ? ' selected' : ''}>${esc(row.label)}${
+            // A task's detail is the id of its project, which is not a label.
+            (row.detail && parent.kind !== 'task') ? ` — ${esc(row.detail)}` : ''
+          }</option>`).join('')}
+        </select>
+      </div>` : '';
+
+    const rows = fields.map(field => `
+      <div class="form-group">
+        <label class="form-label${field.required ? ' required-label' : ''}">${esc(field.label)}</label>
+        ${chatFieldControl(field, values[field.name], choices)}
+        ${field.help ? `<p class="form-hint">${esc(field.help)}</p>` : ''}
+      </div>`).join('');
+
+    const note = (result.spec || {}).kind === 'role_type'
+      ? `<p class="viz-note" style="margin-bottom:12px">Marshal filled in what your message gave.
+           The role is created with no permissions — set those in
+           <strong>Company Settings → User Roles</strong>.</p>`
+      : `<p class="viz-note" style="margin-bottom:12px">Marshal filled in what your message gave.
+           Anything it was not told is blank rather than guessed — check it and press Create.</p>`;
+
+    return `${note}<div class="user-form-grid">${parentRow}${rows}</div>`;
+  }
+
+  function openChatEntityForm(result) {
+    pendingChatEntity = result;
+    DOM.crudModalTitle.textContent = `Create ${result.label}`;
+    DOM.crudModalBody.innerHTML = chatEntityFormHtml(result);
+    DOM.btnSaveCrud.hidden = false;
+    DOM.btnSaveCrud.textContent = `Create ${String(result.label).toLowerCase()}`;
+    DOM.btnSaveCrud.dataset.crudAction = 'save-chat-entity';
+    DOM.btnSaveCrud.dataset.crudId = '';
+    DOM.crudModal.classList.add('open');
+
+    // Everything the server said was missing is highlighted, including the
+    // parent, and the first of them takes the cursor.
+    const ids = {};
+    ((result.spec && result.spec.fields) || []).forEach(field => {
+      ids[field.name] = chatFieldId(field.name);
+    });
+    if (result.parent_field) ids[result.parent_field] = 'ce_parent';
+    markMissingFields(ids, result.missing);
+  }
+
+  async function submitChatEntity() {
+    const result = pendingChatEntity;
+    if (!result) return;
+    const build = CHAT_ENTITY_ROUTES[result.kind];
+    if (!build) { showToast(`I cannot create a ${result.label} yet`, 'error'); return; }
+
+    const fields = ((result.spec && result.spec.fields) || [])
+      .filter(field => field.type !== 'permissions');
+    const body = {};
+    fields.forEach(field => {
+      const element = document.getElementById(chatFieldId(field.name));
+      if (!element) return;
+      const value = String(element.value || '').trim();
+      if (value !== '') body[field.name] = value;
+    });
+
+    const parentSelect = document.getElementById('ce_parent');
+    const parentId = parentSelect ? String(parentSelect.value || '') : '';
+    const chosen = parentSelect && parentSelect.selectedOptions[0];
+    const parent = { id: parentId, detail: chosen ? (chosen.dataset.detail || '') : '' };
+
+    // The server decides what is mandatory; this only avoids a round trip that
+    // would come back saying the same thing.
+    const short = fields.filter(field => field.required && !body[field.name])
+                        .map(field => field.label);
+    if (result.parent && !parentId) short.unshift(result.parent.label);
+    if (short.length) {
+      showToast(`${short.join(', ')} ${short.length > 1 ? 'are' : 'is'} required`, 'warning');
+      return;
+    }
+
+    DOM.btnSaveCrud.disabled = true;
+    const label = DOM.btnSaveCrud.textContent;
+    DOM.btnSaveCrud.textContent = 'Creating…';
+    try {
+      const target = build(parent);
+      const shape = CHAT_ENTITY_PAYLOAD[result.kind];
+      await apiReq(target.path, {
+        method: target.method || 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(shape ? shape(body) : body),
+      });
+      const refresh = CHAT_ENTITY_REFRESH[result.kind];
+      if (refresh) { try { await refresh(); } catch (e) { /* the record exists either way */ } }
+      if (parentId && parentId === state.activeProjectId) {
+        try { await fetchProjectTasks(parentId); } catch (e) { /* as above */ }
+      }
+      closeCrudModal();
+      pendingChatEntity = null;
+      const where = result.stored_in ? ` It is in **${esc(result.stored_in)}**.` : '';
+      addMessage('bot', `Created **${esc(body.name || result.label)}**.${where}`);
+      renderChatMessages();
+      renderPage();
+      showToast(`${result.label} created`, 'success');
+    } catch (error) {
+      DOM.btnSaveCrud.disabled = false;
+      DOM.btnSaveCrud.textContent = label;
+      showToast(error.message, 'error', 8000);
+    }
+  }
+
+  // ═══ Chat Panel — window states (minimized ↔ docked ↔ full screen) ═══
+  const CHAT_STATE_KEY = 'bm_chat_window_state';
+  const CHAT_WINDOW_STATES = ['normal', 'minimized', 'maximized'];
+  let chatWindowState = 'normal';
+
+  function readSavedChatWindowState() {
+    try {
+      const saved = localStorage.getItem(CHAT_STATE_KEY);
+      return CHAT_WINDOW_STATES.includes(saved) ? saved : 'normal';
+    } catch (e) { return 'normal'; }
+  }
+
+  // Single place that maps a window state onto the DOM.
+  function applyChatWindowState(next, persist = true) {
+    if (!CHAT_WINDOW_STATES.includes(next)) next = 'normal';
+    const panel = DOM.chatPanel;
+    if (!panel) return;
+    chatWindowState = next;
+
+    panel.classList.toggle('chat-minimized', next === 'minimized');
+    panel.classList.toggle('chat-maximized', next === 'maximized');
+    document.body.classList.toggle('chat-pill-open', next === 'minimized');
+    if (next !== 'minimized') panel.classList.remove('has-unread');
+
+    // The dimming overlay only belongs to the docked slide-over state
+    if (next === 'normal' && panel.classList.contains('visible')) DOM.chatOverlay.classList.add('open');
+    else DOM.chatOverlay.classList.remove('open');
+
+    // History dropdown has nowhere to go inside a 56px pill
+    if (next === 'minimized') closeChatHistory();
+
+    const btnMax = $('#btnChatMaximize');
+    const iconMax = $('#btnChatMaximizeIcon');
+    if (iconMax) iconMax.textContent = next === 'maximized' ? 'close_fullscreen' : 'open_in_full';
+    if (btnMax) {
+      const label = next === 'maximized' ? 'Exit full screen' : 'Full screen';
+      btnMax.title = label;
+      btnMax.setAttribute('aria-label', label);
+      btnMax.setAttribute('aria-pressed', String(next === 'maximized'));
+    }
+    const title = $('#chatPanelTitle');
+    if (title) {
+      title.title = next === 'minimized' ? 'Click to restore' : 'Double-click to toggle full screen';
+      title.setAttribute('aria-label', next === 'minimized' ? 'Restore chat' : 'Marshal chat');
+    }
+
+    if (persist) { try { localStorage.setItem(CHAT_STATE_KEY, next); } catch (e) { /* storage disabled */ } }
+    if (next !== 'minimized') scrollChatBottom();
+  }
+
+  function openChatPanel() { DOM.chatPanel.classList.add('visible'); DOM.chatPanel.classList.remove('collapsed'); }
+
+  function showChat() {
+    openChatPanel();
+    // Reopening from the pill should give back a usable panel
+    applyChatWindowState(chatWindowState === 'minimized' ? 'normal' : chatWindowState);
+  }
+  function hideChat() {
+    DOM.chatPanel.classList.remove('visible');
+    DOM.chatPanel.classList.add('collapsed');
+    DOM.chatOverlay.classList.remove('open');
+    // Closing always resets the window state so the next open is predictable
+    if (chatWindowState !== 'normal') applyChatWindowState('normal');
+  }
+  function toggleChat() { DOM.chatPanel.classList.contains('collapsed') ? showChat() : hideChat(); }
+
+  function minimizeChat() { openChatPanel(); applyChatWindowState('minimized'); }
+  function restoreChat() { openChatPanel(); applyChatWindowState('normal'); }
+  function maximizeChat() { openChatPanel(); applyChatWindowState('maximized'); }
+  function toggleChatMaximize() {
+    // On phones the docked panel already fills the screen, so this control
+    // only ever expands the pill back out.
+    if (window.innerWidth <= 768 && chatWindowState !== 'maximized') { restoreChat(); return; }
+    chatWindowState === 'maximized' ? restoreChat() : maximizeChat();
+  }
+
+  function initChatWindowControls() {
+    const panel = DOM.chatPanel;
+    if (!panel) return;
+
+    const btnMin = $('#btnChatMinimize');
+    const btnMax = $('#btnChatMaximize');
+    const title = $('#chatPanelTitle');
+
+    if (btnMin) btnMin.addEventListener('click', e => { e.stopPropagation(); minimizeChat(); });
+    if (btnMax) btnMax.addEventListener('click', e => { e.stopPropagation(); toggleChatMaximize(); });
+
+    if (title) {
+      title.addEventListener('click', () => { if (chatWindowState === 'minimized') restoreChat(); });
+      title.addEventListener('dblclick', () => { if (chatWindowState !== 'minimized') toggleChatMaximize(); });
+      title.addEventListener('keydown', e => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        e.preventDefault();
+        chatWindowState === 'minimized' ? restoreChat() : toggleChatMaximize();
+      });
+    }
+
+    // Clicking anywhere on the collapsed pill brings the panel back
+    panel.addEventListener('click', e => {
+      if (chatWindowState !== 'minimized') return;
+      if (e.target.closest('.chat-header-actions')) return;
+      restoreChat();
+    });
+
+    // Esc leaves full screen before it reaches the modal handlers
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape' && chatWindowState === 'maximized') restoreChat();
+    });
+
+    // Only rehydrate where the panel is docked open by default; below that
+    // breakpoint the chat starts closed and a stray pill would be confusing.
+    // Skip the transition so a saved state doesn't visibly animate on load.
+    panel.classList.add('chat-no-anim');
+    applyChatWindowState(window.innerWidth > 1200 ? readSavedChatWindowState() : 'normal', false);
+    requestAnimationFrame(() => requestAnimationFrame(() => panel.classList.remove('chat-no-anim')));
+  }
 
   // ═══ Chat Panel Resize (drag left edge) ═══
   function initChatResize() {
@@ -5387,8 +8090,8 @@
     let isDragging = false;
 
     function onPointerDown(e) {
-      // Only on desktop (> 1200px)
-      if (window.innerWidth <= 1200) return;
+      // Only on desktop (> 1200px), and only while docked
+      if (window.innerWidth <= 1200 || chatWindowState !== 'normal') return;
       e.preventDefault();
       isDragging = true;
       startX = e.clientX || (e.touches && e.touches[0].clientX) || 0;
@@ -5645,6 +8348,7 @@
     if (!chat) { createNewChat(); chat = getActiveChat(); }
     const msg = { id: genId(), role, content, sources, attachments, timestamp: Date.now() };
     chat.messages.push(msg);
+    if (role === 'bot' && chatWindowState === 'minimized') DOM.chatPanel.classList.add('has-unread');
     if (role === 'user' && chat.messages.filter(m => m.role === 'user').length === 1) {
       chat.title = content.slice(0, 50) + (content.length > 50 ? '…' : '');
     }
@@ -5833,14 +8537,25 @@
     if (pending.length) await Promise.all(pending);
   }
 
+  /** The reviewable summary of a proposed meeting.
+   *
+   * Tolerates a partial proposal: a provider that answers with less than
+   * expected should read as a thinner summary, never as a thrown error in
+   * the middle of a conversation.
+   */
   function formatMeetSummary(proposal) {
-    const start = new Date(proposal.start);
-    const end = new Date(proposal.end);
+    const meeting = proposal || {};
+    const start = new Date(meeting.start);
+    const end = new Date(meeting.end);
     const when = Number.isNaN(start.getTime())
-      ? proposal.start
+      ? (meeting.start || 'a time I could not read')
       : `${start.toLocaleString()} – ${Number.isNaN(end.getTime()) ? '' : end.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
-    const guests = proposal.attendees?.length ? proposal.attendees.join(', ') : 'no other attendees';
-    return `**${proposal.summary}**\n\n- **When:** ${when} (${proposal.timezone})\n- **Duration:** ${proposal.duration_minutes} minutes\n- **Attendees:** ${guests}`;
+    const guests = meeting.attendees?.length ? meeting.attendees.join(', ') : 'no other attendees';
+    const parts = [`**${meeting.summary || 'Untitled meeting'}**`, ''];
+    parts.push(`- **When:** ${when}${meeting.timezone ? ` (${meeting.timezone})` : ''}`);
+    if (meeting.duration_minutes) parts.push(`- **Duration:** ${meeting.duration_minutes} minutes`);
+    parts.push(`- **Attendees:** ${guests}`);
+    return parts.join('\n');
   }
 
   /**
@@ -5885,6 +8600,9 @@
       return `I could not schedule that meeting: ${error.message}`;
     }
 
+    // From here on, anything unexpected in the reply ends the conversation
+    // rather than leaving it pending and hijacking the next message.
+    try {
     const result = await response.json();
 
     if (result.status === 'needs_input') {
@@ -5900,7 +8618,9 @@
     if (result.status === 'created') {
       state.pendingMeet = null;
       const event = result.event || {};
-      const lines = [`Scheduled **${event.summary || result.proposal.summary}** in ${cfg.calendarLabel}.`, '', formatMeetSummary(result.proposal)];
+      const proposal = result.proposal || {};
+      const title = event.summary || proposal.summary || 'the meeting';
+      const lines = [`Scheduled **${title}** in ${cfg.calendarLabel}.`, '', formatMeetSummary(proposal)];
       if (result.meet_link) {
         lines.push('', `- **${cfg.meetingLabel}:** ${result.meet_link}`);
       } else if (result.meet_unavailable) {
@@ -5915,6 +8635,11 @@
 
     state.pendingMeet = null;
     return 'I could not schedule that meeting. Try again with a title, a date, and a time.';
+    } catch (error) {
+      state.pendingMeet = null;
+      return `I could not read the scheduling reply: ${error.message}. `
+        + 'Nothing was booked — try again with a title, a date and a time.';
+    }
   }
 
   // ── Editing a calendar event from chat ────────────────────────────────────
@@ -6087,6 +8812,12 @@
     // Likewise for an edit awaiting a yes/no.
     const editReply = await handleCalendarEditRequest(text);
     if (editReply !== null) return { handled: true, response: editReply };
+
+    // "Create a project called ..." used to fall through to document search and
+    // report that it could not be found, while the same sentence worked on the
+    // Onboarding page. It is answered here now.
+    const createReply = await handleEntityCreateRequest(text);
+    if (createReply !== null) return { handled: true, response: createReply };
 
     const routed = calendarProviderFor(text);
 
@@ -6337,6 +9068,8 @@ ${JSON.stringify(context)}` };
     // stays local.  Everything else is account configuration and is stored
     // server-side with the account that owns it.
     localStorage.setItem(APP_CONFIG.STORAGE_KEYS.API_URL, url);
+    // Typed by hand, so it outranks the port the launcher announces.
+    localStorage.setItem('bmarshal_api_url_pinned', '1');
     closeSettings();
     if (state.session) {
       try {
@@ -6391,7 +9124,8 @@ ${JSON.stringify(context)}` };
     DOM.btnChatHistory.addEventListener('click', toggleChatHistory);
     DOM.btnCloseHistory.addEventListener('click', closeChatHistory);
 
-    // Chat panel resize
+    // Chat panel window controls (minimize / full screen) + resize
+    initChatWindowControls();
     initChatResize();
 
     // Chat input — auto-resize textarea
@@ -6455,7 +9189,27 @@ ${JSON.stringify(context)}` };
       }
 
       if (crudAct === 'create-calendar-event') { await submitCalendarEventCreate(); return; }
+      if (crudAct === 'save-chat-user') {
+        await submitCreateUser({
+          onDone: ({ name, role }) => {
+            closeCrudModal();
+            addMessage('bot', `Created **${esc(name)}**${role ? ` as **${esc(role)}**` : ''}. ` +
+              `They are in **Company Settings → User**, and the temporary password you saw ` +
+              `should be changed at first sign-in.`);
+            renderChatMessages();
+          }
+        });
+        return;
+      }
+      if (crudAct === 'save-chat-entity') { await submitChatEntity(); return; }
       if (crudAct === 'save-user-role') { await submitUserRole(crudId); return; }
+      if (crudAct === 'save-onboarding-item') {
+        const kind = DOM.btnSaveCrud.dataset.onbKind;
+        let preset = {};
+        try { preset = JSON.parse(DOM.btnSaveCrud.dataset.onbPreset || '{}'); } catch (e) { preset = {}; }
+        if (await submitOnboardingItem(crudId, kind, preset)) closeCrudModal();
+        return;
+      }
 
       // Project & Task saves (use dataset.crudAction pattern)
       if (crudAct === 'save-new-project') {
@@ -6478,11 +9232,17 @@ ${JSON.stringify(context)}` };
           country: $('#projFCountry')?.value.trim(),
         };
         try {
-          await apiReq('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+          const created = await apiReq('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => r.json());
           await fetchProjects();
           closeCrudModal();
           renderPage();
           showToast('Project created', 'success');
+          // When the chat asked for it, the chat should say it happened.
+          if (DOM.chatPanel?.classList.contains('visible')) {
+            addMessage('bot', `Created **${esc(name)}** (${esc(project_code)}). ` +
+              `Open it from **Projects → All Projects**.`);
+            renderChatMessages();
+          }
         } catch (err) { showToast(err.message, 'error'); }
         return;
       }

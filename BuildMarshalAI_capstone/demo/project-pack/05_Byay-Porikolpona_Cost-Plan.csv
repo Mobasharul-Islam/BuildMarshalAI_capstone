@@ -1,0 +1,17 @@
+﻿পদ্মা ভিউ স্পেশালাইজড হাসপাতাল সম্প্রসারণ — ব্যয় পরিকল্পনা / Elemental Cost Plan
+প্রকল্প কোড PVH-2026,চুক্তিমূল্য BDT 600000000,৳ 60.00 কোটি,সংশোধন C,১৪ সেপ্টেম্বর ২০২৬
+
+উপাদান (Element),বিবরণ (Description),বিস্তারিত (Detail),"টাকা (Amount, BDT)",ধরন (Cost type)
+১.০,প্রিলিমিনারিজ (Preliminaries),"Site management, welfare, insurance and security",38500000,Preliminaries
+2.০,সাইট প্রস্তুতি ও এনাবলিং,"Site preparation, demolition and temporary services",18500000,Construction
+3.০,পাইলিং ও ভিত্তি,"Bored piles, pile caps, grade beams, drainage",79000000,Construction
+4.০,সুপারস্ট্রাকচার,"RCC frame, slabs to Level 5, stair and lift core",142000000,Construction
+5.০,বহিরাবরণ ও ছাদ,"Masonry, aluminium glazing, waterproofing, external paint",64000000,Construction
+6.০,এমইপি স্থাপন,"Electrical, plumbing, HVAC, generator, fire protection",96000000,Construction
+7.০,অভ্যন্তরীণ ফিনিশিং,"Plaster, tiles, joinery, operation theatre fit-out",81000000,Construction
+8.০,কমিশনিং ও হস্তান্তর,"Lifts, external works, commissioning, handover",29000000,Construction
+9.০,কন্টিনজেন্সি (Contingency),Design development and risk allowance,25000000,Contingency
+10.০,ওভারহেড ও মুনাফা (Overhead & profit),Contractor overhead and profit,27000000,Overhead
+
+,মোট (TOTAL),,600000000,
+,প্রতি বর্গমিটার (per m²),,71429,

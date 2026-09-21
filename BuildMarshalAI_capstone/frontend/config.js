@@ -6,7 +6,31 @@
 // retrieval depth, and voice service are account settings: they arrive from
 // /api/account/settings at sign-in and are written back there when changed.
 const APP_CONFIG = {
-  API_URL: localStorage.getItem('bmarshal_api_url') || 'http://127.0.0.1:8000',
+  // window.BMARSHAL_API_URL comes from local-config.js, which the launcher and
+  // the backend rewrite with the port the backend actually got.
+  API_URL: (function resolveApiUrl() {
+    const trim = (url) => (url || '').trim().replace(/\/+$/, '');
+    const saved = trim(localStorage.getItem('bmarshal_api_url'));
+    const announced = trim(window.BMARSHAL_API_URL);
+    const isLocal = (url) => /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/i.test(url);
+
+    // A URL typed into the Backend URL box is a choice, and a choice is never
+    // second-guessed -- two local backends at once is a real thing to do.
+    let chosen = false;
+    try { chosen = localStorage.getItem('bmarshal_api_url_pinned') === '1'; } catch (e) { /* private mode */ }
+
+    // A saved loopback URL that nobody chose, when the backend has announced a
+    // different loopback port, is a stale pointer to a port nothing is on --
+    // keeping it only produces "Failed to fetch" against a backend that is
+    // running. A remote URL is left alone either way.
+    if (!chosen && saved && announced && saved !== announced
+        && isLocal(saved) && isLocal(announced)) {
+      // Written back so the Backend URL field shows where requests really go.
+      try { localStorage.setItem('bmarshal_api_url', announced); } catch (e) { /* private mode */ }
+      return announced;
+    }
+    return saved || announced || 'http://127.0.0.1:8000';
+  })(),
   VOICE_API_URL: '',
   MODEL: 'gemini-3.7-flash-high',
   TOP_K: 5,

@@ -30,7 +30,7 @@ Open PowerShell in this folder and run:
 powershell -ExecutionPolicy Bypass -File .\START-BUILDMARSHAL.ps1
 ```
 
-The script performs the one-time setup, creates `.venv-gpu` from the pinned package list when needed, starts CLIProxyAPI on port 8317, starts the frontend on port 5500, and opens the backend notebook in VS Code. The first environment setup downloads Python packages and can take several minutes; the model weights are already bundled and are not downloaded again.
+The script performs the one-time setup, creates `.venv-gpu` from the pinned package list when needed, starts CLIProxyAPI on port 8317, starts the frontend on port 5500 (moving either one if Windows has reserved its port -- see **If a service will not start on its port** below), and opens the backend notebook in VS Code. The first environment setup downloads Python packages and can take several minutes; the model weights are already bundled and are not downloaded again.
 
 To create only the Python environment yourself, run:
 
@@ -74,6 +74,61 @@ loads nothing until you authenticate.
 
 `BuildMarshalAI_capstone/docs/ACCOUNTS_AND_ISOLATION.md` documents the account
 model, the isolation guarantees, and the migration in full.
+
+## If a service will not start on its port
+
+Symptom: the launcher reports that a service did not start, or a log
+shows
+
+```
+listen tcp 127.0.0.1:8317: bind: An attempt was made to access a socket
+in a way forbidden by its access permissions.
+```
+
+This is **not** an authentication problem and not a broken install.
+Windows allocates ports to Hyper-V's NAT driver out of the TCP *dynamic
+port range*, and then refuses to let anything else bind them, even though
+nothing is listening. The blocks move from boot to boot, so a port that
+worked yesterday can fail today.
+
+Windows' own default dynamic range is 49152-65535, which leaves ordinary
+service ports alone. Docker Desktop and some VPN clients move it down to
+start at 1024 -- and then everything from 1024 up, including 5500, 8000
+and 8317, is fair game. Check both:
+
+```powershell
+netsh int ipv4 show dynamicport tcp
+netsh int ipv4 show excludedportrange protocol=tcp
+```
+
+If the dynamic range starts at 1024 rather than 49152, that is the cause.
+
+`START-BUILDMARSHAL.ps1` handles this by itself: it bind-tests every
+port, moves any service whose port has been taken, and tells you where
+it put it. The frontend follows the backend automatically. Nothing needs
+doing, and nothing needs Administrator.
+
+To get the usual ports back permanently, run once as Administrator:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\RESERVE-PORTS.ps1
+```
+
+It puts the dynamic range back to the Windows default -- which is the fix,
+because it takes 1024-49151 out of contention entirely -- and also adds the
+three ports as persistent exclusions. It asks before changing the range and
+prints the command to undo it. Docker and WSL work normally with the default
+range. `-Revert` removes the exclusions; `-KeepDynamicRange` skips the range
+change.
+
+**A reboot is required afterwards.** Blocks already handed out during the
+current boot stay held until then, so the ports look blocked even after the
+script succeeds. This is why running it and immediately retrying appears to
+change nothing. Meanwhile the launcher keeps working: it moves each service
+to a free port on its own.
+
+When a service really has failed for some other reason, its own output is
+in the `logs\` folder next to this file.
 
 ## If the Antigravity login expires
 

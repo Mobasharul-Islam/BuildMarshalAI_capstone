@@ -1,0 +1,17 @@
+﻿Padma View Specialised Hospital Extension — Elemental Cost Plan
+Project code PVH-2026,Contract sum BDT 600000000,৳ 60.00 crore,Revision C,14 September 2026
+
+Element,Description,Detail,Amount (BDT),Cost type
+1.0,Preliminaries,"Site management, welfare, insurance and security",38500000,Preliminaries
+2.0,Site preparation and enabling,"Site establishment, demolition and temporary services",18500000,Construction
+3.0,Piling and foundation,"Bored piles, pile caps, grade beams, drainage",79000000,Construction
+4.0,Superstructure,"RCC frame, slabs to Level 5, stair and lift core",142000000,Construction
+5.0,Envelope and roofing,"Masonry, aluminium glazing, waterproofing, external paint",64000000,Construction
+6.0,Mechanical and electrical services,"Electrical, plumbing, HVAC, generator, fire protection",96000000,Construction
+7.0,Internal finishing,"Plaster, tiles, joinery, operation theatre fit-out",81000000,Construction
+8.0,"Commissioning, external works and handover","Lifts, external works, commissioning, handover",29000000,Construction
+9.0,Contingency,Design development and risk allowance,25000000,Contingency
+10.0,Overhead and profit,Contractor overhead and profit,27000000,Overhead
+
+,TOTAL,,600000000,
+,Per square metre,,71429,

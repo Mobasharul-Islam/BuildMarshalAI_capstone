@@ -43,11 +43,29 @@ $environment = [ordered]@{
     HF_HOME = (Join-Path $repoRoot ".buildmarshal_runtime\hf_cache")
 }
 
+# CLIPROXY_BASE_URL is deliberately not persisted when it points at this
+# machine. The proxy's port is not fixed -- Windows reserves blocks of low
+# ports for Hyper-V at every boot, so the launcher moves the proxy when it has
+# to -- and a value stored in the user environment outranks the config the
+# proxy was actually started from, in every shell and every notebook kernel
+# opened afterwards. The backend reads the port from cliproxyapi\config.yaml
+# instead. A remote value, such as a Kaggle or ngrok tunnel, is still kept.
+$loopbackUrl = '^https?://(127\.0\.0\.1|localhost|\[::1\])(:|/|$)'
 foreach ($item in $environment.GetEnumerator()) {
-    if ($item.Value) {
-        [Environment]::SetEnvironmentVariable($item.Key, $item.Value, "Process")
-        [Environment]::SetEnvironmentVariable($item.Key, $item.Value, "User")
+    if (-not $item.Value) { continue }
+    if ($item.Key -eq "CLIPROXY_BASE_URL" -and $item.Value -match $loopbackUrl) {
+        # Clear one an earlier run stored, which would otherwise go on pinning
+        # a port the proxy has since moved off.
+        $stored = [Environment]::GetEnvironmentVariable($item.Key, "User")
+        if ($stored -match $loopbackUrl) {
+            Write-Host "Clearing stale $($item.Key)=$stored from the user environment." -ForegroundColor DarkGray
+            [Environment]::SetEnvironmentVariable($item.Key, $null, "User")
+        }
+        [Environment]::SetEnvironmentVariable($item.Key, $null, "Process")
+        continue
     }
+    [Environment]::SetEnvironmentVariable($item.Key, $item.Value, "Process")
+    [Environment]::SetEnvironmentVariable($item.Key, $item.Value, "User")
 }
 
 New-Item -ItemType Directory -Force -Path $proxyUserRoot | Out-Null

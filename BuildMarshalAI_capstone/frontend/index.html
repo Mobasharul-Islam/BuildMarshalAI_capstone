@@ -17,7 +17,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
     rel="stylesheet">
   <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Outlined" rel="stylesheet">
-  <link rel="stylesheet" href="styles.css?v=20260908-todo">
+  <link rel="stylesheet" href="styles.css?v=20260919-stats">
 </head>
 
 <body>
@@ -62,6 +62,14 @@
           <li class="nav-item" data-page="todo-lists">
             <span class="material-icons-outlined">checklist</span>
             <span class="nav-label">To-Do Lists</span>
+          </li>
+
+          <!-- Onboarding: read an existing project out of its own documents.
+               Administrators only; the nav item is hidden for everyone else
+               and the API refuses them regardless. -->
+          <li class="nav-item" data-page="onboarding" id="navOnboarding" hidden>
+            <span class="material-icons-outlined">auto_awesome_motion</span>
+            <span class="nav-label">Onboarding</span>
           </li>
 
           <!-- Projects -->
@@ -200,12 +208,13 @@
     <!-- ═══ RIGHT CHAT PANEL ═══ -->
     <aside class="chat-panel" id="chatPanel">
       <div class="chat-resize-handle" id="chatResizeHandle" title="Drag to resize"></div>
-      <div class="chat-panel-header">
-        <div class="chat-panel-title">
+      <div class="chat-panel-header" id="chatPanelHeader">
+        <div class="chat-panel-title" id="chatPanelTitle" role="button" tabindex="0"
+          title="Double-click to toggle full screen">
           <div class="marshal-avatar">
             <span class="material-icons-outlined">smart_toy</span>
           </div>
-          <div>
+          <div class="marshal-meta">
             <div class="marshal-name">Marshal</div>
             <div class="marshal-status">
               <span class="status-dot disconnected" id="statusDot"></span>
@@ -214,16 +223,28 @@
           </div>
         </div>
         <div class="chat-header-actions">
-          <button class="btn-icon-only" id="btnChatHistory" aria-label="Chat history" title="Chat history">
+          <button class="btn-icon-only chat-win-hide-min" id="btnChatHistory" aria-label="Chat history"
+            title="Chat history">
             <span class="material-icons-outlined">history</span>
           </button>
-          <button class="btn-icon-only" id="btnNewChat" aria-label="New chat" title="New chat">
+          <button class="btn-icon-only chat-win-hide-min" id="btnNewChat" aria-label="New chat" title="New chat">
             <span class="material-icons-outlined">add_comment</span>
           </button>
-          <button class="btn-icon-only" id="btnExportChat" aria-label="Export to PDF" title="Export to PDF">
+          <button class="btn-icon-only chat-win-hide-min" id="btnExportChat" aria-label="Export to PDF"
+            title="Export to PDF">
             <span class="material-icons-outlined">picture_as_pdf</span>
           </button>
-          <button class="btn-icon-only chat-panel-toggle" id="btnToggleChat" aria-label="Close chat panel">
+          <span class="chat-win-sep chat-win-hide-min" aria-hidden="true"></span>
+          <button class="btn-icon-only chat-win-btn chat-win-hide-min" id="btnChatMinimize" aria-label="Minimize chat"
+            title="Minimize">
+            <span class="material-icons-outlined">minimize</span>
+          </button>
+          <button class="btn-icon-only chat-win-btn" id="btnChatMaximize" aria-label="Maximize chat"
+            aria-pressed="false" title="Full screen">
+            <span class="material-icons-outlined" id="btnChatMaximizeIcon">open_in_full</span>
+          </button>
+          <button class="btn-icon-only chat-win-btn chat-panel-toggle" id="btnToggleChat" aria-label="Close chat panel"
+            title="Close">
             <span class="material-icons-outlined">close</span>
           </button>
         </div>
@@ -493,8 +514,9 @@
   </div>
 
   <script src="https://accounts.google.com/gsi/client" async defer></script>
-  <script src="config.js"></script>
-  <script src="app.js?v=20260908-todo"></script>
+  <script src="local-config.js?v=20260920-ports"></script>
+  <script src="config.js?v=20260920-ports"></script>
+  <script src="app.js?v=20260920-chat-collection"></script>
 </body>
 
 </html>

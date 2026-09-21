@@ -71,16 +71,46 @@ if IS_KAGGLE:
     except Exception as _secret_error:
         print(f"Kaggle Secrets unavailable: {_secret_error}")
 else:
-    # Reuse the API key already configured for the local CLIProxyAPI service.
-    # The value is loaded into memory only and is never printed or copied into
-    # this notebook, so a fresh VS Code kernel does not need manual env setup.
-    _proxy_config = Path.home() / ".cli-proxy-api" / "config.yaml"
-    if not os.environ.get("CLIPROXY_API_KEY") and _proxy_config.exists():
+    # Reuse the API key and the port already configured for the local
+    # CLIProxyAPI service. Values are loaded into memory only and are never
+    # printed or copied into this notebook, so a fresh VS Code kernel needs
+    # no manual environment setup.
+    #
+    # The port is read rather than assumed: Windows hands blocks of low TCP
+    # ports to Hyper-V at every boot and then refuses to bind them, so the
+    # proxy does not always end up on 8317, and a notebook started by hand
+    # does not inherit the launcher's environment variables. Reading the
+    # same file the proxy was started with is what keeps the two agreeing.
+    _from = Path(globals()["__file__"]).resolve().parent if "__file__" in globals() else Path.cwd()
+    _proxy_candidates = [_parent / "cliproxyapi" / "config.yaml"
+                         for _parent in (_from, *_from.parents[:4])]
+    _proxy_candidates.append(Path.home() / ".cli-proxy-api" / "config.yaml")
+    _proxy_port = 8317
+    for _proxy_config in _proxy_candidates:
+        if not _proxy_config.exists():
+            continue
         _config_text = _proxy_config.read_text(encoding="utf-8")
         _key_match = re.search(r"(?m)^api-keys:\s*\r?\n\s*-\s*[\"']?([^\"'\r\n#]+)", _config_text)
-        if _key_match:
+        if _key_match and not os.environ.get("CLIPROXY_API_KEY"):
             os.environ["CLIPROXY_API_KEY"] = _key_match.group(1).strip()
-    os.environ.setdefault("CLIPROXY_BASE_URL", "http://127.0.0.1:8317/v1")
+        _port_match = re.search(r"(?m)^\s*port:\s*(\d+)", _config_text)
+        if _port_match:
+            _proxy_port = int(_port_match.group(1))
+        break
+    # setdefault is not enough: PREPARE-TEAMMATE-PC.ps1 persists
+    # CLIPROXY_BASE_URL as a user environment variable, so a stale port
+    # survives in every shell and kernel and quietly outranks the config the
+    # proxy was actually started from. A loopback address that disagrees
+    # with that config is wrong by construction; a remote one is deliberate.
+    _current = os.environ.get("CLIPROXY_BASE_URL", "").strip()
+    _wanted = f"http://127.0.0.1:{_proxy_port}/v1"
+    _is_loopback = re.match(r"https?://(127\.0\.0\.1|localhost|\[::1\])(:|/|$)",
+                            _current, re.I)
+    if not _current or (_is_loopback and _current.rstrip("/") != _wanted.rstrip("/")):
+        if _current:
+            print(f"CLIPROXY_BASE_URL was {_current}, but the proxy is configured "
+                  f"for port {_proxy_port}; using {_wanted}.")
+        os.environ["CLIPROXY_BASE_URL"] = _wanted
     os.environ.setdefault("CLIPROXY_MODEL", "gemini-3.7-flash-high")
 
 # Keep Kaggle's CUDA wheel repair, but never replace the user's local Windows torch install.
@@ -721,6 +751,18 @@ def process_generic(file_path: Path, doc_id: str, pages_dir: Path) -> List[Dict]
     }]
 
 
+def _file_digest(path: Path, chunk: int = 1024 * 1024) -> str:
+    """A content hash of an upload, read in chunks so a large file never lands
+    in memory.  Matches document_storage.digest_of."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while block := handle.read(chunk):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def ingest_document(file_path: Path, doc_id: str, workspace, display_name: str | None = None) -> Dict:
     """
     Convert document to page screenshots, embed each with ColPali,
@@ -812,6 +854,9 @@ def ingest_document(file_path: Path, doc_id: str, workspace, display_name: str |
         "name":       display_name,
         "type":       ext,
         "size":       file_path.stat().st_size,
+        # A content hash, so the same file uploaded twice is recognised rather
+        # than re-rendered, re-embedded and stored again.  See document_storage.
+        "digest":     _file_digest(file_path),
         "pages":      pages,
         "page_count": len(pages),
         "status":     "indexed",
@@ -1312,6 +1357,32 @@ async def upload_document(
     except Exception as e:
         save_path.unlink(missing_ok=True)
         raise HTTPException(500, detail=f"Could not save file: {e}")
+    # Indexing is the expensive part -- rendering every page, embedding each one,
+    # and storing the result.  The same bytes already indexed cost all of that
+    # again for nothing, so look before doing the work.
+    try:
+        digest = _file_digest(save_path)
+        existing = next(
+            (dict(stored, id=stored_id)
+             for stored_id, stored in workspace.load_metadata().get("documents", {}).items()
+             if stored_id != doc_id and stored.get("digest") == digest),
+            None,
+        )
+    except Exception:
+        existing = None
+    if existing:
+        save_path.unlink(missing_ok=True)
+        return {
+            "id":      existing["id"],
+            "name":    existing.get("name", file.filename),
+            "pages":   existing.get("page_count", 0),
+            "status":  "duplicate",
+            "message": (
+                f"Already indexed as \"{existing.get('name', existing['id'])}\"; "
+                "the existing copy was reused."
+            ),
+        }
+
     try:
         doc_meta = ingest_document(save_path, doc_id, workspace, display_name=file.filename)
         return {
@@ -1359,11 +1430,15 @@ async def document_status(doc_id: str, context=Depends(require_account)):
     }
 
 
-@app.delete("/api/documents/{doc_id}")
-async def delete_document(doc_id: str, context=Depends(require_account)):
-    workspace = context.workspace
+def delete_document_files(workspace, doc_id: str) -> None:
+    """Remove every trace of one document.
+
+    Named and reachable so the storage sweep can collapse a duplicate exactly
+    the way a hand-deletion does, rather than growing a second, divergent
+    cleanup path.
+    """
     meta = workspace.load_metadata()
-    doc  = meta.get("documents", {}).get(doc_id)
+    doc = meta.get("documents", {}).get(doc_id)
     if not doc:
         raise HTTPException(404, detail="Document not found")
 
@@ -1386,13 +1461,31 @@ async def delete_document(doc_id: str, context=Depends(require_account)):
         collection.delete(where={"doc_id": doc_id})
         logger.info(
             f"Vector index: removed entries for doc_id={doc_id} "
-            f"| account {context.account_id} now has {collection.count()} pages"
+            f"| account {workspace.account_id} now has {collection.count()} pages"
         )
     except Exception as e:
         logger.warning(f"Vector index delete failed for {doc_id}: {e}")
 
+    # 3. The ColPali multi-vector cache and the vision tiles are keyed by page
+    #    filename, not by doc_id, so they outlive the document unless they are
+    #    removed here.  Left behind they are unreachable and permanent.
+    import re as _re
+
+    for page in doc.get("pages", []):
+        stored = page.get("image_path") or ""
+        if not stored:
+            continue
+        stem = _re.sub(r"[^A-Za-z0-9._-]+", "_", Path(stored).stem)
+        (Path(workspace.multivector_dir) / f"{stem}.npy").unlink(missing_ok=True)
+        (Path(workspace.vision_cache_dir) / f"{stem}_512.jpg").unlink(missing_ok=True)
+
     del meta["documents"][doc_id]
     workspace.save_metadata(meta)
+
+
+@app.delete("/api/documents/{doc_id}")
+async def delete_document(doc_id: str, context=Depends(require_account)):
+    delete_document_files(context.workspace, doc_id)
     return {"message": "Document deleted", "id": doc_id}
 
 
@@ -1442,6 +1535,15 @@ async def get_page_image(doc_id: str, page_num: int, context=Depends(require_acc
                     '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime',
                 }
                 ct = content_types.get(ext, 'application/octet-stream')
+                # Somebody looked at this document: that is what separates a
+                # document worth keeping cached from one indexed and forgotten.
+                try:
+                    meta = workspace.load_metadata()
+                    if doc_id in meta.get("documents", {}):
+                        meta["documents"][doc_id]["accessed_at"] = datetime.now(timezone.utc).isoformat()
+                        workspace.save_metadata(meta)
+                except Exception:
+                    pass
                 with open(img_path, "rb") as f:
                     return StreamingResponse(BytesIO(f.read()), media_type=ct)
     raise HTTPException(404, detail="Page not found")
@@ -1991,6 +2093,12 @@ if IS_KAGGLE:
                      "tasks.py", "project_management.py", "company_settings.py",
                      "permissions.py", "user_roles.py",
                      "todo_lists.py",
+                     "entity_schema.py",
+                     "project_analytics.py",
+                     "project_report.py",
+                     "document_storage.py",
+                     "project_onboarding.py",
+                     "chat_entities.py",
                      "meeting_language.py",
                      "document_generation.py", "google_workspace.py",
                      "microsoft_workspace.py"):
@@ -2011,6 +2119,12 @@ else:
          and (candidate / "permissions.py").exists()
          and (candidate / "user_roles.py").exists()
          and (candidate / "todo_lists.py").exists()
+         and (candidate / "entity_schema.py").exists()
+         and (candidate / "project_analytics.py").exists()
+         and (candidate / "project_report.py").exists()
+         and (candidate / "document_storage.py").exists()
+         and (candidate / "project_onboarding.py").exists()
+         and (candidate / "chat_entities.py").exists()
          and (candidate / "meeting_language.py").exists()
          and (candidate / "oauth_tokens.py").exists()
          and (candidate / "external_imports.py").exists()
@@ -2033,6 +2147,11 @@ from project_management import register_project_management_routes
 from company_settings import register_company_settings_routes
 from user_roles import register_user_role_routes
 from todo_lists import register_todo_list_routes
+from project_onboarding import register_project_onboarding_routes
+from chat_entities import register_chat_entity_routes
+from project_analytics import register_project_analytics_routes
+from project_report import register_project_report_routes
+from document_storage import register_document_storage_routes
 from hybrid_retrieval import install_hybrid_retrieval
 from evidence_viewer import register_evidence_viewer_routes
 from document_generation import register_kaggle_routes
@@ -2053,6 +2172,16 @@ DOCUMENT_GENERATION_SERVICE = register_kaggle_routes(globals())
 GOOGLE_WORKSPACE_SERVICE = register_google_workspace_routes(globals())
 MICROSOFT_WORKSPACE_SERVICE = register_microsoft_workspace_routes(globals())
 TODO_LIST_SERVICE = register_todo_list_routes(globals())
+# Onboarding registers last: it reuses the project, task, catalogue, and role
+# constructors the modules above install, and writes nothing live until commit.
+PROJECT_ONBOARDING_SERVICE = register_project_onboarding_routes(globals())
+# Marshal Chat can create a project or a user from a sentence; the schema
+# decides what is mandatory and the ordinary create routes do the creating.
+CHAT_ENTITY_SERVICE = register_chat_entity_routes(globals())
+# Statistics, the report that reads them, and the storage the documents sit in.
+PROJECT_ANALYTICS_SERVICE = register_project_analytics_routes(globals())
+PROJECT_REPORT_SERVICE = register_project_report_routes(globals())
+DOCUMENT_STORAGE_SERVICE = register_document_storage_routes(globals())
 print(f"Account isolation active - {ACCOUNT_SERVICE['accounts']} account(s) registered")
 print("Project task routes registered")
 print("Project people, cost, timeline, and procurement routes registered")
@@ -2061,17 +2190,83 @@ print("Exact-page evidence viewer routes registered")
 print("Project document-generation routes registered")
 print("Google Workspace routes registered", "(configured)" if GOOGLE_WORKSPACE_SERVICE["configured"] else "(configure OAuth variables to enable)")
 print("Microsoft 365 routes registered", "(configured)" if MICROSOFT_WORKSPACE_SERVICE["configured"] else "(configure OAuth variables to enable)")
+print(f"Project onboarding routes registered - draft kinds: {', '.join(PROJECT_ONBOARDING_SERVICE['kinds'])}")
+print("Project statistics routes registered -", ", ".join(PROJECT_ANALYTICS_SERVICE["phases"]))
+print("Project report routes registered -", len(PROJECT_REPORT_SERVICE["sections"]), "sections")
+print("Document storage routes registered -", ", ".join(DOCUMENT_STORAGE_SERVICE["actions"]))
 
 
 # ======================================================================
 # CELL 13
 # ======================================================================
 
+import socket
 import uvicorn
 from pyngrok import ngrok
 
+
+def resolve_backend_port():
+    """The port to serve on, which is not always the one that was asked for.
+
+    Windows hands blocks of low TCP ports to Hyper-V at every boot and then
+    refuses to bind them even though nothing is listening on them, so a port
+    that worked yesterday can fail today with "an attempt was made to access
+    a socket in a way forbidden by its access permissions". Serving on a port
+    that works beats refusing to start, and the browser is told where to look
+    by publish_backend_port below.
+    """
+    wanted = int(os.environ.get("BUILDMARSHAL_PORT", "8000"))
+    first_refusal = None
+    for candidate in (wanted, 8900, 8901, 9000, 9100, 18000):
+        # Both addresses: uvicorn binds the wildcard, and on Windows that
+        # succeeds even when another process already holds 127.0.0.1 on the
+        # same port -- the more specific bind then wins every loopback
+        # request and the backend is up but unreachable.
+        blocked = None
+        for address in ("0.0.0.0", "127.0.0.1"):
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                probe.bind((address, candidate))
+            except OSError as error:
+                blocked = error
+            finally:
+                probe.close()
+            if blocked:
+                break
+        if blocked:
+            print(f"Port {candidate} cannot be bound ({blocked.strerror}).")
+            first_refusal = first_refusal or blocked
+            continue
+        if candidate != wanted:
+            # WSAEACCES is Windows refusing a port it has reserved for
+            # Hyper-V; anything else is an ordinary clash with a process.
+            reserved = getattr(first_refusal, "winerror", None) == 10013
+            reason = "is reserved by Windows" if reserved else "is already in use"
+            print(f"Port {wanted} {reason}; serving on {candidate}.")
+            if reserved:
+                print("Run RESERVE-PORTS.ps1 as Administrator to get the usual port back.")
+        return candidate
+    raise RuntimeError("No bindable port for the backend. Run RESERVE-PORTS.ps1 "
+                       "as Administrator, or reboot.")
+
+
+def publish_backend_port(port):
+    """Write the port where the frontend reads it: a browser has no environment."""
+    here = Path(globals()["__file__"]).resolve().parent if "__file__" in globals() else Path.cwd()
+    for parent in (here, *here.parents[:3]):
+        frontend = parent / "frontend"
+        if frontend.is_dir():
+            (frontend / "local-config.js").write_text(
+                "// Written by the backend at startup -- do not edit.\n"
+                "// A URL entered on the sign-in screen still wins over this.\n"
+                f"window.BMARSHAL_API_URL = 'http://127.0.0.1:{port}';\n",
+                encoding="utf-8")
+            return
+
+
 def start_server():
-    port = int(os.environ.get("BUILDMARSHAL_PORT", "8000"))
+    port = resolve_backend_port()
+    publish_backend_port(port)
     public_url = None
     if NGROK_AUTH_TOKEN:
         try:

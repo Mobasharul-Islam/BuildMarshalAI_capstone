@@ -57,3 +57,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Service output captured by START-BUILDMARSHAL.ps1
+logs/
