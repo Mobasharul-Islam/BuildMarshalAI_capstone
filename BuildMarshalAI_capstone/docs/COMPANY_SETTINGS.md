@@ -10,7 +10,7 @@ member of an account can read all three. Only an administrator can change them.
 unchanged:
 
 ```python
-ADMIN_ROLES = frozenset(SYSTEM_ROLES)   # ("Super Admin", "System Admin")
+ADMIN_ROLES = frozenset(SYSTEM_ROLES)   # ("Head (Super Admin)", "Head (System Admin)")
 
 @property
 def is_admin(self) -> bool:
@@ -44,11 +44,11 @@ which `test_all_features.py` checks for all seven write routes.
 
 ## Storage
 
-| Record | File under `accounts/<account_id>/` | Loader |
+| Record | Stored in (PostgreSQL, per account) | Loader |
 | --- | --- | --- |
-| Company profile | `company.json` | `AccountWorkspace.load_company()` |
-| Task types | `management.json` → `task_types` | `AccountWorkspace.load_mgmt()` |
-| Project types | `management.json` → `project_types` | `AccountWorkspace.load_mgmt()` |
+| Company profile | `account_state` → `company` | `AccountWorkspace.load_company()` |
+| Task types | `catalog_entries`, kind `task_types` | `AccountWorkspace.load_mgmt()` |
+| Project types | `catalog_entries`, kind `project_types` | `AccountWorkspace.load_mgmt()` |
 
 `load_mgmt()` backfills any key missing from `DEFAULT_MANAGEMENT`, so an account
 created before project types existed picks up the six defaults on its next read
@@ -56,8 +56,8 @@ rather than needing a migration.
 
 An account that has never opened Company Info still shows something useful: the
 profile is seeded from the account name and the contact details already in
-`settings.json`. Saving writes the four overlapping fields back to `settings.json`
-so the rest of the app keeps reading the same values it always did.
+the account settings. Saving writes the four overlapping fields back to the
+settings so the rest of the app keeps reading the same values it always did.
 
 ## Routes
 

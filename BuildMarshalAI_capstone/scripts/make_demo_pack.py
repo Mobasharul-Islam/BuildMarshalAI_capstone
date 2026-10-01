@@ -183,7 +183,7 @@ TASKS = [
 # ── The team ─────────────────────────────────────────────────────────────
 TEAM = [
     ("Md. Rafiqul Islam", "মোঃ রফিকুল ইসলাম", "rafiqul.islam@purbachalcon.example",
-     "Project Director", "Super Admin", "Management", "01711-902345"),
+     "Project Director", "Head (Super Admin)", "Management", "01711-902345"),
     ("Nusrat Jahan", "নুসরাত জাহান", "nusrat.jahan@purbachalcon.example",
      "Construction Manager", "Project Manager", "Operations", "01711-902416"),
     ("Tanvir Ahmed", "তানভীর আহমেদ", "tanvir.ahmed@prokoushalseba.example",

@@ -34,13 +34,16 @@ account; an id from another account returns 404. See
 [ACCOUNTS_AND_ISOLATION.md](ACCOUNTS_AND_ISOLATION.md).
 
 
-Upload a PDF source to a project:
+Upload a document to a project (any type the Documents page accepts; a PDF's
+text layer is also kept per page for generation). Existing documents are linked
+rather than uploaded again; see
+[PROJECT_SECTIONS.md](PROJECT_SECTIONS.md#project-documents):
 
 ```http
 POST /api/projects/{project_id}/source-documents
 Content-Type: multipart/form-data
 
-file=<pdf>
+file=<file>
 ```
 
 List project sources:
@@ -48,6 +51,32 @@ List project sources:
 ```http
 GET /api/projects/{project_id}/source-documents
 ```
+
+## Language, evidence and Bangla
+
+- **One language per document.** `language` is `English` (default) or `Bangla`.
+  With English, Bangla evidence is translated and a person's, company's or
+  place's name is followed by its Bangla form in brackets; with Bangla, the
+  whole narrative is Bangla while codes, amounts and dates stay as written.
+  Section headings come from the template and stay in English.
+- **Fuller evidence.** Each retrieved page is quoted up to 4,000 characters
+  (`BUILDMARSHAL_DOCGEN_PAGE_CHARS`, total `BUILDMARSHAL_DOCGEN_EVIDENCE_CHARS`
+  = 24,000). A longer page -- a programme sheet -- is quoted by the lines that
+  match the section, plus its opening lines, in page order, instead of its
+  first few hundred characters.
+- **Bangla text extraction.** PDF text is read with PyMuPDF, which keeps Bangla
+  in reading order; pypdf returned vowel signs displaced (`িববরণী` for
+  `বিবরণী`).
+- **Bangla rendering.** Words containing Bangla are set in a Bangla font
+  (Nirmala UI on Windows; Noto Sans Bengali or Lohit Bengali on Linux -- the
+  Kaggle cell installs `fonts-noto-core`; `BUILDMARSHAL_BENGALI_FONT` overrides)
+  and shaped with HarfBuzz (`uharfbuzz`), so conjuncts and vowel signs join.
+  Before this, every Bangla word -- the project name in the title included --
+  printed as blank space. The PDF's copy/search text layer for shaped Bangla is
+  not reliable (a ReportLab limitation); what is printed is.
+- Section sources list document and page. The retrieval score is kept in the
+  record but not printed: scores are normalised within a section, so the
+  weakest candidate always read 0.000 however relevant it was.
 
 Generate a document:
 
@@ -57,6 +86,7 @@ Content-Type: application/json
 
 {
   "doc_kind": "tender_summary",
+  "language": "English",
   "title": null,
   "instructions": "Focus on revised deadlines and allowances",
   "top_k_per_section": 6
@@ -82,7 +112,7 @@ Run the notebook with the Kaggle `GPU T4 x2` accelerator and Internet enabled. T
 
 ## Evidence rules
 
-- Retrieval is filtered by `project_id`.
+- Retrieval is limited to the documents linked to the project (a document can be linked to several).
 - Every generated section records its source document and page.
 - A Qwen citation can reference only source numbers supplied in that section prompt.
 - Later dated addenda are instructed to supersede conflicting original tender information.

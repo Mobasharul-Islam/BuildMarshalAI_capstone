@@ -26,14 +26,18 @@ from __future__ import annotations
 
 import hashlib
 import re
-import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from fastapi import Depends, HTTPException
 from pydantic import BaseModel, Field
+
+try:  # the notebook puts this directory on sys.path
+    from document_links import document_project_ids, set_document_projects
+except ModuleNotFoundError:  # imported as backend.document_storage
+    from backend.document_links import document_project_ids, set_document_projects
 
 
 @dataclass(frozen=True)
@@ -84,6 +88,10 @@ SWEEP_ACTIONS: tuple[tuple[str, str], ...] = (
     ("compact", "Recompress page images that are larger than they need to be"),
     ("evict", "Drop rebuildable caches for the least recently used documents"),
 )
+
+# What a sweep request that names no action does: the one action that is
+# always safe.  Anything lossy has to be asked for by name.
+DEFAULT_SWEEP_ACTIONS: tuple[str, ...] = ("orphans",)
 
 DEFAULT_POLICY: dict[str, Any] = {
     # Nothing is reclaimed below this; a small workspace is not worth managing.
@@ -254,6 +262,7 @@ def document_rows(workspace: Any) -> list[dict[str, Any]]:
             "id": doc_id,
             "name": _text(document.get("name")) or doc_id,
             "project_id": document.get("project_id"),
+            "project_ids": document_project_ids(document),
             "pages": int(document.get("page_count") or len(document.get("pages", []) or [])),
             "bytes": total, "human": human_bytes(total),
             "breakdown": {name: {"bytes": size, "human": human_bytes(size),
@@ -375,6 +384,7 @@ def duplicate_groups(workspace: Any) -> dict[str, Any]:
         by_digest.setdefault(digest, []).append({
             "id": doc_id, "name": _text(document.get("name")) or doc_id,
             "project_id": document.get("project_id"),
+            "project_ids": document_project_ids(document),
             "bytes": rows.get(doc_id, {}).get("bytes", 0),
             "created_at": _text(document.get("created_at")),
         })
@@ -471,9 +481,13 @@ def plan_sweep(workspace: Any, *, actions: Sequence[str] = (),
                policy: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """What a sweep would reclaim, without reclaiming any of it.
 
-    Read-only by construction, and it returns the very lists :func:`run_sweep`
-    consumes, so the confirmation an administrator sees is what actually
-    happens.
+    Read-only by construction.  It computes the same selection that
+    :func:`run_sweep` recomputes at execution time, so for the same
+    ``actions`` the confirmation an administrator sees is what happens.  With
+    no ``actions`` it previews every action (the storage report's "what could
+    be reclaimed"); a sweep request resolves an empty list to
+    :data:`DEFAULT_SWEEP_ACTIONS` before planning or running, so the two never
+    disagree.
     """
     policy = dict(policy or policy_of(workspace))
     wanted = set(actions) or {key for key, _ in SWEEP_ACTIONS}
@@ -601,7 +615,7 @@ def run_sweep(workspace: Any, *, actions: Sequence[str] = (),
     touch rather than trusting a plan that may be minutes old.
     """
     policy = dict(policy or policy_of(workspace))
-    wanted = set(actions) or {"orphans"}
+    wanted = set(actions) or set(DEFAULT_SWEEP_ACTIONS)
     done: list[dict[str, Any]] = []
     freed = 0
 
@@ -621,6 +635,16 @@ def run_sweep(workspace: Any, *, actions: Sequence[str] = (),
             for copy in group["copies"]:
                 if delete_document is None:
                     break
+                # The copy's projects move to the one that stays, so collapsing
+                # never takes a document off a project it was filed under.
+                metadata = workspace.load_metadata()
+                documents = metadata.get("documents", {})
+                kept, gone = documents.get(group["keep"]["id"]), documents.get(copy["id"])
+                if kept is not None and gone is not None:
+                    merged = document_project_ids(kept) + document_project_ids(gone)
+                    if merged != document_project_ids(kept):
+                        set_document_projects(kept, merged)
+                        workspace.save_metadata(metadata)
                 before = sum(_bytes_of(paths) for paths in
                              document_files(workspace, copy["id"],
                                             workspace.load_metadata()
@@ -762,10 +786,13 @@ def register_document_storage_routes(namespace: Mapping[str, Any]) -> dict[str, 
         unknown = set(body.actions) - {key for key, _ in SWEEP_ACTIONS}
         if unknown:
             raise HTTPException(422, detail=f"Unknown sweep action(s): {', '.join(sorted(unknown))}")
-        plan = plan_sweep(context.workspace, actions=body.actions)
+        # Resolve the default once, so the plan shown and the sweep run are
+        # the same actions even when the request names none.
+        actions = list(body.actions) or list(DEFAULT_SWEEP_ACTIONS)
+        plan = plan_sweep(context.workspace, actions=actions)
         if not body.confirm:
             return {"confirmation_required": True, **plan}
-        outcome = run_sweep(context.workspace, actions=body.actions,
+        outcome = run_sweep(context.workspace, actions=actions,
                             delete_document=remover(context))
         return {"confirmation_required": False, **outcome,
                 "storage": storage_report(context.workspace)}
@@ -781,7 +808,7 @@ def register_document_storage_routes(namespace: Mapping[str, Any]) -> dict[str, 
 
 
 __all__ = [
-    "AREAS", "DEFAULT_POLICY", "POLICY_KEY", "SWEEP_ACTIONS", "Area",
+    "AREAS", "DEFAULT_POLICY", "DEFAULT_SWEEP_ACTIONS", "POLICY_KEY", "SWEEP_ACTIONS", "Area",
     "area_usage", "cold_documents", "compact_page", "digest_of",
     "directory_size", "document_files", "document_rows", "duplicate_groups",
     "find_by_digest", "find_orphans", "human_bytes", "last_used", "note_access",

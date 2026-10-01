@@ -31,7 +31,6 @@ const APP_CONFIG = {
     }
     return saved || announced || 'http://127.0.0.1:8000';
   })(),
-  VOICE_API_URL: '',
   MODEL: 'gemini-3.7-flash-high',
   TOP_K: 5,
   MAX_FILE_SIZE: 50 * 1024 * 1024,

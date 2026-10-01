@@ -26,7 +26,7 @@ the workspace's real data — not by the model — so there is nothing to invent
 | Backend | [`backend/project_onboarding.py`](../backend/project_onboarding.py) |
 | Tests | [`test_entity_schema.py`](../backend/tests/test_entity_schema.py), [`test_project_onboarding.py`](../backend/tests/test_project_onboarding.py) |
 | Frontend | the **Onboarding** page in `frontend/app.js` |
-| Storage | `onboarding.json` in the caller's workspace |
+| Storage | the `onboarding_drafts` table, in the caller's workspace |
 | Who | account administrators only |
 
 ---
@@ -43,7 +43,7 @@ Eleven kinds, each mapped onto a record the application already has. The
 | Task type | — | name | a `task_types` entry |
 | Trade | — | name | a `trades` entry |
 | External company | — | name | a `vendors` entry |
-| Role | — | name | a role in `user_roles.json` |
+| Role | — | name | a role in the account's `roles` |
 | Project | — | name, project code | a project |
 | User | — | name, email | an account member (+ project membership) |
 | Task | a project | name, project | a task under it, nesting as subtasks |
@@ -122,6 +122,22 @@ of the records that actually exist**, never free text, so there is no way to typ
 a project that nobody has.
 
 #### Creating and editing in conversation
+
+**Review & complete** lists every kind of record the draft holds, each in its
+own section — projects, people, tasks, task and project costs, procurement,
+external companies, trades, task and project types, roles — built from the
+schema's own list of kinds rather than a fixed set, so a kind added later
+appears too. Each row says where it belongs ("In Padma View › Piling", "On
+Padma View"), every row opens for editing, and the summary tiles jump to their
+section. **By project** switches to the hierarchy: each project with its tasks,
+costs and people beneath it. A task outside its drafted project's dates is
+marked with the reason and cannot be onboarded until it is moved.
+
+Confirming links the documents the draft was built from to the project they
+describe, so the new project's **Project Documents** lists them and a chat
+question naming it searches them. A document belongs to each project one of its
+items belongs to; with a single project in the draft, every attached document
+is that project's.
 
 The command bar takes a sentence, typed or dictated through the existing
 voice-transcription service:
@@ -212,7 +228,7 @@ result. It is never written to the draft.
 **Roles.** The model proposes a permission set for each role it finds, pre-ticked
 in the draft for review — a role grants real authority, so the editor puts the
 full permission catalogue in front of the administrator before anything is
-created. Creating roles stays Super Admin work; a System Admin's commit reports
+created. Creating roles stays Head (Super Admin) work; a Head (System Admin)'s commit reports
 role records as skipped. A role named on a person but absent from the account is
 dropped and reported rather than stored as a label that resolves to no
 permissions.

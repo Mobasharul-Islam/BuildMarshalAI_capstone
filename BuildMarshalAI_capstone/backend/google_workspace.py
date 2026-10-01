@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import html
-import io
 import json
 import os
 import re
@@ -22,14 +21,14 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 try:  # the notebook puts this directory on sys.path
     from meeting_language import (
-        EMAIL_PATTERN, MEET_FIELD_QUESTIONS, MeetScheduleRequest, extraction_prompt,
+        MeetScheduleRequest, extraction_prompt,
         meeting_proposal, merge_meet_fields, normalise_meet_fields, parse_extraction,
         parse_meeting_start, validate_meet_fields,
     )
@@ -39,7 +38,7 @@ try:  # the notebook puts this directory on sys.path
     from oauth_tokens import utcnow as _utcnow
 except ModuleNotFoundError:  # imported as backend.google_workspace
     from backend.meeting_language import (
-        EMAIL_PATTERN, MEET_FIELD_QUESTIONS, MeetScheduleRequest, extraction_prompt,
+        MeetScheduleRequest, extraction_prompt,
         meeting_proposal, merge_meet_fields, normalise_meet_fields, parse_extraction,
         parse_meeting_start, validate_meet_fields,
     )
@@ -68,6 +67,11 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
 ]
+
+#: Drive's folder type, and the characters a Drive file or folder id is made
+#: of. An id is interpolated into a Drive query, so anything else is refused.
+DRIVE_FOLDER = "application/vnd.google-apps.folder"
+DRIVE_ID = re.compile(r"[A-Za-z0-9_-]{1,200}")
 
 GOOGLE_EXPORTS = {
     "application/vnd.google-apps.document": ("application/pdf", ".pdf"),
@@ -243,7 +247,7 @@ def register_google_workspace_routes(namespace: Mapping[str, Any]) -> Any:
         with _stores_lock:
             store = _stores.get(workspace.account_id)
             if store is None:
-                store = EncryptedAccountStore(Path(workspace.google_store_file), encryption_key)
+                store = EncryptedAccountStore(workspace.token_store("google"), encryption_key)
                 _stores[workspace.account_id] = store
             return store
 
@@ -415,30 +419,47 @@ def register_google_workspace_routes(namespace: Mapping[str, Any]) -> Any:
 
     @app.get("/api/google/drive/files")
     async def google_drive_files(account_id: str, q: str = "", page_size: int = 50,
-                                 page_token: str | None = None,
+                                 page_token: str | None = None, folder_id: str = "root",
                                  context=Depends(require_account)) -> dict[str, Any]:
+        """One folder's contents, folders first -- or a search across the drive.
+
+        The folder id goes into a Drive query string, so it is held to the
+        characters Drive ids are made of rather than trusted.
+        """
         drive = service(context.workspace, account_id, "drive", "v3")
-        query = "trashed = false and mimeType != 'application/vnd.google-apps.folder'"
         if q.strip():
-            clean = q.replace("'", "\\'")
-            query += f" and name contains '{clean}'"
+            clean = q.replace("\\", "\\\\").replace("'", "\\'")
+            query = f"trashed = false and name contains '{clean}'"
+        else:
+            folder = str(folder_id or "root").strip()
+            if not DRIVE_ID.fullmatch(folder):
+                raise HTTPException(422, "Invalid folder id")
+            query = f"trashed = false and '{folder}' in parents"
         result = drive.files().list(
             q=query, pageSize=min(max(page_size, 1), 100), pageToken=page_token,
-            orderBy="modifiedTime desc",
+            orderBy="folder,modifiedTime desc",
             fields="nextPageToken,files(id,name,mimeType,size,modifiedTime,webViewLink,iconLink)",
         ).execute()
-        return {"files": result.get("files", []), "next_page_token": result.get("nextPageToken")}
+        files = [{**item, "is_folder": item.get("mimeType") == DRIVE_FOLDER}
+                 for item in result.get("files", [])]
+        return {"files": files, "next_page_token": result.get("nextPageToken"),
+                "folder_id": None if q.strip() else folder}
 
     @app.post("/api/google/drive/import")
     async def google_drive_import(
         body: ImportRequest, context=Depends(require_account)
     ) -> dict[str, Any]:
+        context.require("document.upload", "adding documents")
         workspace = context.workspace
         drive = service(workspace, body.account_id, "drive", "v3")
         imported, errors = [], []
         for item_id in body.item_ids:
             try:
                 item = drive.files().get(fileId=item_id, fields="id,name,mimeType,modifiedTime").execute()
+                if item.get("mimeType") == DRIVE_FOLDER:
+                    # A folder has no content of its own to index; its files do.
+                    errors.append({"item_id": item_id, "error": f"{item.get('name')} is a folder"})
+                    continue
                 path, display_name = download_drive_file(workspace, drive, item)
                 imported.append(ingest_path(
                     workspace, path, display_name, body.project_id, "google_drive",
@@ -476,6 +497,7 @@ def register_google_workspace_routes(namespace: Mapping[str, Any]) -> Any:
     async def google_gmail_import(
         body: ImportRequest, context=Depends(require_account)
     ) -> dict[str, Any]:
+        context.require("document.upload", "adding documents")
         workspace = context.workspace
         gmail = service(workspace, body.account_id, "gmail", "v1")
         imported, errors = [], []
@@ -728,6 +750,28 @@ def register_google_workspace_routes(namespace: Mapping[str, Any]) -> Any:
             calendarId="primary", eventId=event_id, body=patch, sendUpdates="all",
         ), "update")
         return {"updated": True, "event": updated, "meet_link": meet_link(updated)}
+
+    @app.delete("/api/google/calendar/events/{event_id}")
+    async def google_calendar_delete(
+        event_id: str, account_id: str, confirm: bool = False,
+        context=Depends(require_account),
+    ) -> dict[str, Any]:
+        """Cancel an event in the user's real Google Calendar.
+
+        Events could be created and edited here but not removed, so a meeting
+        booked by mistake had to be cleared up in Google itself. Like every
+        other outward action, nothing happens without ``confirm=true``: the
+        first call names the event, and attendees are told it was cancelled.
+        """
+        calendar = service(context.workspace, account_id, "calendar", "v3")
+        event = run_calendar(calendar.events().get(calendarId="primary", eventId=event_id), "read")
+        summary = {"id": event.get("id"), "summary": event.get("summary"),
+                   "start": event.get("start"), "attendees": len(event.get("attendees") or [])}
+        if not confirm:
+            return {"confirmation_required": True, "action": "delete_calendar_event", "event": summary}
+        run_calendar(calendar.events().delete(
+            calendarId="primary", eventId=event_id, sendUpdates="all"), "delete")
+        return {"deleted": True, "event": summary}
 
     @app.post("/api/google/assistant/interpret")
     async def google_assistant_interpret(

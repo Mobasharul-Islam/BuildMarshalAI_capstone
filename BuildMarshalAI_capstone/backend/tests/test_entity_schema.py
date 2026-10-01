@@ -95,17 +95,17 @@ def context(make_account):
     return ctx
 
 
-def test_a_task_without_a_name_is_refused_by_the_task_route(context):
+def test_a_task_without_a_name_is_refused_by_the_task_route(context, registry):
     """Schema says ``name`` is mandatory for a task; the route agrees."""
     assert "name" in {item.name for item in entity("task").required_fields}
-    client = _client(register_task_routes, context)
+    client = _client(register_task_routes, context, ACCOUNT_REGISTRY=registry)
     assert client.post("/api/projects/p1/tasks", json={"name": "  "}).status_code == 422
     assert client.post("/api/projects/p1/tasks", json={"name": "Pour slab"}).status_code == 200
 
 
-def test_every_other_task_field_really_is_optional(context):
+def test_every_other_task_field_really_is_optional(context, registry):
     """Only ``name`` is mandatory, so a task with nothing else must be accepted."""
-    client = _client(register_task_routes, context)
+    client = _client(register_task_routes, context, ACCOUNT_REGISTRY=registry)
     created = client.post("/api/projects/p1/tasks", json={"name": "Bare"})
     assert created.status_code == 200
     optional = {item.name for item in entity("task").fields if not item.required}
@@ -198,7 +198,7 @@ def test_zero_is_an_answer_but_nothing_is_not():
 
 
 def test_a_role_with_no_permissions_is_still_complete():
-    """Permissions are optional: a named role a Super Admin fills in later is valid."""
+    """Permissions are optional: a named role a Head (Super Admin) fills in later is valid."""
     assert is_complete("role_type", {"name": "Site Lead", "permissions": []})
 
 
@@ -259,7 +259,7 @@ def test_reference_choices_come_from_the_workspace(make_account, registry):
                               account_id=context.account_id)
     assert [row["detail"] for row in people] == ["owner@example.com"]
     # The built-in roles are offered even before any custom one is made.
-    assert "Super Admin" in [row["label"] for row in
+    assert "Head (Super Admin)" in [row["label"] for row in
                              reference_choices("role_type", workspace=context.workspace)]
 
 
@@ -305,7 +305,7 @@ def test_reconcile_is_happy_with_the_real_constructors():
         server_owned={
             "task": ("id", "project_id", "created_at", "updated_at", "parent_id", "cost"),
             "task_type": ("id", "created_at"), "project_type": ("id", "created_at"),
-            "role_type": ("id", "created_at", "updated_at"),
+            "role_type": ("id", "created_at", "updated_at", "upgrades"),
             "procurement": ("id", "project_id", "created_at", "updated_at"),
         },
     )

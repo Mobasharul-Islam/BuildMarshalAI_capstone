@@ -6,6 +6,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI
 
 from backend.document_generation import register_kaggle_routes
+from backend.oauth_tokens import MemoryTokenStorage
 from backend.google_workspace import (
     EncryptedAccountStore,
     _account_id,
@@ -28,28 +29,28 @@ def test_google_credentials_expiry_preserves_naive_timestamp():
     assert _credentials_expiry(None) is None
 
 
-def test_account_store_encrypts_tokens_at_rest(tmp_path):
-    path = tmp_path / "accounts.enc"
+def test_account_store_encrypts_tokens_at_rest():
+    storage = MemoryTokenStorage()
     key = Fernet.generate_key().decode("ascii")
-    store = EncryptedAccountStore(path, key)
+    store = EncryptedAccountStore(storage, key)
     record = {
         "id": "account-1", "email": "user@example.com", "name": "User",
         "access_token": "secret-access-token", "refresh_token": "secret-refresh-token",
     }
     store.put(record)
 
-    raw = path.read_bytes()
+    raw = storage.read()
     assert b"secret-access-token" not in raw
     assert b"secret-refresh-token" not in raw
     assert store.get("account-1")["refresh_token"] == "secret-refresh-token"
     assert "refresh_token" not in store.list_public()[0]
 
 
-def test_account_store_rejects_wrong_encryption_key(tmp_path):
-    path = tmp_path / "accounts.enc"
-    EncryptedAccountStore(path, Fernet.generate_key().decode()).put({"id": "one"})
+def test_account_store_rejects_wrong_encryption_key():
+    storage = MemoryTokenStorage()
+    EncryptedAccountStore(storage, Fernet.generate_key().decode()).put({"id": "one"})
     with pytest.raises(InvalidToken):
-        EncryptedAccountStore(path, Fernet.generate_key().decode()).list_public()
+        EncryptedAccountStore(storage, Fernet.generate_key().decode()).list_public()
 
 
 def test_gmail_multipart_prefers_plain_text():
@@ -76,7 +77,7 @@ def test_registered_routes_build_openapi_schema(registry):
 
     namespace = {
         "app": FastAPI(),
-        "ingest_document": lambda *_: {"page_count": 0},
+        "ingest_document": lambda *_args, **_kwargs: {"page_count": 0},
         "embed_query": lambda *_: None,
         "vl_generate": lambda *_args, **_kwargs: "{}",
         "require_account": require_account,

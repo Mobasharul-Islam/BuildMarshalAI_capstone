@@ -1,12 +1,12 @@
-"""User Roles: the permission sets a Super Admin defines for their workspace.
+"""User Roles: the permission sets a Head (Super Admin) defines for their workspace.
 
-Only two roles exist without being created -- Super Admin and System Admin --
+Only two roles exist without being created -- Head (Super Admin) and Head (System Admin) --
 and neither can be edited or removed here. Every other role in an account is a
 name plus the permissions ticked for it.
 
-Creating, editing, and deleting roles is Super Admin work and is not itself a
+Creating, editing, and deleting roles is Head (Super Admin) work and is not itself a
 permission. An authority that could be ticked on a custom role would be an
-authority a Super Admin could give away by accident, so it is not offered.
+authority a Head (Super Admin) could give away by accident, so it is not offered.
 """
 
 from __future__ import annotations
@@ -19,13 +19,13 @@ from fastapi import Depends, HTTPException, Request
 
 try:  # the notebook puts this directory on sys.path
     from permissions import (
-        BUILTIN_ROLES, PERMISSION_KEYS, SUPER_ADMIN_ROLE, SYSTEM_ADMIN_ROLE,
-        clean_permissions, permission_catalogue,
+        BUILTIN_ROLE_IDS, BUILTIN_ROLES, PERMISSION_KEYS, SUPER_ADMIN_ROLE, UPGRADE_IDS,
+        clean_permissions, permission_catalogue, reserved_role_names,
     )
 except ModuleNotFoundError:  # imported as backend.user_roles
     from backend.permissions import (
-        BUILTIN_ROLES, PERMISSION_KEYS, SUPER_ADMIN_ROLE, SYSTEM_ADMIN_ROLE,
-        clean_permissions, permission_catalogue,
+        BUILTIN_ROLE_IDS, BUILTIN_ROLES, PERMISSION_KEYS, SUPER_ADMIN_ROLE, UPGRADE_IDS,
+        clean_permissions, permission_catalogue, reserved_role_names,
     )
 
 
@@ -43,6 +43,9 @@ def make_role(data: Mapping[str, Any]) -> dict[str, Any]:
         "name": _text(data.get("name")),
         "description": _text(data.get("description")),
         "permissions": clean_permissions(data.get("permissions") or ()),
+        # Made after every permission upgrade so far, so none of them apply:
+        # a new role holds exactly what it was given.
+        "upgrades": list(UPGRADE_IDS),
         "created_at": _now(),
         "updated_at": _now(),
     }
@@ -53,7 +56,9 @@ def validate_role_name(name: str, roles: Sequence[Mapping[str, Any]],
     if not name:
         raise HTTPException(422, "Role name is required")
     lowered = name.casefold()
-    if lowered in {builtin.casefold() for builtin in BUILTIN_ROLES}:
+    # The built-ins' former names are reserved too, or an old label could come
+    # back as a custom role with none of the built-in's authority.
+    if lowered in reserved_role_names():
         raise HTTPException(409, f"\"{name}\" is a built-in role and cannot be redefined")
     for role in roles:
         if role.get("id") == ignore_id:
@@ -72,7 +77,7 @@ def builtin_role_rows() -> list[dict[str, Any]]:
     """The two built-ins, shaped like custom roles so one table renders both."""
     return [
         {
-            "id": f"builtin-{name.replace(' ', '-').lower()}",
+            "id": BUILTIN_ROLE_IDS[name],
             "name": name,
             "description": (
                 "Full access to everything, and the only role that can manage roles "
@@ -110,7 +115,7 @@ def register_user_role_routes(namespace: Mapping[str, Any]) -> dict[str, Any]:
 
     @app.get("/api/user-roles")
     async def list_roles(context=Depends(require_account)) -> dict[str, Any]:
-        """Every role in this account. Any member may look; only a Super Admin may change."""
+        """Every role in this account. Any member may look; only a Head (Super Admin) may change."""
         custom = [
             {**role, "builtin": False, "editable": True,
              "users": count_role_holders(account_users(context), role.get("name", ""))}

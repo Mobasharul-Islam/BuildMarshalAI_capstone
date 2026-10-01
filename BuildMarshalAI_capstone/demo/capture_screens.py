@@ -194,8 +194,10 @@ def capture() -> tuple[list[tuple[str, int]], dict]:
     browser = driver()
     shoot = Shooter(browser)
     try:
-        # 1 — the gate, photographed before any session exists.
-        browser.get(BASE)
+        # 1 — the gate, photographed before any session exists. A signed-out
+        # visit to the root now shows the homepage, so the sign-in screen is
+        # asked for by name.
+        browser.get(f"{BASE}/index.html?signin")
         shoot.wait_for("#authGate, .auth-gate, input[type=password]", 15)
         time.sleep(1.5)
         shoot.shot("01-signin", "the gate every account starts behind")

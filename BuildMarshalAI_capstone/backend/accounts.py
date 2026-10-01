@@ -20,10 +20,10 @@ workspace resolved from the caller's bearer token.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import hmac
 import json
-import os
 import re
 import secrets
 import shutil
@@ -37,17 +37,27 @@ from typing import Any, Callable, Mapping, Sequence
 
 try:  # the notebook puts this directory on sys.path
     from permissions import (
-        BUILTIN_ROLES, PERMISSION_KEYS, SUPER_ADMIN_ROLE, SYSTEM_ADMIN_ROLE,
-        clean_permissions, is_builtin_admin, is_super_admin, resolve_permissions,
-        role_names,
+        BUILTIN_ROLES, PERMISSION_KEYS, SUPER_ADMIN_ROLE, apply_permission_upgrades,
+        canonical_role, is_super_admin, resolve_permissions, role_names,
     )
 except ModuleNotFoundError:  # imported as backend.accounts
     from backend.permissions import (
-        BUILTIN_ROLES, PERMISSION_KEYS, SUPER_ADMIN_ROLE, SYSTEM_ADMIN_ROLE,
-        clean_permissions, is_builtin_admin, is_super_admin, resolve_permissions,
-        role_names,
+        BUILTIN_ROLES, PERMISSION_KEYS, SUPER_ADMIN_ROLE, apply_permission_upgrades,
+        canonical_role, is_super_admin, resolve_permissions, role_names,
     )
 
+try:
+    from database import (
+        CATALOG, CONVERSATIONS, DOCUMENTS, EVIDENCE, GENERATED, ONBOARDING, PROCUREMENT,
+        PROJECTS, ROLES, TASKS, Database, as_jsonb, default_database,
+    )
+except ModuleNotFoundError:
+    from backend.database import (
+        CATALOG, CONVERSATIONS, DOCUMENTS, EVIDENCE, GENERATED, ONBOARDING, PROCUREMENT,
+        PROJECTS, ROLES, TASKS, Database, as_jsonb, default_database,
+    )
+
+import psycopg
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
@@ -57,7 +67,9 @@ from pydantic import BaseModel, Field
 # --------------------------------------------------------------------------
 
 PBKDF2_ALGORITHM = "pbkdf2_sha256"
-PBKDF2_ITERATIONS = 240_000
+# OWASP's current recommendation for PBKDF2-HMAC-SHA256.  Hashes stored with a
+# lower count keep working and are upgraded the next time their owner signs in.
+PBKDF2_ITERATIONS = 600_000
 SESSION_TTL_HOURS = 12
 SESSION_IDLE_HOURS = 4
 MAX_SESSIONS_PER_USER = 12
@@ -66,7 +78,7 @@ MIN_PASSWORD_LENGTH = 8
 # Roles that administer the account itself. These are system-level and stay
 # separate from what someone does day to day.
 # The only roles that exist without being created. Everything else is made by
-# a Super Admin on the User Roles page and is exactly the permissions it was
+# a Head (Super Admin) on the User Roles page and is exactly the permissions it was
 # given, so no job title is hardcoded here.
 SYSTEM_ROLES: tuple[str, ...] = BUILTIN_ROLES
 OWNER_ROLE = SUPER_ADMIN_ROLE
@@ -84,7 +96,6 @@ _COST_KEYS = ("project.cost.base", "project.cost.additional", "project.cost.task
 DEFAULT_SETTINGS: dict[str, Any] = {
     "model": "gemini-3.7-flash-high",
     "top_k": 5,
-    "voice_api_url": "",
     "company_name": "",
     "company_email": "",
     "company_phone": "",
@@ -173,30 +184,50 @@ def hash_password(plain: str) -> str:
 def verify_password(plain: str, stored: str) -> tuple[bool, bool]:
     """Check ``plain`` against ``stored``.
 
-    Returns ``(is_valid, needs_rehash)``.  Accounts created before per-user
-    salting used a bare SHA-256 digest; those still authenticate once and are
-    transparently upgraded to PBKDF2 by the caller.
+    Returns ``(is_valid, needs_rehash)``.  ``needs_rehash`` is set for any hash
+    weaker than what :func:`hash_password` writes today: a bare SHA-256 digest
+    from before per-user salting, or PBKDF2 at fewer than
+    :data:`PBKDF2_ITERATIONS`.  Both still authenticate, and the caller
+    upgrades them transparently on a successful sign-in.
     """
     stored = str(stored or "")
     if stored.startswith(PBKDF2_ALGORITHM + "$"):
         try:
             _, iterations, salt_hex, digest_hex = stored.split("$", 3)
+            rounds = int(iterations)
             expected = bytes.fromhex(digest_hex)
             actual = hashlib.pbkdf2_hmac(
-                "sha256", plain.encode("utf-8"), bytes.fromhex(salt_hex), int(iterations)
+                "sha256", plain.encode("utf-8"), bytes.fromhex(salt_hex), rounds
             )
         except (ValueError, TypeError):
             return False, False
-        return hmac.compare_digest(expected, actual), False
+        return hmac.compare_digest(expected, actual), rounds < PBKDF2_ITERATIONS
     if len(stored) == 64:
         legacy = hashlib.sha256(plain.encode("utf-8")).hexdigest()
         return hmac.compare_digest(legacy, stored), True
     return False, False
 
 
+@functools.lru_cache(maxsize=1)
+def dummy_password_hash() -> str:
+    """A hash of a random password, made once per process.
+
+    Login verifies against it when the email is unknown, so a missing account
+    costs exactly one key derivation at the current work factor -- the same as
+    a wrong password -- and the response time does not reveal which emails are
+    registered.  Built once because building it per request would double the
+    cost of that path, which is the leak this exists to close.
+    """
+    return hash_password(secrets.token_hex(16))
+
+
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
+
+# JSON-file helpers.  Records are no longer stored in files; these remain for
+# reading the files a pre-database installation left behind (see
+# ``json_storage_import`` and :func:`migrate_legacy_workspace`).
 
 def read_json(path: Path, default: Any) -> Any:
     if not path.exists():
@@ -221,17 +252,66 @@ def write_json(path: Path, payload: Any) -> None:
 # Workspace
 # --------------------------------------------------------------------------
 
-class AccountWorkspace:
-    """Every file and index owned by a single account.
+def _text(value: Any) -> str:
+    return "" if value is None else str(value)
 
-    Nothing in this class accepts an absolute path from a request.  Callers pass
-    ids; the workspace turns them into paths beneath its own root, so a request
-    handled for one account can never name a file belonging to another.
+
+def _optional(value: Any) -> str | None:
+    return None if value in (None, "") else str(value)
+
+
+def _keyed(items: Sequence[Any]) -> list[tuple[str, Any]]:
+    """Give each list item a row key: its own id, or its position if it has none.
+
+    A list store may hold items without an id, or (in old data) two with the
+    same one; each still needs a distinct row, and the item itself is stored
+    unchanged, so what reads back is exactly what was saved.
+    """
+    seen: set[str] = set()
+    keyed: list[tuple[str, Any]] = []
+    for index, item in enumerate(items):
+        key = _text(item.get("id")) if isinstance(item, Mapping) else ""
+        key = key or f"#{index}"
+        while key in seen:
+            key = f"{key}#{index}"
+        seen.add(key)
+        keyed.append((key, item))
+    return keyed
+
+
+def _field(record: Any, name: str) -> Any:
+    return record.get(name) if isinstance(record, Mapping) else None
+
+
+class TokenStorage:
+    """One encrypted OAuth token blob, kept in the database for one account."""
+
+    def __init__(self, database: Database, account_id: str, provider: str):
+        self.database, self.account_id, self.provider = database, account_id, provider
+
+    def read(self) -> bytes | None:
+        return self.database.get_token_store(self.account_id, self.provider)
+
+    def write(self, ciphertext: bytes) -> None:
+        self.database.put_token_store(self.account_id, self.provider, ciphertext)
+
+
+class AccountWorkspace:
+    """Every record, file and index owned by a single account.
+
+    Records -- projects, tasks, documents, catalogues, roles and the rest --
+    live in PostgreSQL, in rows keyed by this account's id; the load/save pairs
+    below read and write them.  Files -- uploads, page images, caches,
+    generated PDFs -- live under ``root``.  Nothing in this class accepts an
+    absolute path or an account id from a request: callers pass record ids, and
+    the workspace scopes every query and every path to its own account.
     """
 
-    def __init__(self, root: Path, account_id: str, chroma_factory: Callable[[Path], Any]):
+    def __init__(self, root: Path, account_id: str, chroma_factory: Callable[[Path], Any],
+                 database: Database | None = None):
         self.account_id = account_id
         self.root = Path(root).resolve()
+        self.db = database or default_database()
         self._chroma_factory = chroma_factory
         self._client: Any = None
         self._collection: Any = None
@@ -244,20 +324,6 @@ class AccountWorkspace:
         self.generated_dir = self.root / "generated_documents"
         self.imports_dir = self.root / "google_imports"
         self.vision_cache_dir = self.root / "document_generation_vision_cache"
-
-        self.metadata_file = self.root / "metadata.json"
-        self.mgmt_file = self.root / "management.json"
-        self.projects_file = self.root / "projects.json"
-        self.tasks_file = self.root / "tasks.json"
-        self.procurement_file = self.root / "procurement.json"
-        self.settings_file = self.root / "settings.json"
-        self.company_file = self.root / "company.json"
-        self.roles_file = self.root / "user_roles.json"
-        self.conversations_file = self.root / "conversations.json"
-        self.onboarding_file = self.root / "onboarding.json"
-        self.evidence_file = self.root / "evidence_feedback.json"
-        self.generated_registry = self.root / "generated_documents.json"
-        self.google_store_file = self.root / "google_workspace_accounts.enc"
 
     # -- filesystem ------------------------------------------------------
 
@@ -321,52 +387,130 @@ class AccountWorkspace:
             except Exception:
                 pass
 
-    # -- JSON stores -----------------------------------------------------
+    # -- records -----------------------------------------------------------
+
+    def atomic(self):
+        """One transaction around several saves: all of them land, or none."""
+        return self.db.atomic()
+
+    def _rows(self, table) -> list[dict[str, Any]]:
+        return self.db.load_rows(table, self.account_id)
+
+    def _sync(self, table, rows: list[dict[str, Any]]) -> None:
+        self.db.sync_rows(table, self.account_id, rows)
+
+    def _load_map(self, table) -> dict[str, Any]:
+        return {row["id"]: row["data"] for row in self._rows(table)}
+
+    def _save_map(self, table, data: Mapping[str, Any], columns: Callable[[Any], dict]) -> None:
+        self._sync(table, [{"id": str(key), **columns(record), "data": record}
+                           for key, record in data.items()])
+
+    def _load_grouped(self, table, groups_key: str) -> dict[str, list[dict[str, Any]]]:
+        # Group order, including groups that are currently empty lists.
+        grouped: dict[str, list[dict[str, Any]]] = {
+            str(group): [] for group in (self.db.get_state(self.account_id, groups_key) or [])}
+        for row in self._rows(table):
+            grouped.setdefault(row["project_id"], []).append(row["data"])
+        return grouped
+
+    def _save_grouped(self, table, groups_key: str, data: Mapping[str, Any],
+                      columns: Callable[[Any], dict]) -> None:
+        rows = []
+        for group, items in data.items():
+            for key, item in _keyed(list(items or [])):
+                rows.append({"project_id": str(group), "id": key, **columns(item), "data": item})
+        with self.db.atomic():
+            self._sync(table, rows)
+            self.db.set_state(self.account_id, groups_key, [str(group) for group in data])
 
     def load_metadata(self) -> dict[str, Any]:
-        data = read_json(self.metadata_file, {"documents": {}})
-        if not isinstance(data, dict) or not isinstance(data.get("documents"), dict):
-            return {"documents": {}}
-        return data
+        """Documents and their pages, plus any other metadata the account keeps."""
+        extras = self.db.get_state(self.account_id, "metadata") or {}
+        return {**{k: v for k, v in extras.items() if k != "documents"},
+                "documents": self._load_map(DOCUMENTS)}
 
     def save_metadata(self, meta: Mapping[str, Any]) -> None:
-        write_json(self.metadata_file, meta)
+        documents = meta.get("documents") if isinstance(meta.get("documents"), Mapping) else {}
+        with self.db.atomic():
+            self._save_map(DOCUMENTS, documents, lambda doc: {
+                "name": _text(_field(doc, "name")),
+                "project_id": _optional(_field(doc, "project_id")),
+                "digest": _optional(_field(doc, "digest")),
+                "status": _text(_field(doc, "status")),
+            })
+            self.db.set_state(self.account_id, "metadata",
+                              {k: v for k, v in meta.items() if k != "documents"})
 
     def load_mgmt(self) -> dict[str, Any]:
-        data = read_json(self.mgmt_file, None)
-        if not isinstance(data, dict):
+        """Trades, external companies, contacts, task and project types, and
+        the other account-wide catalogues; seeded with the defaults on first use."""
+        state = self.db.get_state(self.account_id, "management")
+        if state is None:
             data = json.loads(json.dumps(DEFAULT_MANAGEMENT))
-            write_json(self.mgmt_file, data)
+            self.save_mgmt(data)
+        else:
+            kinds = list(state.get("kinds") or [])
+            extras = dict(state.get("extras") or {})
+            catalogues: dict[str, list[Any]] = {kind: [] for kind in kinds}
+            for row in self._rows(CATALOG):
+                catalogues.setdefault(row["kind"], []).append(row["data"])
+            data = {}
+            for key in state.get("order") or [*kinds, *extras]:
+                if key in catalogues:
+                    data[key] = catalogues[key]
+                elif key in extras:
+                    data[key] = extras[key]
         for key, default in DEFAULT_MANAGEMENT.items():
             data.setdefault(key, json.loads(json.dumps(default)))
         return data
 
     def save_mgmt(self, data: Mapping[str, Any]) -> None:
-        write_json(self.mgmt_file, data)
+        kinds = [key for key, value in data.items() if isinstance(value, list)]
+        rows = []
+        for kind in kinds:
+            for key, item in _keyed(data[kind]):
+                rows.append({"kind": kind, "id": key, "name": _text(_field(item, "name")), "data": item})
+        with self.db.atomic():
+            self._sync(CATALOG, rows)
+            self.db.set_state(self.account_id, "management", {
+                "order": list(data.keys()), "kinds": kinds,
+                "extras": {key: value for key, value in data.items() if key not in kinds},
+            })
 
     def load_projects(self) -> dict[str, dict[str, Any]]:
-        data = read_json(self.projects_file, {})
-        return data if isinstance(data, dict) else {}
+        return self._load_map(PROJECTS)
 
     def save_projects(self, data: Mapping[str, Any]) -> None:
-        write_json(self.projects_file, data)
+        self._save_map(PROJECTS, data, lambda project: {
+            "name": _text(_field(project, "name")),
+            "project_code": _text(_field(project, "project_code")),
+            "status": _text(_field(project, "status")),
+        })
 
     def load_tasks(self) -> dict[str, list[dict[str, Any]]]:
-        data = read_json(self.tasks_file, {})
-        return data if isinstance(data, dict) else {}
+        """Tasks by project id, each project's in its saved order."""
+        return self._load_grouped(TASKS, "tasks.groups")
 
     def save_tasks(self, data: Mapping[str, Any]) -> None:
-        write_json(self.tasks_file, data)
+        self._save_grouped(TASKS, "tasks.groups", data, lambda task: {
+            "parent_id": _optional(_field(task, "parent_id")),
+            "name": _text(_field(task, "name")),
+            "status": _text(_field(task, "status")),
+            "archived": bool(_field(task, "archived")),
+        })
 
     def load_procurement(self) -> dict[str, list[dict[str, Any]]]:
-        data = read_json(self.procurement_file, {})
-        return data if isinstance(data, dict) else {}
+        return self._load_grouped(PROCUREMENT, "procurement.groups")
 
     def save_procurement(self, data: Mapping[str, Any]) -> None:
-        write_json(self.procurement_file, data)
+        self._save_grouped(PROCUREMENT, "procurement.groups", data, lambda item: {
+            "name": _text(_field(item, "name")),
+            "status": _text(_field(item, "status")),
+        })
 
     def load_settings(self) -> dict[str, Any]:
-        data = read_json(self.settings_file, {})
+        data = self.db.get_state(self.account_id, "settings") or {}
         merged = dict(DEFAULT_SETTINGS)
         if isinstance(data, dict):
             merged.update({k: v for k, v in data.items() if k in DEFAULT_SETTINGS})
@@ -375,39 +519,83 @@ class AccountWorkspace:
     def save_settings(self, data: Mapping[str, Any]) -> dict[str, Any]:
         merged = dict(DEFAULT_SETTINGS)
         merged.update({k: v for k, v in data.items() if k in DEFAULT_SETTINGS})
-        write_json(self.settings_file, merged)
+        self.db.set_state(self.account_id, "settings", merged)
         return merged
 
     def load_roles(self) -> list[dict[str, Any]]:
-        data = read_json(self.roles_file, [])
-        return data if isinstance(data, list) else []
+        return [row["data"] for row in self._rows(ROLES)]
 
     def save_roles(self, data: Sequence[Mapping[str, Any]]) -> None:
-        write_json(self.roles_file, list(data))
+        self._sync(ROLES, [{"id": key, "name": _text(_field(role, "name")), "data": role}
+                           for key, role in _keyed(list(data))])
 
     def load_company(self) -> dict[str, Any]:
-        data = read_json(self.company_file, {})
+        data = self.db.get_state(self.account_id, "company")
         return data if isinstance(data, dict) else {}
 
     def save_company(self, data: Mapping[str, Any]) -> None:
-        write_json(self.company_file, data)
+        self.db.set_state(self.account_id, "company", dict(data))
 
     def load_conversations(self) -> dict[str, Any]:
-        data = read_json(self.conversations_file, {})
-        return data if isinstance(data, dict) else {}
+        return self._load_map(CONVERSATIONS)
 
     def save_conversations(self, data: Mapping[str, Any]) -> None:
-        write_json(self.conversations_file, data)
+        self._save_map(CONVERSATIONS, data, lambda chat: {"title": _text(_field(chat, "title"))})
 
     def load_onboarding(self) -> dict[str, Any]:
         """Onboarding drafts, keyed by draft id."""
-        data = read_json(self.onboarding_file, {})
-        return data if isinstance(data, dict) else {}
+        return self._load_map(ONBOARDING)
 
     def save_onboarding(self, data: Mapping[str, Any]) -> None:
-        write_json(self.onboarding_file, data)
+        self._save_map(ONBOARDING, data, lambda draft: {"status": _text(_field(draft, "status"))})
+
+    def load_generated(self) -> dict[str, dict[str, Any]]:
+        """The generated-document register: generated PDFs and reports, by id."""
+        return self._load_map(GENERATED)
+
+    def save_generated(self, data: Mapping[str, Any]) -> None:
+        self._save_map(GENERATED, data, lambda record: {
+            "project_id": _optional(_field(record, "project_id")),
+            "doc_kind": _text(_field(record, "doc_kind")),
+        })
+
+    def load_evidence(self) -> list[dict[str, Any]]:
+        """Relevance feedback on cited pages, oldest first."""
+        return [row["data"] for row in self._rows(EVIDENCE)]
+
+    def save_evidence(self, records: Sequence[Mapping[str, Any]]) -> None:
+        self._sync(EVIDENCE, [{"id": key, "doc_id": _text(_field(record, "doc_id")),
+                               "rating": _text(_field(record, "rating")), "data": record}
+                              for key, record in _keyed(list(records))])
+
+    def add_evidence(self, record: Mapping[str, Any], keep: int = 5000) -> None:
+        """Append one feedback record and trim the log to its newest ``keep``.
+
+        An insert, not a rewrite: the log is append-mostly and can be thousands
+        of rows long.
+        """
+        with self.db.transaction() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"evidence_feedback:{self.account_id}",))
+            cur.execute("""INSERT INTO evidence_feedback (account_id, id, position, doc_id, rating, data)
+                           VALUES (%s, %s,
+                                   (SELECT coalesce(max(position) + 1, 0) FROM evidence_feedback
+                                     WHERE account_id = %s),
+                                   %s, %s, %s)
+                           ON CONFLICT (account_id, id) DO UPDATE SET data = EXCLUDED.data""",
+                        (self.account_id, _text(record.get("id")) or uuid.uuid4().hex, self.account_id,
+                         _text(record.get("doc_id")), _text(record.get("rating")), as_jsonb(record)))
+            cur.execute("""DELETE FROM evidence_feedback WHERE account_id = %s AND position <
+                               (SELECT position FROM evidence_feedback WHERE account_id = %s
+                                 ORDER BY position DESC OFFSET %s LIMIT 1)""",
+                        (self.account_id, self.account_id, max(keep, 1) - 1))
+
+    def token_store(self, provider: str) -> TokenStorage:
+        """Where a provider's encrypted OAuth tokens for this account are kept."""
+        return TokenStorage(self.db, self.account_id, provider)
 
     def delete(self) -> None:
+        """Remove this account's files.  Its rows go with the account's own row
+        (every table cascades from ``accounts``); see ``AccountRegistry.delete_account``."""
         self.close_index()
         # A file handle can linger for a moment after close on Windows, so give
         # the removal a few attempts before reporting what is left behind.
@@ -438,7 +626,7 @@ class AccountContext:
 
     @property
     def is_admin(self) -> bool:
-        return bool(self.user.get("is_owner")) or self.user.get("role") in ADMIN_ROLES
+        return bool(self.user.get("is_owner")) or canonical_role(self.user.get("role")) in ADMIN_ROLES
 
     def require_admin(self) -> None:
         if not self.is_admin:
@@ -455,7 +643,7 @@ class AccountContext:
 
     def require_super_admin(self) -> None:
         if not self.is_super_admin:
-            raise HTTPException(403, "This action requires a Super Admin")
+            raise HTTPException(403, "This action requires a Head (Super Admin)")
 
     @property
     def permissions(self) -> frozenset[str]:
@@ -484,9 +672,12 @@ class AccountContext:
     def is_assigned(self, task: Mapping[str, Any]) -> bool:
         """Whether this user is the person a task is assigned to.
 
-        Tasks carry the assignee's display name, so match on that first and
-        fall back to the email for members whose name was never filled in.
+        A task names its assignee by user id. Older tasks carry only the
+        display name, so those match on the name, falling back to the email for
+        members whose name was never filled in.
         """
+        if str(task.get("assignee_id") or "").strip():
+            return str(task.get("assignee_id")).strip() == str(self.user.get("id") or "")
         assignee = str(task.get("assignee") or "").strip().casefold()
         if not assignee:
             return False
@@ -512,54 +703,99 @@ class AccountContext:
 # Registry
 # --------------------------------------------------------------------------
 
-class AccountRegistry:
-    """Accounts, users, and sessions, plus the workspace cache."""
+class DataDirectoryMismatch(RuntimeError):
+    """The data directory and the database belong to different installations."""
 
-    def __init__(self, base_dir: Path, chroma_factory: Callable[[Path], Any], logger: Any = None):
+
+BINDING_FILE = ".database-binding.json"
+
+
+class AccountRegistry:
+    """Accounts, users, and sessions -- rows in PostgreSQL -- plus the workspace cache."""
+
+    def __init__(self, base_dir: Path, chroma_factory: Callable[[Path], Any], logger: Any = None,
+                 database: Database | None = None):
         self.base_dir = Path(base_dir)
         self.accounts_root = self.base_dir / "accounts"
-        self.accounts_file = self.base_dir / "accounts.json"
-        self.users_file = self.base_dir / "users.json"
-        self.sessions_file = self.base_dir / "sessions.json"
+        self.db = database or default_database()
+        self.db.migrate()
         self._chroma_factory = chroma_factory
         self._logger = logger
         self._lock = threading.RLock()
         self._workspaces: dict[str, AccountWorkspace] = {}
         self.accounts_root.mkdir(parents=True, exist_ok=True)
+        self._bind_data_dir()
 
-    # -- storage ---------------------------------------------------------
+    # -- the data directory belongs to this database --------------------
 
-    def _accounts(self) -> dict[str, dict[str, Any]]:
-        data = read_json(self.accounts_file, {})
-        return data if isinstance(data, dict) else {}
+    def _bind_data_dir(self) -> None:
+        """Pair the data directory (files) with the database (records), once.
 
-    def _users(self) -> dict[str, dict[str, Any]]:
-        data = read_json(self.users_file, {})
-        if isinstance(data, list):
-            data = {u["id"]: u for u in data if isinstance(u, dict) and "id" in u}
-        return data if isinstance(data, dict) else {}
+        Records point at files -- page images, uploads, generated PDFs -- so a
+        database served with some other installation's data directory would
+        answer with documents whose files are missing.  A random id is recorded
+        in both on first start and must match afterwards; the pair can move to
+        another machine together (copy the directory, restore the database).
+        ``BUILDMARSHAL_ALLOW_REBIND=1`` deliberately re-pairs them.
+        """
+        import os
 
-    def _sessions(self) -> dict[str, dict[str, Any]]:
-        data = read_json(self.sessions_file, {})
-        return data if isinstance(data, dict) else {}
+        marker = self.base_dir / BINDING_FILE
+        local = read_json(marker, None)
+        local_id = local.get("id") if isinstance(local, dict) else None
+        recorded = self.db.get_meta("data_dir_binding")
+        recorded_id = recorded.get("id") if isinstance(recorded, dict) else None
+        if local_id and local_id == recorded_id:
+            return
+        with self.db.transaction() as cur:
+            cur.execute("SELECT count(*) AS n FROM accounts")
+            database_empty = cur.fetchone()["n"] == 0
+        rebind = os.environ.get("BUILDMARSHAL_ALLOW_REBIND", "").strip() == "1"
+        if recorded_id and not database_empty and not rebind:
+            raise DataDirectoryMismatch(
+                f"The database already belongs to another data directory, and {self.base_dir} "
+                + ("belongs to a different database." if local_id else "is not the one it was paired with.")
+                + " Point BUILDMARSHAL_DATA_DIR at the matching directory, use a different database, "
+                  "or set BUILDMARSHAL_ALLOW_REBIND=1 to re-pair them deliberately."
+            )
+        binding = {"id": local_id or uuid.uuid4().hex, "bound_at": iso()}
+        write_json(marker, binding)
+        self.db.set_meta("data_dir_binding", {**binding, "path": str(self.base_dir.resolve())})
 
     # -- workspaces ------------------------------------------------------
+
+    def _open_workspace(self, account_id: str) -> AccountWorkspace:
+        return AccountWorkspace(self.accounts_root / account_id, account_id,
+                                self._chroma_factory, self.db).ensure()
 
     def workspace(self, account_id: str) -> AccountWorkspace:
         with self._lock:
             workspace = self._workspaces.get(account_id)
             if workspace is None:
-                workspace = AccountWorkspace(
-                    self.accounts_root / account_id, account_id, self._chroma_factory
-                ).ensure()
+                workspace = self._open_workspace(account_id)
                 self._workspaces[account_id] = workspace
+                first_load = True
                 needs_role_seed = not workspace.load_roles()
             else:
-                needs_role_seed = False
+                first_load = needs_role_seed = False
         if needs_role_seed:
             # Outside the lock: seeding reads the user list, which takes it.
             self._seed_roles(account_id, workspace)
+        if first_load:
+            self._upgrade_roles(workspace)
         return workspace
+
+    @staticmethod
+    def _upgrade_roles(workspace: "AccountWorkspace") -> None:
+        """Give existing roles the permissions added since they were made, once.
+
+        Each new permission guards something any member could do before it, so
+        a role that already existed is granted it and its people lose nothing.
+        See ``permissions.PERMISSION_UPGRADES``.
+        """
+        roles = workspace.load_roles()
+        if roles and apply_permission_upgrades(roles):
+            workspace.save_roles(roles)
 
     def _seed_roles(self, account_id: str, workspace: AccountWorkspace) -> None:
         """Carry pre-existing role labels into the new role records, once."""
@@ -586,62 +822,69 @@ class AccountRegistry:
 
     # -- accounts --------------------------------------------------------
 
+    @staticmethod
+    def _account_params(account: Mapping[str, Any]) -> tuple:
+        return (str(account["id"]), _text(account.get("name")) or "Workspace",
+                _text(account.get("status")) or "Active", _optional(account.get("owner_user_id")),
+                parse_iso(account.get("created_at")) or utcnow(), as_json(account))
+
     def list_accounts(self) -> list[dict[str, Any]]:
-        return list(self._accounts().values())
+        with self.db.transaction() as cur:
+            cur.execute("SELECT data FROM accounts ORDER BY created_at, id")
+            return [row["data"] for row in cur.fetchall()]
 
     def get_account(self, account_id: str) -> dict[str, Any] | None:
-        return self._accounts().get(account_id)
+        with self.db.transaction() as cur:
+            cur.execute("SELECT data FROM accounts WHERE id = %s", (str(account_id),))
+            row = cur.fetchone()
+        return row["data"] if row else None
+
+    def adopt_account(self, account: Mapping[str, Any]) -> bool:
+        """Insert an account record as it is (imports); False if it already exists."""
+        with self.db.transaction() as cur:
+            cur.execute("""INSERT INTO accounts (id, name, status, owner_user_id, created_at, data)
+                           VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING""",
+                        self._account_params(account))
+            return cur.rowcount == 1
 
     def create_account(self, name: str, *, account_id: str | None = None) -> dict[str, Any]:
-        with self._lock:
-            accounts = self._accounts()
-            new_id = account_id or uuid.uuid4().hex
-            account = {
-                "id": new_id,
-                "name": name.strip() or "Workspace",
-                "status": "Active",
-                "owner_user_id": None,
-                "created_at": iso(),
-            }
-            accounts[new_id] = account
-            write_json(self.accounts_file, accounts)
-        self.workspace(new_id)
+        account = {
+            "id": account_id or uuid.uuid4().hex,
+            "name": name.strip() or "Workspace",
+            "status": "Active",
+            "owner_user_id": None,
+            "created_at": iso(),
+        }
+        if not self.adopt_account(account):
+            raise HTTPException(409, "An account with this id already exists")
+        self.workspace(account["id"])
         return account
 
     def update_account(self, account_id: str, changes: Mapping[str, Any]) -> dict[str, Any]:
-        with self._lock:
-            accounts = self._accounts()
-            account = accounts.get(account_id)
-            if not account:
+        with self.db.transaction() as cur:
+            cur.execute("SELECT data FROM accounts WHERE id = %s FOR UPDATE", (str(account_id),))
+            row = cur.fetchone()
+            if not row:
                 raise HTTPException(404, "Account not found")
+            account = dict(row["data"])
             for field in ("name", "status", "owner_user_id"):
                 if field in changes and changes[field] is not None:
                     account[field] = changes[field]
-            accounts[account_id] = account
-            write_json(self.accounts_file, accounts)
-            return account
+            _, name, status, owner, _, data = self._account_params(account)
+            cur.execute("""UPDATE accounts SET name = %s, status = %s, owner_user_id = %s,
+                                  data = %s, updated_at = now() WHERE id = %s""",
+                        (name, status, owner, data, str(account_id)))
+        return account
 
     def delete_account(self, account_id: str) -> None:
+        """Delete an account: its row, and with it (by cascade) every user,
+        session and record it owns, in one statement; then its files."""
+        with self.db.transaction() as cur:
+            cur.execute("DELETE FROM accounts WHERE id = %s", (str(account_id),))
         with self._lock:
-            accounts = self._accounts()
-            accounts.pop(account_id, None)
-            write_json(self.accounts_file, accounts)
-
-            users = self._users()
-            removed = [uid for uid, user in users.items() if user.get("account_id") == account_id]
-            for uid in removed:
-                users.pop(uid, None)
-            write_json(self.users_file, users)
-
-            sessions = {
-                token: session for token, session in self._sessions().items()
-                if session.get("account_id") != account_id
-            }
-            write_json(self.sessions_file, sessions)
-
             workspace = self._workspaces.pop(account_id, None)
             workspace = workspace or AccountWorkspace(
-                self.accounts_root / account_id, account_id, self._chroma_factory
+                self.accounts_root / account_id, account_id, self._chroma_factory, self.db
             )
         # Outside the registry lock: removing a populated workspace can take a
         # moment and must not block other accounts' requests.
@@ -649,20 +892,49 @@ class AccountRegistry:
 
     # -- users -----------------------------------------------------------
 
+    @staticmethod
+    def _user_params(user: Mapping[str, Any]) -> tuple:
+        # Every write stores the built-ins under their current names, whatever
+        # label an older client or an import carried.
+        user = {**user, "role": canonical_role(user.get("role"))}
+        return (str(user["id"]), str(user["account_id"]), _text(user.get("email")),
+                _text(user.get("name")), _text(user.get("role")),
+                _text(user.get("status")) or "Active", bool(user.get("is_owner")),
+                parse_iso(user.get("created_at")) or utcnow(), as_json(user))
+
     def users_for_account(self, account_id: str) -> list[dict[str, Any]]:
-        return [u for u in self._users().values() if u.get("account_id") == account_id]
+        with self.db.transaction() as cur:
+            cur.execute("SELECT data FROM users WHERE account_id = %s ORDER BY created_at, id",
+                        (str(account_id),))
+            return [row["data"] for row in cur.fetchall()]
 
     def get_user(self, user_id: str) -> dict[str, Any] | None:
-        return self._users().get(user_id)
+        with self.db.transaction() as cur:
+            cur.execute("SELECT data FROM users WHERE id = %s", (str(user_id),))
+            row = cur.fetchone()
+        return row["data"] if row else None
 
     def find_by_email(self, email: str) -> dict[str, Any] | None:
         target = str(email or "").strip().lower()
         if not target:
             return None
-        for user in self._users().values():
-            if str(user.get("email", "")).lower() == target:
-                return user
-        return None
+        with self.db.transaction() as cur:
+            cur.execute("SELECT data FROM users WHERE email_key = %s", (target,))
+            row = cur.fetchone()
+        return row["data"] if row else None
+
+    def adopt_user(self, user: Mapping[str, Any]) -> bool:
+        """Insert a user record as it is -- password hash and all (imports,
+        legacy migration).  False when the id or the email is already taken."""
+        try:
+            with self.db.transaction() as cur:
+                cur.execute("""INSERT INTO users (id, account_id, email, name, role, status,
+                                                  is_owner, created_at, data)
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                               ON CONFLICT (id) DO NOTHING""", self._user_params(user))
+                return cur.rowcount == 1
+        except psycopg.errors.UniqueViolation:
+            return False
 
     def create_user(
         self,
@@ -676,136 +948,164 @@ class AccountRegistry:
         **profile: Any,
     ) -> dict[str, Any]:
         email = email.strip()
-        with self._lock:
-            users = self._users()
-            for user in users.values():
-                if str(user.get("email", "")).lower() == email.lower():
-                    raise HTTPException(409, "An account with this email already exists")
-            user = {
-                "id": str(uuid.uuid4()),
-                "account_id": account_id,
-                "name": name.strip(),
-                "email": email,
-                "password_hash": hash_password(password),
-                "phone": str(profile.get("phone", "") or ""),
-                "address": str(profile.get("address", "") or ""),
-                "role": str(role or "").strip(),
-                "department": str(profile.get("department", "") or ""),
-                "designation": str(profile.get("designation", "") or ""),
-                "company": str(profile.get("company", "") or ""),
-                "time_zone": str(profile.get("time_zone", "UTC") or "UTC"),
-                "status": str(profile.get("status", "Active") or "Active"),
-                "is_owner": bool(is_owner),
-                "created_at": iso(),
-            }
-            users[user["id"]] = user
-            write_json(self.users_file, users)
+        user = {
+            "id": str(uuid.uuid4()),
+            "account_id": account_id,
+            "name": name.strip(),
+            "email": email,
+            "password_hash": hash_password(password),
+            "phone": str(profile.get("phone", "") or ""),
+            "address": str(profile.get("address", "") or ""),
+            "role": canonical_role(role),
+            "department": str(profile.get("department", "") or ""),
+            "designation": str(profile.get("designation", "") or ""),
+            "company": str(profile.get("company", "") or ""),
+            "time_zone": str(profile.get("time_zone", "UTC") or "UTC"),
+            "status": str(profile.get("status", "Active") or "Active"),
+            "is_owner": bool(is_owner),
+            "created_at": iso(),
+        }
+        try:
+            with self.db.transaction() as cur:
+                cur.execute("""INSERT INTO users (id, account_id, email, name, role, status,
+                                                  is_owner, created_at, data)
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""", self._user_params(user))
+        except psycopg.errors.UniqueViolation:
+            # The unique index on lower(email) is the rule; two requests racing
+            # to register the same address cannot both succeed.
+            raise HTTPException(409, "An account with this email already exists") from None
+        except psycopg.errors.ForeignKeyViolation:
+            raise HTTPException(404, "Account not found") from None
         return user
 
+    def _write_user(self, cur: Any, user: Mapping[str, Any]) -> None:
+        _, account_id, email, name, role, status, is_owner, _, data = self._user_params(user)
+        cur.execute("""UPDATE users SET account_id = %s, email = %s, name = %s, role = %s,
+                              status = %s, is_owner = %s, data = %s, updated_at = now()
+                       WHERE id = %s""",
+                    (account_id, email, name, role, status, is_owner, data, str(user["id"])))
+
     def update_user(self, user_id: str, changes: Mapping[str, Any]) -> dict[str, Any]:
-        with self._lock:
-            users = self._users()
-            user = users.get(user_id)
-            if not user:
-                raise HTTPException(404, "User not found")
-            if "email" in changes and changes["email"]:
-                candidate = str(changes["email"]).strip()
-                for other_id, other in users.items():
-                    if other_id != user_id and str(other.get("email", "")).lower() == candidate.lower():
-                        raise HTTPException(409, "Email already in use")
-            for field in (
-                "name", "email", "phone", "address", "role", "department",
-                "designation", "company", "time_zone", "status",
-            ):
-                if field in changes and changes[field] is not None:
-                    user[field] = changes[field]
-            if changes.get("password"):
-                user["password_hash"] = hash_password(str(changes["password"]))
-            users[user_id] = user
-            write_json(self.users_file, users)
+        try:
+            with self.db.transaction() as cur:
+                cur.execute("SELECT data FROM users WHERE id = %s FOR UPDATE", (str(user_id),))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(404, "User not found")
+                user = dict(row["data"])
+                for field in (
+                    "name", "email", "phone", "address", "role", "department",
+                    "designation", "company", "time_zone", "status",
+                ):
+                    if field in changes and changes[field] is not None:
+                        user[field] = changes[field]
+                if changes.get("password"):
+                    user["password_hash"] = hash_password(str(changes["password"]))
+                self._write_user(cur, user)
+        except psycopg.errors.UniqueViolation:
+            raise HTTPException(409, "Email already in use") from None
         if changes.get("password") or str(changes.get("status", "")).lower() == "inactive":
             self.revoke_user_sessions(user_id)
         return user
 
+    def rehash_password(self, user_id: str, plain: str) -> dict[str, Any] | None:
+        """Store the same password under the current hash parameters.
+
+        Unlike a password change this revokes nothing: the credential has not
+        changed, only how strongly it is stored.
+        """
+        with self.db.transaction() as cur:
+            cur.execute("SELECT data FROM users WHERE id = %s FOR UPDATE", (str(user_id),))
+            row = cur.fetchone()
+            if not row:
+                return None
+            user = dict(row["data"])
+            user["password_hash"] = hash_password(plain)
+            self._write_user(cur, user)
+        return user
+
     def delete_user(self, user_id: str) -> None:
-        with self._lock:
-            users = self._users()
-            users.pop(user_id, None)
-            write_json(self.users_file, users)
-        self.revoke_user_sessions(user_id)
+        # Sessions go with the user (ON DELETE CASCADE).
+        with self.db.transaction() as cur:
+            cur.execute("DELETE FROM users WHERE id = %s", (str(user_id),))
 
     # -- sessions --------------------------------------------------------
 
-    def _prune(self, sessions: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    @staticmethod
+    def _session_record(row: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "user_id": row["user_id"], "account_id": row["account_id"],
+            "created_at": iso(row["created_at"]), "last_seen": iso(row["last_seen"]),
+            "expires_at": iso(row["expires_at"]),
+        }
+
+    @staticmethod
+    def _prune(cur: Any, now: datetime) -> None:
+        cur.execute("DELETE FROM sessions WHERE expires_at <= %s OR last_seen < %s",
+                    (now, now - timedelta(hours=SESSION_IDLE_HOURS)))
+
+    def adopt_session(self, token_hash: str, session: Mapping[str, Any]) -> bool:
+        """Insert a session as it is (imports); skipped when expired or orphaned."""
         now = utcnow()
-        alive: dict[str, dict[str, Any]] = {}
-        for key, session in sessions.items():
-            expires = parse_iso(session.get("expires_at"))
-            last_seen = parse_iso(session.get("last_seen")) or parse_iso(session.get("created_at"))
-            if expires and expires <= now:
-                continue
-            if last_seen and now - last_seen > timedelta(hours=SESSION_IDLE_HOURS):
-                continue
-            alive[key] = session
-        return alive
+        created = parse_iso(session.get("created_at")) or now
+        last_seen = parse_iso(session.get("last_seen")) or created
+        expires = parse_iso(session.get("expires_at"))
+        if not expires or expires <= now or now - last_seen > timedelta(hours=SESSION_IDLE_HOURS):
+            return False
+        try:
+            with self.db.transaction() as cur:
+                cur.execute("""INSERT INTO sessions (token_hash, user_id, account_id, created_at,
+                                                     last_seen, expires_at)
+                               VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING""",
+                            (token_hash, str(session.get("user_id")), str(session.get("account_id")),
+                             created, last_seen, expires))
+                return cur.rowcount == 1
+        except psycopg.errors.ForeignKeyViolation:
+            return False
 
     def issue_session(self, user: Mapping[str, Any]) -> str:
         token = secrets.token_urlsafe(32)
-        with self._lock:
-            sessions = self._prune(self._sessions())
-            owned = sorted(
-                (k for k, s in sessions.items() if s.get("user_id") == user["id"]),
-                key=lambda k: str(sessions[k].get("created_at", "")),
-            )
-            for stale in owned[: max(0, len(owned) - MAX_SESSIONS_PER_USER + 1)]:
-                sessions.pop(stale, None)
-            sessions[hash_token(token)] = {
-                "user_id": str(user["id"]),
-                "account_id": str(user["account_id"]),
-                "created_at": iso(),
-                "last_seen": iso(),
-                "expires_at": iso(utcnow() + timedelta(hours=SESSION_TTL_HOURS)),
-            }
-            write_json(self.sessions_file, sessions)
+        now = utcnow()
+        with self.db.transaction() as cur:
+            self._prune(cur, now)
+            cur.execute("SELECT token_hash FROM sessions WHERE user_id = %s ORDER BY created_at",
+                        (str(user["id"]),))
+            owned = [row["token_hash"] for row in cur.fetchall()]
+            stale = owned[: max(0, len(owned) - MAX_SESSIONS_PER_USER + 1)]
+            if stale:
+                cur.execute("DELETE FROM sessions WHERE token_hash = ANY(%s)", (stale,))
+            cur.execute("""INSERT INTO sessions (token_hash, user_id, account_id, created_at,
+                                                 last_seen, expires_at)
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
+                        (hash_token(token), str(user["id"]), str(user["account_id"]), now, now,
+                         now + timedelta(hours=SESSION_TTL_HOURS)))
         return token
 
     def resolve_session(self, token: str) -> dict[str, Any] | None:
         digest = hash_token(token)
         now = utcnow()
-        with self._lock:
-            sessions = self._sessions()
-            session = sessions.get(digest)
-            if session is None:
+        with self.db.transaction() as cur:
+            cur.execute("SELECT * FROM sessions WHERE token_hash = %s", (digest,))
+            row = cur.fetchone()
+            if row is None:
                 return None
-            expires = parse_iso(session.get("expires_at"))
-            last_seen = parse_iso(session.get("last_seen")) or parse_iso(session.get("created_at"))
-            if (expires and expires <= now) or (
-                last_seen and now - last_seen > timedelta(hours=SESSION_IDLE_HOURS)
-            ):
-                write_json(self.sessions_file, self._prune(sessions))
+            if row["expires_at"] <= now or now - row["last_seen"] > timedelta(hours=SESSION_IDLE_HOURS):
+                cur.execute("DELETE FROM sessions WHERE token_hash = %s", (digest,))
                 return None
-            # Rewriting the store on every request would be a disk write per API
-            # call; the idle window is hours, so a coarse heartbeat is enough.
-            if not last_seen or now - last_seen > timedelta(minutes=1):
-                session["last_seen"] = iso(now)
-                sessions[digest] = session
-                write_json(self.sessions_file, self._prune(sessions))
-        return session
+            # A coarse heartbeat: the idle window is hours, so writing on every
+            # request would be a write per API call for nothing.
+            if now - row["last_seen"] > timedelta(minutes=1):
+                cur.execute("UPDATE sessions SET last_seen = %s WHERE token_hash = %s", (now, digest))
+                row = {**row, "last_seen": now}
+        return self._session_record(row)
 
     def revoke_session(self, token: str) -> None:
-        digest = hash_token(token)
-        with self._lock:
-            sessions = self._sessions()
-            sessions.pop(digest, None)
-            write_json(self.sessions_file, sessions)
+        with self.db.transaction() as cur:
+            cur.execute("DELETE FROM sessions WHERE token_hash = %s", (hash_token(token),))
 
     def revoke_user_sessions(self, user_id: str) -> None:
-        with self._lock:
-            sessions = {
-                key: session for key, session in self._sessions().items()
-                if session.get("user_id") != user_id
-            }
-            write_json(self.sessions_file, sessions)
+        with self.db.transaction() as cur:
+            cur.execute("DELETE FROM sessions WHERE user_id = %s", (str(user_id),))
 
     # -- registration ----------------------------------------------------
 
@@ -815,8 +1115,8 @@ class AccountRegistry:
         Before custom roles, a member's abilities came from a hardcoded list.
         Seeding a role for each label actually in use -- with the permissions
         that label carried -- means nobody silently loses access the moment
-        roles become data. Runs once; after that the file is the source of
-        truth and a Super Admin edits it on the User Roles page.
+        roles become data. Runs once; after that the stored roles are the source
+        of truth and a Head (Super Admin) edits them on the User Roles page.
         """
         workspace = self.workspace(account_id)
         if not workspace.load_roles():
@@ -849,6 +1149,11 @@ class AccountRegistry:
         return account, owner
 
 
+def as_json(value: Any):
+    """A record as a jsonb parameter (NUL and non-finite numbers removed)."""
+    return as_jsonb(value)
+
+
 def public_user(user: Mapping[str, Any]) -> dict[str, Any]:
     """A user record with the credential material removed."""
     return {key: value for key, value in user.items() if key != "password_hash"}
@@ -864,9 +1169,11 @@ def migrate_legacy_workspace(registry: AccountRegistry, base_dir: Path, logger: 
     The handover ships a populated ``BASE_DIR`` that predates account
     isolation.  Everything there belongs to whoever was using the machine, so it
     is moved wholesale into a single account owned by the existing administrator
-    from ``users.json``.  Absolute page paths recorded in ``metadata.json``, the
-    generated-document registry, and the Chroma index are rewritten to the new
-    location.  A marker file makes the migration run exactly once.
+    from ``users.json``: the logins and the JSON stores go into the database,
+    the directories of files into the account's workspace.  Absolute page paths
+    recorded in the document metadata, the generated-document register, and the
+    Chroma index are rewritten to the new location.  A marker file makes the
+    migration run exactly once.
     """
     base_dir = Path(base_dir)
     marker = base_dir / ".account_migration_complete"
@@ -883,11 +1190,6 @@ def migrate_legacy_workspace(registry: AccountRegistry, base_dir: Path, logger: 
         base_dir / name for name in
         ("documents", "pages", "chroma_db", "colpali_v1_2_multivectors",
          "generated_documents", "google_imports", "document_generation_vision_cache")
-    ]
-    legacy_files = [
-        base_dir / name for name in
-        ("metadata.json", "management.json", "generated_documents.json",
-         "evidence_feedback.json", "google_workspace_accounts.enc")
     ]
     has_legacy = (
         legacy_metadata.exists()
@@ -909,24 +1211,23 @@ def migrate_legacy_workspace(registry: AccountRegistry, base_dir: Path, logger: 
     workspace = registry.workspace(account_id)
 
     # Adopt the existing logins so the shipped credentials keep working.
-    owner_id: str | None = None
     if legacy_users:
-        users = registry._users()
         preferred = next(
             (u for u in legacy_users if str(u.get("role", "")).lower().startswith("super")),
             legacy_users[0],
         )
+        adopted = 0
         for user in legacy_users:
             record = dict(user)
             record["account_id"] = account_id
             record["is_owner"] = record["id"] == preferred["id"]
             record.setdefault("status", "Active")
             record.setdefault("created_at", iso())
-            users[str(record["id"])] = record
-        owner_id = str(preferred["id"])
-        write_json(registry.users_file, users)
-        registry.update_account(account_id, {"owner_user_id": owner_id})
-        log(f"Adopted {len(legacy_users)} existing login(s) into the migrated account")
+            adopted += registry.adopt_user(record)
+        registry.update_account(account_id, {"owner_user_id": str(preferred["id"])})
+        log(f"Adopted {adopted} existing login(s) into the migrated account")
+        # A pre-isolation installation had no stored roles; give its labels some.
+        registry.migrate_account_roles(account_id)
 
     # Move directories.
     targets = {
@@ -950,21 +1251,25 @@ def migrate_legacy_workspace(registry: AccountRegistry, base_dir: Path, logger: 
             shutil.move(str(item), str(target))
         shutil.rmtree(source, ignore_errors=True)
 
-    # Move flat JSON stores.
-    file_targets = {
-        "metadata.json": workspace.metadata_file,
-        "management.json": workspace.mgmt_file,
-        "generated_documents.json": workspace.generated_registry,
-        "evidence_feedback.json": workspace.evidence_file,
-        "google_workspace_accounts.enc": workspace.google_store_file,
+    # The flat JSON stores go into the database.
+    stores = {
+        "metadata.json": workspace.save_metadata,
+        "management.json": workspace.save_mgmt,
+        "generated_documents.json": workspace.save_generated,
+        "evidence_feedback.json": workspace.save_evidence,
     }
-    for name, destination in file_targets.items():
+    for name, save in stores.items():
         source = base_dir / name
-        if source.exists() and not destination.exists():
-            shutil.move(str(source), str(destination))
-    for path in legacy_files:
-        if path.exists():
-            path.unlink(missing_ok=True)
+        data = read_json(source, None)
+        if data is not None:
+            save(data)
+        source.unlink(missing_ok=True)
+    tokens = base_dir / "google_workspace_accounts.enc"
+    if tokens.exists():
+        if tokens.stat().st_size:
+            workspace.token_store("google").write(tokens.read_bytes())
+        tokens.unlink(missing_ok=True)
+    (base_dir / "users.json").unlink(missing_ok=True)
 
     # Rewrite absolute page paths recorded before the move.
     metadata = workspace.load_metadata()
@@ -980,16 +1285,15 @@ def migrate_legacy_workspace(registry: AccountRegistry, base_dir: Path, logger: 
                 rewritten += 1
     workspace.save_metadata(metadata)
 
-    registry_data = read_json(workspace.generated_registry, {})
-    if isinstance(registry_data, dict):
-        for record in registry_data.values():
-            stored = (record or {}).get("file_path")
-            if not stored:
-                continue
-            relocated = workspace.generated_dir / Path(stored).name
-            if relocated.exists():
-                record["file_path"] = str(relocated)
-        write_json(workspace.generated_registry, registry_data)
+    generated = workspace.load_generated()
+    for record in generated.values():
+        stored = (record or {}).get("file_path")
+        if not stored:
+            continue
+        relocated = workspace.generated_dir / Path(stored).name
+        if relocated.exists():
+            record["file_path"] = str(relocated)
+    workspace.save_generated(generated)
 
     # Rewrite the same paths inside the vector index, preserving embeddings.
     try:
@@ -1078,7 +1382,6 @@ class AccountUpdateRequest(BaseModel):
 class SettingsRequest(BaseModel):
     model: str | None = Field(default=None, max_length=120)
     top_k: int | None = Field(default=None, ge=1, le=20)
-    voice_api_url: str | None = Field(default=None, max_length=500)
     company_name: str | None = Field(default=None, max_length=160)
     company_email: str | None = Field(default=None, max_length=200)
     company_phone: str | None = Field(default=None, max_length=60)
@@ -1123,12 +1426,25 @@ def register_account_routes(namespace: dict[str, Any]) -> dict[str, Any]:
     if missing:
         raise RuntimeError(f"Account integration is missing: {', '.join(missing)}")
 
+    # Build the unknown-email comparison hash now, so the first failed login
+    # does not pay for it (and stand out by taking longer).
+    dummy_password_hash()
+
     app = namespace["app"]
     base_dir = Path(namespace["BASE_DIR"])
     logger = namespace.get("logger")
 
-    registry = AccountRegistry(base_dir, namespace["build_account_collection"], logger)
+    registry = AccountRegistry(base_dir, namespace["build_account_collection"], logger,
+                               database=namespace.get("DATABASE"))
+    namespace["DATABASE"] = registry.db
     migrate_legacy_workspace(registry, base_dir, logger)
+    # An installation from before the database keeps its records in JSON files;
+    # bring them in once.  See json_storage_import.
+    try:
+        from json_storage_import import import_json_storage
+    except ModuleNotFoundError:
+        from backend.json_storage_import import import_json_storage
+    import_json_storage(registry, base_dir, logger)
 
     def bearer_token(request: Request) -> str:
         header = request.headers.get("Authorization", "")
@@ -1197,8 +1513,9 @@ def register_account_routes(namespace: dict[str, Any]) -> dict[str, Any]:
     async def auth_login(body: LoginRequest) -> dict[str, Any]:
         user = registry.find_by_email(body.email)
         # Compare against a dummy hash when the email is unknown so a missing
-        # account and a wrong password take the same time to answer.
-        stored = str(user.get("password_hash", "")) if user else hash_password(secrets.token_hex(8))
+        # account and a wrong password take the same time to answer: one key
+        # derivation each.
+        stored = str(user.get("password_hash", "")) if user else dummy_password_hash()
         valid, needs_rehash = verify_password(body.password, stored)
         if not user or not valid:
             raise HTTPException(401, "Invalid email or password")
@@ -1210,8 +1527,8 @@ def register_account_routes(namespace: dict[str, Any]) -> dict[str, Any]:
         if str(account.get("status", "Active")).lower() != "active":
             raise HTTPException(403, "This workspace has been deactivated")
         if needs_rehash:
-            registry.update_user(user["id"], {"password": body.password})
-            user = registry.get_user(user["id"]) or user
+            # Same password, stronger hash: other devices stay signed in.
+            user = registry.rehash_password(user["id"], body.password) or user
         token = registry.issue_session(user)
         payload = session_payload(user, account, token)
         payload["message"] = "Login successful"
@@ -1362,9 +1679,9 @@ def register_account_routes(namespace: dict[str, Any]) -> dict[str, Any]:
         unknown role would resolve to no permissions at all -- failing closed,
         but confusingly.
         """
-        wanted = str(value or "").strip()
+        wanted = canonical_role(value)
         if not wanted:
-            # A new workspace has no roles until a Super Admin makes one, and
+            # A new workspace has no roles until a Head (Super Admin) makes one, and
             # none are shipped. Someone can therefore be added before a role
             # exists for them; with no role they hold no permissions, so this
             # fails closed rather than granting anything by default.

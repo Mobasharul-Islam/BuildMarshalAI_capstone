@@ -2,7 +2,7 @@ $ErrorActionPreference = "SilentlyContinue"
 
 Write-Host "Stopping BuildMarshalAI services..." -ForegroundColor Cyan
 
-$ports = @(8000, 5500, 8317)
+$ports = @(8000, 5500, 8317, 8903)
 $stopped = 0
 
 foreach ($port in $ports) {

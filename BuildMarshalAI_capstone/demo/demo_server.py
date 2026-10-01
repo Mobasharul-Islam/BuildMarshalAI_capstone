@@ -44,10 +44,16 @@ from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 import make_demo_pack as pack  # noqa: E402
 import providers  # noqa: E402
+from demo_db import demo_database  # noqa: E402
 from backend import (accounts, chat_entities, company_settings,  # noqa: E402
                      document_storage, evidence_viewer, project_analytics,
                      project_management, project_onboarding, project_report,
                      tasks as task_routes, todo_lists, user_roles)
+from backend.document_links import (  # noqa: E402
+    document_listing, register_project_document_routes, set_document_projects, unlink_document,
+)
+from backend.permissions import SUPER_ADMIN_ROLE  # noqa: E402
+from backend.project_people import active, present_project, resolve_manager, resolve_user  # noqa: E402
 
 RUNTIME = HERE / ".demo-runtime"
 FRONTEND = REPO / "frontend"
@@ -86,13 +92,25 @@ def build_account_collection(account_id: str):
     return StubCollection(f"demo-{account_id}")
 
 
+# The demonstration workspace is disposable: its files (RUNTIME) and its
+# records (the demo database) are thrown away and rebuilt together, on --reset
+# or whenever the seeded files are missing, so the two can never disagree.
+DEMO_DATABASE = demo_database()
+RESET = "--reset" in sys.argv
+if RESET and RUNTIME.exists():
+    shutil.rmtree(RUNTIME)
+RUNTIME.mkdir(parents=True, exist_ok=True)
+if RESET or not (RUNTIME / "seeded.json").exists():
+    DEMO_DATABASE.drop_all()
+DEMO_DATABASE.migrate()
+
 NAMESPACE: dict = {
     "app": app,
     "BASE_DIR": str(RUNTIME),
     "build_account_collection": build_account_collection,
+    "DATABASE": DEMO_DATABASE,
 }
 
-RUNTIME.mkdir(parents=True, exist_ok=True)
 NAMESPACE.update(accounts.register_account_routes(NAMESPACE))
 REGISTRY = NAMESPACE["ACCOUNT_REGISTRY"]
 require_account = NAMESPACE["require_account"]
@@ -118,7 +136,9 @@ def _make_project(data: dict) -> dict:
     return {
         "id": str(uuid.uuid4()),
         "name": text("name"), "project_code": text("project_code"),
-        "manager": text("manager"), "type": text("type"),
+        "manager_id": text("manager_id"), "manager": text("manager"),
+        "members": [dict(entry) for entry in data.get("members", []) or []],
+        "type": text("type"),
         "status": text("status", "Active") or "Active",
         "start_date": str(data.get("start_date", "") or ""),
         "end_date": str(data.get("end_date", "") or ""),
@@ -126,6 +146,7 @@ def _make_project(data: dict) -> dict:
         "address_line1": text("address_line1"), "address_line2": text("address_line2"),
         "city": text("city"), "state": text("state"),
         "postal_code": text("postal_code"), "country": text("country"),
+        "currency": (text("currency", "USD") or "USD").upper(),
         "archived": False,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -134,7 +155,8 @@ def _make_project(data: dict) -> dict:
 NAMESPACE.update({"ingest_document": ingest_document, "vl_generate": vl_generate,
                   "_make_project": _make_project})
 
-for register in (task_routes.register_task_routes,
+for register in (register_project_document_routes,
+                 task_routes.register_task_routes,
                  project_management.register_project_management_routes,
                  company_settings.register_company_settings_routes,
                  user_roles.register_user_role_routes,
@@ -157,11 +179,34 @@ def project_or_404(workspace, project_id: str) -> dict:
     return project
 
 
+def account_users(context) -> list:
+    return REGISTRY.users_for_account(context.account_id)
+
+
+def bind_manager(data: dict, users: list) -> None:
+    """As the notebook does: the manager is a user, chosen, never typed."""
+    user = resolve_manager(data, users, required=True)
+    data["manager_id"], data["manager"] = user["id"], user.get("name") or user.get("email") or ""
+
+
+def initial_members(data: dict, users: list) -> list:
+    members = []
+    for user_id in dict.fromkeys(data.get("member_ids") or []):
+        user = resolve_user(users, user_id=user_id)
+        if user is None or not active(user):
+            raise HTTPException(422, "Project members must be active users in this account")
+        members.append({"user_id": user["id"], "project_role": "",
+                        "added_at": datetime.now(timezone.utc).isoformat()})
+    return members
+
+
 @app.get("/api/health")
 async def health() -> dict:
     # The frontend reads "healthy" literally; anything else shows Disconnected.
     return {"status": "healthy", "gpu": "demonstration backend — no GPU in use",
-            "model": "not loaded", "documents": len(DEMO_DOCUMENTS)}
+            "model": "not loaded", "documents": len(DEMO_DOCUMENTS),
+            "voice": {"available": False,
+                      "detail": "the demonstration backend has no voice service"}}
 
 
 @app.get("/api/status")
@@ -190,7 +235,8 @@ async def list_projects(name: str = "", manager: str = "", type: str = "",
                         status: str = "", show_archived: bool = False,
                         page: int = 1, per_page: int = 10,
                         context=Depends(require_account)) -> dict:
-    items = list(context.workspace.load_projects().values())
+    users = account_users(context)
+    items = [present_project(p, users) for p in context.workspace.load_projects().values()]
     if not show_archived:
         items = [p for p in items if not p.get("archived")]
     if name and len(name) >= 2:
@@ -213,7 +259,7 @@ async def list_projects(name: str = "", manager: str = "", type: str = "",
 
 @app.get("/api/projects/{project_id}")
 async def get_project(project_id: str, context=Depends(require_account)) -> dict:
-    return project_or_404(context.workspace, project_id)
+    return present_project(project_or_404(context.workspace, project_id), account_users(context))
 
 
 @app.post("/api/projects")
@@ -224,6 +270,10 @@ async def create_project(request: Request, context=Depends(require_account)) -> 
         raise HTTPException(422, "Name is required")
     if not str(data.get("project_code", "")).strip():
         raise HTTPException(422, "Project code is required")
+    task_routes.check_project_dates(data)
+    users = account_users(context)
+    bind_manager(data, users)
+    data["members"] = initial_members(data, users)
     workspace = context.workspace
     projects = workspace.load_projects()
     code = str(data["project_code"]).strip().upper()
@@ -232,7 +282,7 @@ async def create_project(request: Request, context=Depends(require_account)) -> 
     project = _make_project(data)
     projects[project["id"]] = project
     workspace.save_projects(projects)
-    return project
+    return present_project(project, users)
 
 
 @app.put("/api/projects/{project_id}")
@@ -245,19 +295,28 @@ async def update_project(project_id: str, request: Request,
     if not project:
         raise HTTPException(404, "Project not found")
     data = await request.json()
-    editable = ("name", "project_code", "manager", "type", "status", "start_date",
+    users = account_users(context)
+    if "manager_id" in data or "manager" in data:
+        bind_manager(data, users)
+    if any(key in data and str(data[key] or "") != str(project.get(key) or "")
+           for key in ("start_date", "end_date")):
+        task_routes.check_project_dates(
+            {**project, **{k: data[k] for k in ("start_date", "end_date") if k in data}},
+            workspace.load_tasks().get(project_id, []))
+    editable = ("name", "project_code", "manager_id", "manager", "type", "status", "currency", "start_date",
                 "end_date", "description", "address_line1", "address_line2",
                 "city", "state", "postal_code", "country", "archived")
     project.update({key: data[key] for key in editable if key in data})
     projects[project_id] = project
     workspace.save_projects(projects)
-    return project
+    return present_project(project, users)
 
 
 @app.delete("/api/projects/{project_id}")
 async def delete_project(project_id: str, context=Depends(require_account)) -> dict:
-    # The real route has no permission check here, and takes the project's tasks
-    # and procurement with it rather than orphaning rows nothing can reach.
+    # Like the real route: an administrator's action, and it takes the project's
+    # tasks and procurement with it rather than orphaning rows nothing can reach.
+    context.require_admin()
     workspace = context.workspace
     projects = workspace.load_projects()
     if project_id not in projects:
@@ -270,6 +329,9 @@ async def delete_project(project_id: str, context=Depends(require_account)) -> d
     procurement = workspace.load_procurement()
     if procurement.pop(project_id, None) is not None:
         workspace.save_procurement(procurement)
+    meta = workspace.load_metadata()
+    if any([unlink_document(doc, project_id) for doc in meta.get("documents", {}).values()]):
+        workspace.save_metadata(meta)
     return {"status": "deleted"}
 
 
@@ -302,12 +364,11 @@ def mgmt_save(context, key: str, rows: list) -> None:
     context.workspace.save_mgmt(data)
 
 
-def catalogue(path: str, key: str) -> None:
+def catalogue(path: str, key: str, permission: str, action: str) -> None:
     """Register the list-shaped catalogues the notebook keeps.
 
-    No permission check, because the notebook's own trade, vendor and
-    team-member routes have none: a stub that is stricter than the thing it
-    stands in for teaches the wrong lesson during a demonstration.
+    Reading is open to every member; changing one takes the same permission the
+    notebook's own route checks, so the demonstration behaves like the real app.
     """
 
     @app.get(path, name=f"list_{key}")
@@ -316,6 +377,7 @@ def catalogue(path: str, key: str) -> None:
 
     @app.post(path, name=f"create_{key}")
     async def _create(request: Request, context=Depends(require_account)) -> dict:
+        context.require(permission, action)
         body = await request.json()
         rows = mgmt_list(context, key)
         row = {"id": uuid.uuid4().hex[:12], "status": "Active",
@@ -327,6 +389,7 @@ def catalogue(path: str, key: str) -> None:
     @app.put(path + "/{row_id}", name=f"update_{key}")
     async def _update(row_id: str, request: Request,
                       context=Depends(require_account)) -> dict:
+        context.require(permission, action)
         body = await request.json()
         rows = mgmt_list(context, key)
         for row in rows:
@@ -338,14 +401,15 @@ def catalogue(path: str, key: str) -> None:
 
     @app.delete(path + "/{row_id}", name=f"delete_{key}")
     async def _delete(row_id: str, context=Depends(require_account)) -> dict:
+        context.require(permission, action)
         rows = [row for row in mgmt_list(context, key) if row.get("id") != row_id]
         mgmt_save(context, key, rows)
         return {"status": "deleted"}
 
 
-catalogue("/api/trades", "trades")
-catalogue("/api/vendors", "vendors")
-catalogue("/api/team-members", "team_members")
+catalogue("/api/trades", "trades", "trade.manage", "changing trades")
+catalogue("/api/vendors", "vendors", "vendor.manage", "changing external companies")
+catalogue("/api/team-members", "team_members", "contact.manage", "changing the contact directory")
 
 
 # -- documents, retrieval and chat ---------------------------------------
@@ -363,17 +427,9 @@ DEMO_DOCUMENTS = [
 
 
 @app.get("/api/documents")
-async def list_documents(context=Depends(require_account)) -> dict:
-    meta = context.workspace.load_metadata()
-    return {"documents": [
-        {"id": doc_id, "name": document["name"],
-         "type": document.get("type", Path(document["name"]).suffix.lstrip(".")),
-         "size": document.get("size", 0),
-         "pages": document.get("page_count", 0),
-         "status": document.get("status", "indexed"),
-         "project_id": document.get("project_id"),
-         "created_at": document.get("uploaded_at")}
-        for doc_id, document in meta.get("documents", {}).items()]}
+async def list_documents(scope: str = "all", project_id: str = "",
+                         context=Depends(require_account)) -> dict:
+    return document_listing(context.workspace, scope=scope, project_id=project_id)
 
 
 @app.get("/api/documents/{doc_id}/status")
@@ -387,6 +443,7 @@ async def document_status(doc_id: str, context=Depends(require_account)) -> dict
 
 @app.delete("/api/documents/{doc_id}")
 async def delete_document(doc_id: str, context=Depends(require_account)) -> dict:
+    context.require("document.delete", "deleting documents")
     workspace = context.workspace
     meta = workspace.load_metadata()
     if doc_id not in meta.get("documents", {}):
@@ -540,13 +597,6 @@ async def document_templates() -> dict:
          "description": "Changes since the last issue, with the clause each one touches."}]}
 
 
-@app.get("/api/projects/{project_id}/source-documents")
-async def source_documents(project_id: str, context=Depends(require_account)) -> dict:
-    documents = context.workspace.load_metadata().get("documents", {})
-    return {"documents": [doc for doc in documents.values()
-                          if doc.get("project_id") == project_id]}
-
-
 # -- Google Workspace and Microsoft 365, simulated -----------------------
 # Nothing here reaches a provider. Every account, file, message and meeting
 # link is invented, and every response says so with "simulated": true, so the
@@ -567,7 +617,7 @@ def seed() -> str:
     account = REGISTRY.create_account(ACCOUNT_NAME)
     owner = REGISTRY.create_user(
         account_id=account["id"], name="Md. Rafiqul Islam", email=DEMO_EMAIL,
-        password=DEMO_PASSWORD, role="Super Admin", is_owner=True,
+        password=DEMO_PASSWORD, role=SUPER_ADMIN_ROLE, is_owner=True,
         department="Management", designation="Project Director",
         company=ACCOUNT_NAME, phone="01711-902345", time_zone="Asia/Dhaka")
     REGISTRY.update_account(account["id"], {"owner_user_id": owner["id"]})
@@ -635,7 +685,7 @@ def seed() -> str:
     workspace.save_mgmt(mgmt)
 
     # -- roles -------------------------------------------------------------
-    from backend.permissions import PERMISSIONS
+    from backend.permissions import PERMISSIONS, UPGRADE_IDS
 
     keys = [entry["key"] for entry in PERMISSIONS]
     grants = {
@@ -652,7 +702,10 @@ def seed() -> str:
         "Costs and procurement, read-only on tasks",
         "Read-only access to the project, no editing")
     workspace.save_roles([
+        # These grants are chosen here on purpose, so the one-time upgrade for
+        # roles that predate a permission must not add to them.
         {"id": uuid.uuid4().hex[:12], "name": name, "permissions": sorted(set(granted)),
+         "upgrades": list(UPGRADE_IDS),
          "description": detail, "created_at": datetime.now(timezone.utc).isoformat()}
         for (name, granted), detail in zip(grants.items(), descriptions)])
 
@@ -686,8 +739,7 @@ def seed() -> str:
     project["members"] = [
         {"user_id": user["id"], "name": user["name"], "role": user.get("role", ""),
          "added_at": datetime.now(timezone.utc).isoformat()}
-        for user in REGISTRY._users().values()  # noqa: SLF001
-        if user.get("account_id") == account["id"]]
+        for user in REGISTRY.users_for_account(account["id"])]
 
     # -- the programme -----------------------------------------------------
     by_name: dict[str, str] = {}
@@ -764,6 +816,19 @@ def seed() -> str:
                ("Partitions and finishes", 13_900_000, "Tiling", "Completed"),
                ("Commissioning and handover", 3_100_000, "General", "Completed")])
 
+    # Managers and assignees are users: the names above are the team's, so
+    # each becomes the id of the one user it names.
+    people = REGISTRY.users_for_account(account["id"])
+    for item in [project, *extra_projects.values()]:
+        manager = resolve_user(people, name=item.get("manager"))
+        if manager:
+            item["manager_id"], item["manager"] = manager["id"], manager["name"]
+    for project_tasks in [rows, *extra_tasks.values()]:
+        for task in project_tasks:
+            person = resolve_user(people, name=task.get("assignee"))
+            task["assignee_id"] = person["id"] if person else ""
+            if not person:
+                task["assignee"] = ""
     workspace.save_projects({project["id"]: project, **extra_projects})
     workspace.save_tasks({project["id"]: rows, **extra_tasks})
     workspace.save_procurement({project["id"]: procurement_rows})
@@ -775,7 +840,7 @@ def seed() -> str:
         doc_id = uuid.uuid4().hex[:12]
         source = PACK / name
         meta["documents"][doc_id] = {
-            "id": doc_id, "name": name, "project_id": project["id"],
+            "id": doc_id, "name": name, "origin": "project",
             "source_type": kind, "status": "indexed", "page_count": pages,
             "size": source.stat().st_size if source.exists() else 0,
             "digest": uuid.uuid4().hex,
@@ -783,6 +848,19 @@ def seed() -> str:
             "accessed_at": (today - timedelta(days=index)).isoformat(),
             "pages": [{"page_num": page, "image_path": f"{name}_{page}.png",
                        "text_content": ""} for page in range(1, pages + 1)]}
+        # The tender specification is the company's standard one, so the school
+        # uses it too: one document, linked to both projects.
+        school = next((pid for pid, p in extra_projects.items() if p["project_code"] == "BSB-2027"), None)
+        linked = [project["id"], school] if (index == 0 and school) else [project["id"]]
+        set_document_projects(meta["documents"][doc_id], linked)
+    # Uploaded from the chat and never filed under a project: an orphan.
+    orphan_id = uuid.uuid4().hex[:12]
+    meta["documents"][orphan_id] = {
+        "id": orphan_id, "name": "Site-photo_North-Elevation.jpg", "type": ".jpg",
+        "origin": "chat", "status": "indexed", "page_count": 1, "size": 0,
+        "digest": uuid.uuid4().hex, "uploaded_at": today.isoformat(),
+        "pages": [{"page_num": 1, "image_path": "", "text_content": ""}]}
+    set_document_projects(meta["documents"][orphan_id], [])
     workspace.save_metadata(meta)
 
     return account["id"]
@@ -800,12 +878,9 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8000)
     options = parser.parse_args()
 
-    if options.reset and RUNTIME.exists():
-        shutil.rmtree(RUNTIME)
-        RUNTIME.mkdir(parents=True)
-
+    # --reset was acted on at import, before the routes were registered.
     marker = RUNTIME / "seeded.json"
-    if not marker.exists():
+    if not marker.exists() or not REGISTRY.find_by_email(DEMO_EMAIL):
         account_id = seed()
         marker.write_text(json.dumps({"account_id": account_id,
                                       "seeded_at": datetime.now(timezone.utc).isoformat()}),

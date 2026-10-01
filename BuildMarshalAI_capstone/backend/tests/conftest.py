@@ -2,18 +2,70 @@
 
 The modules under test resolve every store through an ``AccountWorkspace`` and
 an ``AccountContext``.  These helpers build real ones over a temporary
-directory, backed by an in-memory stand-in for the Chroma collection, so route
-tests can assert isolation without loading ColPali or starting ChromaDB.
+directory and a real PostgreSQL database, backed by an in-memory stand-in for
+the Chroma collection, so route tests can assert isolation without loading
+ColPali or starting ChromaDB.
+
+Each test gets its own schema in the test database, created the first time the
+test touches the database and dropped afterwards, so tests cannot see each
+other's rows and a test that never stores anything costs nothing.  The test
+database is ``BUILDMARSHAL_TEST_DATABASE_URL``, or the one ``SETUP-DATABASE.ps1``
+recorded in ``secrets/runtime-secrets.json``.
 """
 
 from __future__ import annotations
 
+import json
+import os
+import uuid
 from pathlib import Path
 from typing import Any
 
+import psycopg
 import pytest
 
 from backend.accounts import AccountContext, AccountRegistry, AccountWorkspace
+from backend.database import Database, set_default_database
+
+
+def _test_database_url() -> str:
+    url = os.environ.get("BUILDMARSHAL_TEST_DATABASE_URL", "").strip()
+    if url:
+        return url
+    secrets_file = Path(__file__).resolve().parents[3] / "secrets" / "runtime-secrets.json"
+    if secrets_file.exists():
+        recorded = json.loads(secrets_file.read_text(encoding="utf-8-sig"))
+        url = str(recorded.get("BUILDMARSHAL_TEST_DATABASE_URL") or "").strip()
+    if not url:
+        pytest.exit("No test database: set BUILDMARSHAL_TEST_DATABASE_URL or run SETUP-DATABASE.ps1",
+                    returncode=2)
+    return url
+
+
+TEST_DATABASE_URL = _test_database_url()
+
+
+@pytest.fixture(autouse=True)
+def database():
+    """A fresh schema for this test, made on first use and dropped after."""
+    opened: dict[str, Any] = {}
+
+    def create() -> Database:
+        schema = f"t_{uuid.uuid4().hex[:16]}"
+        with psycopg.connect(TEST_DATABASE_URL, autocommit=True) as admin:
+            admin.execute(f'CREATE SCHEMA "{schema}"')
+        opened["schema"] = schema
+        opened["db"] = Database(TEST_DATABASE_URL, schema=schema, min_size=1, max_size=4)
+        return opened["db"]
+
+    set_default_database(create)
+    yield lambda: opened.get("db")
+    set_default_database(None)
+    if "db" in opened:
+        opened["db"].close()
+    if "schema" in opened:
+        with psycopg.connect(TEST_DATABASE_URL, autocommit=True) as admin:
+            admin.execute(f'DROP SCHEMA "{opened["schema"]}" CASCADE')
 
 
 class FakeCollection:

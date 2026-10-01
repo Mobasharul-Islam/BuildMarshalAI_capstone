@@ -22,12 +22,20 @@ TASK_WORK = ("task.create", "task.update.status", "task.update.description",
 
 
 def as_role(context: AccountContext, role: str, *, name: str | None = None) -> AccountContext:
-    """The same account, seen as a member holding a particular role."""
-    user = {**context.user, "is_owner": False, "role": role}
+    """The same account, seen as a member holding a particular role.
+
+    ``name`` picks one of the account's real people (see the ``project``
+    fixture), because a task is assigned to a user, not to a name.
+    """
+    user = dict(context.user)
     if name is not None:
-        user["name"] = name
-    return AccountContext(user=user, account=context.account,
-                          workspace=context.workspace, token=context.token)
+        user = next((dict(u) for u in context.people if u.get("name") == name), None) \
+            or {**context.user, "name": name}
+    user.update({"is_owner": False, "role": role})
+    ctx = AccountContext(user=user, account=context.account,
+                         workspace=context.workspace, token=context.token)
+    ctx.people = context.people
+    return ctx
 
 
 def build_app(context: AccountContext, registry) -> TestClient:
@@ -52,10 +60,17 @@ def define_role(context: AccountContext, name: str, permissions) -> None:
 
 
 @pytest.fixture
-def project(make_account):
+def project(make_account, registry):
     context = make_account("owner@example.com")
+    # Real people: tasks are assigned to users, and only to people on the project.
+    sam = registry.create_user(account_id=context.account_id, name="Sam Field",
+                               email="sam@example.com", password="Passw0rd!123", role="Worker")
+    alex = registry.create_user(account_id=context.account_id, name="Alex Other",
+                                email="alex@example.com", password="Passw0rd!123", role="Worker")
+    context.people = [context.user, sam, alex]
     context.workspace.save_projects({"p1": {
         "id": "p1", "name": "Tower", "project_code": "TWR", "baseline_cost": 0,
+        "members": [{"user_id": u["id"]} for u in context.people],
     }})
     # A cost holder, and a worker who holds no cost permission at all.
     define_role(context, "Cost Holder", [BASE, ADDITIONAL, TASK_COST, *TASK_WORK])
@@ -66,7 +81,7 @@ def project(make_account):
 
 # ── project baseline and additional costs ─────────────────────────────────────
 
-@pytest.mark.parametrize("role", ["Cost Holder", "Super Admin", "System Admin"])
+@pytest.mark.parametrize("role", ["Cost Holder", "Head (Super Admin)", "Head (System Admin)"])
 def test_a_cost_holder_or_administrator_may_set_the_baseline(project, registry, role):
     client = build_app(as_role(project, role), registry)
     saved = client.put("/api/projects/p1/costs/baseline", json={"amount": 25000})
@@ -223,6 +238,7 @@ def test_a_member_with_no_name_is_matched_on_their_email(project, registry):
     holder = build_app(as_role(project, "Cost Holder"), registry)
     task = make_task(holder, assignee="owner@example.com")
 
-    nameless = build_app(as_role(project, "Worker", name=""), registry)
+    # The owner, seen as a Worker: the task named them by email, not by name.
+    nameless = build_app(as_role(project, "Worker"), registry)
     assert nameless.put(f"/api/projects/p1/tasks/{task['id']}",
                         json={"cost": 60}).status_code == 200

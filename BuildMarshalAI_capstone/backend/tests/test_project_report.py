@@ -268,8 +268,7 @@ def test_generating_a_report_writes_a_pdf_and_registers_it(project):
 
     written = list(Path(project.workspace.generated_dir).glob("*.pdf"))
     assert len(written) == 1
-    registry = project.workspace.generated_registry
-    assert registry.exists() and body["id"] in registry.read_text(encoding="utf-8")
+    assert body["id"] in project.workspace.load_generated()
 
 
 def test_the_report_is_listed_against_its_project(project):

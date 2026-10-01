@@ -13,6 +13,11 @@ import numpy as np
 import torch
 from PIL import Image
 
+try:  # the notebook puts this directory on sys.path
+    from document_links import document_project_ids
+except ModuleNotFoundError:  # imported as backend.hybrid_retrieval
+    from backend.document_links import document_project_ids
+
 
 LOGGER = logging.getLogger("BuildMarshalAI.retrieval")
 
@@ -139,12 +144,22 @@ class HybridColPaliRetriever:
         multi = self._query_multivector(query)
         return None if multi is None else multi.float().mean(dim=0).numpy()
 
-    def _pages(self, project_id: str | None, workspace: Any) -> list[dict[str, Any]]:
+    @staticmethod
+    def _scope(project_id: Any) -> set[str]:
+        """The project ids a search is limited to; empty means the whole account."""
+        if not project_id:
+            return set()
+        return {project_id} if isinstance(project_id, str) else {str(p) for p in project_id if p}
+
+    def _pages(self, project_id: Any, workspace: Any) -> list[dict[str, Any]]:
         pages: list[dict[str, Any]] = []
+        scope = self._scope(project_id)
         for doc_id, document in workspace.load_metadata().get("documents", {}).items():
-            doc_project = document.get("project_id")
-            if project_id and doc_project != project_id:
+            linked = document_project_ids(document)
+            # A document shared by several projects is found from each of them.
+            if scope and not scope.intersection(linked):
                 continue
+            doc_project = linked[0] if linked else None
             for page in document.get("pages", []):
                 page_num = int(page.get("page_num", 1))
                 pages.append({
@@ -159,8 +174,13 @@ class HybridColPaliRetriever:
                 })
         return pages
 
-    def retrieve(self, query: str, top_k: int = 5, project_id: str | None = None,
+    def retrieve(self, query: str, top_k: int = 5, project_id: Any = None,
                  workspace: Any = None) -> list[dict[str, Any]]:
+        """The best ``top_k`` pages, from the whole account or only ``project_id``.
+
+        ``project_id`` may be one id or several. Scoped, no page of a document
+        outside the scope can be returned by any of the three channels.
+        """
         if workspace is None:
             raise RuntimeError("Hybrid retrieval requires the caller's account workspace")
         collection = workspace.collection
@@ -183,8 +203,10 @@ class HybridColPaliRetriever:
                     "n_results": min(candidate_limit, collection.count()),
                     "include": ["metadatas", "distances"],
                 }
-                if project_id:
-                    kwargs["where"] = {"project_id": project_id}
+                if self._scope(project_id):
+                    # Page vectors know their document, not its projects (links
+                    # change without re-embedding), so filter on the documents.
+                    kwargs["where"] = {"doc_id": {"$in": sorted({p["doc_id"] for p in pages})}}
                 result = collection.query(**kwargs)
                 for item_id, distance in zip(result["ids"][0], result["distances"][0]):
                     if item_id in by_id:

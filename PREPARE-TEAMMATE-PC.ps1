@@ -39,6 +39,10 @@ $environment = [ordered]@{
     CLIPROXY_MODEL = [string]$runtimeSecrets.CLIPROXY_MODEL
     CLIPROXY_TIMEOUT_SECONDS = [string]$runtimeSecrets.CLIPROXY_TIMEOUT_SECONDS
     BUILDMARSHAL_DOCGEN_MAX_TOKENS = [string]$runtimeSecrets.BUILDMARSHAL_DOCGEN_MAX_TOKENS
+    # Every record lives in PostgreSQL; SETUP-DATABASE.ps1 records these.
+    BUILDMARSHAL_DATABASE_URL = [string]$runtimeSecrets.BUILDMARSHAL_DATABASE_URL
+    BUILDMARSHAL_TEST_DATABASE_URL = [string]$runtimeSecrets.BUILDMARSHAL_TEST_DATABASE_URL
+    BUILDMARSHAL_DEMO_DATABASE_URL = [string]$runtimeSecrets.BUILDMARSHAL_DEMO_DATABASE_URL
     BUILDMARSHAL_DATA_DIR = (Join-Path $repoRoot ".buildmarshal_runtime\buildmarshal")
     HF_HOME = (Join-Path $repoRoot ".buildmarshal_runtime\hf_cache")
 }
@@ -96,19 +100,24 @@ foreach ($requiredData in @($modelIndex, $adapter)) {
     }
 }
 
-# Connected Google accounts live in the encrypted store of the account that owns
-# them. Before the first backend start that is still the pre-migration file at
-# the data root; afterwards it sits under accounts\<account_id>\. Accept either,
-# and treat "none connected yet" as a warning rather than a hard stop so a fresh
-# install can start and connect one from the UI.
-$legacyTokenStore = Join-Path $dataRoot "google_workspace_accounts.enc"
-$accountsRoot = Join-Path $dataRoot "accounts"
-$accountTokenStores = @()
-if (Test-Path -LiteralPath $accountsRoot) {
-    $accountTokenStores = @(Get-ChildItem -LiteralPath $accountsRoot -Filter "google_workspace_accounts.enc" -File -Recurse -ErrorAction SilentlyContinue)
+# Every record -- accounts, projects, tasks, documents, linked Google and
+# Microsoft accounts (encrypted) -- lives in PostgreSQL. Create the database on
+# first use, then make sure it answers before anything tries to start.
+if (-not $runtimeSecrets.BUILDMARSHAL_DATABASE_URL) {
+    Write-Host "No BuildMarshalAI database yet; creating one (you will be asked for the PostgreSQL superuser password)." -ForegroundColor Yellow
+    & (Join-Path $packageRoot "SETUP-DATABASE.ps1")
+    $runtimeSecrets = Get-Content -Raw -LiteralPath $secretsPath | ConvertFrom-Json
+    foreach ($name in @("BUILDMARSHAL_DATABASE_URL", "BUILDMARSHAL_TEST_DATABASE_URL", "BUILDMARSHAL_DEMO_DATABASE_URL")) {
+        $value = [string]$runtimeSecrets.$name
+        if ($value) {
+            [Environment]::SetEnvironmentVariable($name, $value, "Process")
+            [Environment]::SetEnvironmentVariable($name, $value, "User")
+        }
+    }
 }
-if (-not (Test-Path -LiteralPath $legacyTokenStore) -and $accountTokenStores.Count -eq 0) {
-    Write-Host "No connected Google account found yet. Sign in, then connect one from Google Workspace in the app." -ForegroundColor Yellow
+& $venvPython (Join-Path $repoRoot "scripts\check_database.py") --secrets $secretsPath
+if ($LASTEXITCODE -ne 0) {
+    throw "The BuildMarshalAI database does not answer. Start the PostgreSQL service (services.msc), or run .\SETUP-DATABASE.ps1."
 }
 
 Write-Host "Preparation complete." -ForegroundColor Green

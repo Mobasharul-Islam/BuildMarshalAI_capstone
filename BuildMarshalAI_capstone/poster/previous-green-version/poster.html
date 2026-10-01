@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>BuildMarshalAI — Capstone Poster</title>
+<!-- IBM Plex, inlined as woff2 data URIs by poster/embed_fonts.py, so the PDF
+     embeds real fonts rather than Type3 glyph programs and the poster renders
+     the same on a machine with no network. -->
+<link rel="stylesheet" href="fonts.css">
+<style>
+/* ══════════════════════════════════════════════════════════════════════
+   18in × 24in poster.
+
+   Every length is in inches or points, so what is measured on screen is
+   what comes off the printer. The vertical budget is deliberate and tight:
+
+     header 3.4  ·  problem 1.8  ·  guarantees 9.7  ·  how 4.1
+     ·  tail 4.0  ·  footer 1.0   =  24.0in
+
+   Plain block flow, not flex: a flex column silently shrinks whichever
+   child can give, which is how the title ended up a third of its size.
+   ══════════════════════════════════════════════════════════════════════ */
+@page { size: 18in 24in; margin: 0; }
+
+:root{
+  --ink:      #0D1A15;   /* near-black, green-shifted to sit with the accent */
+  --deep:     #11402A;   /* header band */
+  --green:    #1B6B45;   /* the accent that carries the argument */
+  --bright:   #2E9E68;
+  --risk:     #A8410C;   /* the one warm colour, reserved for what goes wrong */
+  --paper:    #FFFFFF;
+  --surface:  #F2F6F3;
+  --surface2: #E7EEE9;
+  --rule:     #CFDAD4;
+  --muted:    #566860;
+}
+
+*{ box-sizing:border-box; margin:0; padding:0; }
+
+html,body{ width:18in; height:24in; overflow:hidden; }
+body{
+  background:var(--paper);
+  color:var(--ink);
+  font-family:'IBM Plex Sans', Arial, sans-serif;
+  line-height:1.36;
+  -webkit-print-color-adjust:exact;
+  print-color-adjust:exact;
+}
+.mono{ font-family:'IBM Plex Mono', monospace; }
+
+/* ── Header · 3.4in ──────────────────────────────────────────────── */
+header{
+  background:var(--deep); color:#fff;
+  padding:0.30in 0.7in 0.27in;
+  position:relative; overflow:hidden;
+}
+header::after{                     /* a quiet blueprint grid, not a gradient */
+  content:''; position:absolute; inset:0;
+  background-image:
+    linear-gradient(rgba(255,255,255,.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,.05) 1px, transparent 1px);
+  background-size:0.5in 0.5in; pointer-events:none;
+}
+.head-row{ display:flex; align-items:flex-start; gap:0.45in; position:relative; z-index:1; }
+.eyebrow{
+  font-family:'IBM Plex Mono', monospace;
+  font-size:13pt; font-weight:500; letter-spacing:0.05em;
+  text-transform:uppercase; color:#8FD3B0; margin-bottom:0.09in;
+}
+h1{ font-size:76pt; line-height:0.95; font-weight:700; letter-spacing:-0.022em; }
+h1 .ai{ color:var(--bright); }
+.tagline{
+  font-size:23pt; line-height:1.22; font-weight:400; color:#D2E7DC;
+  margin-top:0.10in; max-width:12in;
+}
+.tagline b{ color:#fff; font-weight:600; }
+.authors{
+  margin-top:0.15in; padding-top:0.12in; border-top:1px solid rgba(255,255,255,.22);
+  font-size:13.5pt; color:#B5D4C4; line-height:1.4;
+}
+.authors b{ color:#fff; font-weight:600; }
+.mark{ flex:0 0 2.35in; text-align:right; }
+.mark .tick{
+  width:1.12in; height:1.12in; border-radius:0.25in; background:var(--bright);
+  display:inline-flex; align-items:center; justify-content:center;
+  font-size:56pt; font-weight:700; color:#0B3421; line-height:1;
+}
+.mark .stack{
+  margin-top:0.16in; font-family:'IBM Plex Mono', monospace;
+  font-size:11.5pt; color:#8FD3B0; line-height:1.6; text-align:right;
+}
+
+/* ── Shared ──────────────────────────────────────────────────────── */
+.band-title{
+  font-family:'IBM Plex Mono', monospace;
+  font-size:13.5pt; font-weight:600; letter-spacing:0.09em; text-transform:uppercase;
+  color:var(--green); display:flex; align-items:center; gap:0.15in;
+}
+.band-title::after{ content:''; flex:1; height:2px; background:var(--rule); }
+
+/* ── The problem · 1.8in ─────────────────────────────────────────── */
+.problem{
+  padding:0.22in 0.7in 0.20in;
+  background:var(--surface); border-bottom:1px solid var(--rule);
+  display:grid; grid-template-columns: 1fr 5.5in; gap:0.55in; align-items:center;
+}
+.problem .lead{ font-size:21pt; line-height:1.28; }
+.problem .lead b{ color:var(--risk); font-weight:600; }
+.problem .aside{
+  font-size:14.5pt; line-height:1.42; color:var(--muted);
+  border-left:4px solid var(--risk); padding-left:0.24in;
+}
+.problem .aside b{ color:var(--ink); font-weight:600; }
+
+/* ── The two guarantees · 9.7in ──────────────────────────────────── */
+.guarantees{ padding:0.18in 0.7in 0.05in; }
+.g{
+  display:grid; grid-template-columns: 1fr 3.7in; gap:0.4in;
+  padding-bottom:0.20in; margin-bottom:0.20in;
+  border-bottom:1px solid var(--rule);
+}
+.g:last-child{ border-bottom:none; margin-bottom:0; padding-bottom:0; }
+.g-num{
+  font-family:'IBM Plex Mono', monospace; font-size:13.5pt; font-weight:600;
+  color:var(--bright); letter-spacing:0.08em;
+}
+.g h2{
+  font-size:31pt; line-height:1.05; font-weight:700; letter-spacing:-0.017em;
+  margin:0.05in 0 0.13in;
+}
+.g h2 u{ text-decoration:none; box-shadow:inset 0 -0.11em 0 rgba(46,158,104,.34); }
+.g .why{ font-size:16pt; line-height:1.36; color:#223830; margin-bottom:0.13in; }
+.g .why b{ font-weight:600; }
+.g ul{ list-style:none; display:grid; gap:0.085in; }
+.g li{
+  font-size:14.5pt; line-height:1.32; padding-left:0.3in; position:relative; color:#1E322A;
+}
+.g li::before{
+  content:''; position:absolute; left:0; top:0.09in;
+  width:0.13in; height:0.13in; border-radius:50%; border:3px solid var(--bright);
+}
+.g li b{ font-weight:600; color:var(--ink); }
+.g li .mono{ font-size:13.5pt; background:var(--surface2); padding:0 0.06in; border-radius:3px; }
+
+.shot{
+  background:var(--surface); border:1px solid var(--rule); border-radius:0.09in;
+  padding:0.11in; align-self:start;
+}
+.shot img{ width:100%; display:block; border-radius:0.04in; }
+.shot .cap{
+  font-size:11pt; line-height:1.32; color:var(--muted); margin-top:0.09in;
+  font-family:'IBM Plex Mono', monospace;
+}
+.shot .cap b{ color:var(--green); font-weight:600; }
+.shot-pair{ display:grid; gap:0.14in; align-items:start; }
+
+.claim{
+  background:var(--deep); color:#fff; border-radius:0.09in;
+  padding:0.13in 0.2in; margin-top:0.13in;
+  font-size:15pt; line-height:1.32;
+}
+.claim b{ color:var(--bright); font-weight:600; }
+
+/* ── Architecture · 4.1in ────────────────────────────────────────── */
+.how{
+  padding:0.22in 0.7in 0.19in; background:var(--surface);
+  border-top:1px solid var(--rule); border-bottom:1px solid var(--rule);
+}
+.how svg{ width:100%; height:auto; display:block; margin-top:0.16in; }
+
+/* ── Beyond + numbers · 4.0in ────────────────────────────────────── */
+.tail{ padding:0.18in 0.7in 0.14in; display:grid; grid-template-columns: 1fr 5.3in; gap:0.55in; }
+.more ul{ list-style:none; display:grid; grid-template-columns:1fr 1fr; gap:0.15in 0.35in; margin-top:0.17in; }
+.more li{ font-size:14pt; line-height:1.32; padding-left:0.28in; position:relative; color:#1E322A; }
+.more li::before{
+  content:''; position:absolute; left:0; top:0.085in; width:0.14in; height:0.14in;
+  background:var(--bright); border-radius:2px;
+}
+.more li b{ display:block; font-weight:600; color:var(--ink); font-size:15pt; }
+
+.numbers{
+  display:grid; grid-template-columns:repeat(3,1fr); gap:0.02in; margin-top:0.17in;
+  border:1px solid var(--rule); border-radius:0.09in; overflow:hidden; background:var(--rule);
+}
+.numbers div{ background:var(--paper); padding:0.14in 0.17in; }
+.numbers .n{ font-size:31pt; font-weight:700; line-height:1; color:var(--green); letter-spacing:-0.02em; }
+.numbers .l{ font-size:11.5pt; line-height:1.26; color:var(--muted); margin-top:0.06in; }
+
+/* ── Footer · 1.0in ──────────────────────────────────────────────── */
+footer{
+  background:var(--ink); color:#A5BAB0; padding:0.17in 0.7in;
+  display:flex; align-items:center; gap:0.4in; font-size:12.5pt;
+}
+footer .qr{ width:0.82in; height:0.82in; background:#fff; padding:0.04in; border-radius:0.04in; flex:0 0 auto; }
+footer .qr img{ width:100%; height:100%; display:block; }
+footer .grow{ flex:1; line-height:1.45; }
+footer b{ color:#fff; font-weight:600; }
+footer .mono{ font-size:11.5pt; }
+</style>
+</head>
+<body>
+
+<!-- ═══ Header ══════════════════════════════════════════════════════ -->
+<header>
+  <div class="head-row">
+    <div style="flex:1">
+      <p class="eyebrow">Bangladesh University of Engineering &amp; Technology &nbsp;·&nbsp; Dept. of CSE &nbsp;·&nbsp; Level-4 Capstone 2026</p>
+      <h1>BuildMarshal<span class="ai">AI</span></h1>
+      <p class="tagline">Construction document intelligence that <b>refuses to guess</b>.
+        Every answer points at the page it came from; every field it cannot read, it asks for.</p>
+      <p class="authors">
+        <b>Md. Mobasharul Islam</b> (2105076) &nbsp;·&nbsp; <b>[Team member 2]</b> &nbsp;·&nbsp; <b>[Team member 3]</b>
+        &nbsp;&nbsp;|&nbsp;&nbsp; Supervised by <b>[Supervisor name]</b>, Department of Computer Science &amp; Engineering
+      </p>
+    </div>
+    <div class="mark">
+      <div class="tick">
+        <svg viewBox="0 0 24 24" width="62%" height="62%" aria-hidden="true">
+          <path d="M3.5 12.5 L9.5 18.5 L20.5 6" fill="none" stroke="#0B3421"
+                stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <div class="stack">
+        ColPali v1.2 · MaxSim<br>
+        ChromaDB · FastAPI<br>
+        Gemini via CLIProxyAPI<br>
+        1 × RTX 3070 · on-premises
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- ═══ The problem ═════════════════════════════════════════════════ -->
+<section class="problem">
+  <p class="lead">A construction contract is a legal document. Slabs are specified at
+    3500&nbsp;psi and piles at 4000&nbsp;psi — an assistant that confuses the two has not
+    made a typo, it has <b>created a liability</b>.</p>
+  <p class="aside">Site engineers still answer such questions by hand-searching hundreds of
+    pages of specifications and drawings. A general-purpose assistant answers
+    <b>fluently and wrongly</b>, with nothing to check it against — and will invent a
+    project, a date or a person to finish filling a form.</p>
+</section>
+
+<!-- ═══ The two guarantees ══════════════════════════════════════════ -->
+<section class="guarantees">
+
+  <!-- ── 1 ── -->
+  <div class="g">
+    <div>
+      <p class="g-num">GUARANTEE 01 — READING</p>
+      <h2>Every answer points at <u>the page it came from</u>.</h2>
+      <p class="why">Retrieval runs over <b>rendered page images</b>, not extracted text. A
+        ColPali&nbsp;v1.2 vision–language encoder embeds each page as a grid of patch vectors
+        and MaxSim scores the question against them — so a table, a stamped revision or a
+        floor plan is searchable on the same footing as a paragraph.</p>
+      <ul>
+        <li><b>The citation is part of the answer.</b> Document, page and MaxSim score travel
+            with every reply; one click opens that exact page image. Scanned drawings and dense
+            tender tables — where a text-chunk pipeline returns nothing usable — are retrieved
+            the same way.</li>
+        <li><b>Nothing found means nothing said.</b> With no passage above threshold it says
+            so and names what the workspace holds, rather than composing something plausible.</li>
+      </ul>
+      <p class="claim">The answer alongside is checkable in one click:
+        <b>06_Tender-Specification.pdf, page 2, 94% MaxSim</b> — the page that actually
+        carries the concrete schedule.</p>
+    </div>
+    <div class="shot">
+      <img src="assets/p1-evidence.png" alt="Marshal Chat answering with concrete grades by location, followed by an evidence card naming 06_Tender-Specification.pdf page 2 at 94 per cent">
+      <p class="cap">A live answer and its <b>evidence card</b> — grades differ by location.</p>
+    </div>
+  </div>
+
+  <!-- ── 2 ── -->
+  <div class="g">
+    <div>
+      <p class="g-num">GUARANTEE 02 — WRITING</p>
+      <h2>Every field it cannot read, <u>it asks for</u>.</h2>
+      <p class="why">Chat creates <b>eleven kinds of record</b> — projects, tasks, users, roles,
+        costs, procurement, catalogues. What each one mandates is derived from the
+        application's own constructors and validators, so the assistant and the API can never
+        disagree about what is required.</p>
+      <ul>
+        <li><b>A reference must exist.</b> A project type, trade or assignee is accepted only
+            when it names a record already in the workspace; an unmatched value is dropped
+            and asked about, never corrected to the nearest guess.</li>
+        <li><b>It collects across turns.</b> Values given one message at a time accumulate; it
+            asks only for what is outstanding and never re-asks.</li>
+        <li><b>The form opens once, at the end.</b> Complete and prefilled for review — then
+            the record is written by the <span class="mono">POST</span> route that already owns
+            the permission check and the validator.</li>
+      </ul>
+      <p class="claim">Interpretation creates nothing. <b>529 tests / 591 cases</b> hold the
+        line — including that an unreadable date is asked for again rather than filled in.</p>
+    </div>
+    <div class="shot-pair">
+      <div class="shot">
+        <img src="assets/p2-collection.png" alt="Chat collecting a project across four turns, each reply naming only what is still missing">
+        <p class="cap">Mid-collection: each reply names <b>only what is still missing</b>.</p>
+      </div>
+      <div class="shot">
+        <img src="assets/p3-dialog.png" alt="The New Project dialog opening prefilled with Website Redesign, WR-2027, John and 10/01/2027">
+        <p class="cap">Then the dialog opens <b>once, prefilled</b>, for review.</p>
+      </div>
+    </div>
+  </div>
+
+</section>
+
+<!-- ═══ Architecture ════════════════════════════════════════════════ -->
+<section class="how">
+  <p class="band-title">How it works — two paths, one guarantee each</p>
+  <svg viewBox="0 0 1660 312" xmlns="http://www.w3.org/2000/svg" role="img"
+       aria-label="Two pipelines. Reading: documents are rendered to page images, embedded by ColPali v1.2, stored per account in ChromaDB, retrieved by MaxSim, and answered by Gemini with the page cited. Writing: a sentence is checked against the entity schema, whatever is mandatory and missing is asked for in chat in a loop, and only when nothing is missing does a prefilled form post to the ordinary API route with its permission check and validator.">
+    <defs>
+      <marker id="ar" markerWidth="9" markerHeight="9" refX="7.5" refY="4.5" orient="auto">
+        <path d="M0,1 L8,4.5 L0,8 z" fill="#1B6B45"/></marker>
+      <marker id="ar2" markerWidth="9" markerHeight="9" refX="7.5" refY="4.5" orient="auto">
+        <path d="M0,1 L8,4.5 L0,8 z" fill="#A8410C"/></marker>
+    </defs>
+    <style>
+      .bx  { fill:#FFFFFF; stroke:#CFDAD4; stroke-width:2; }
+      .bxk { fill:#11402A; }
+      .bxa { fill:#E7EEE9; stroke:#1B6B45; stroke-width:2; }
+      .t   { font-family:'IBM Plex Sans',sans-serif; font-size:18px; fill:#0D1A15; font-weight:600; }
+      .ts  { font-family:'IBM Plex Mono',monospace; font-size:13.5px; fill:#566860; }
+      .tw  { font-family:'IBM Plex Sans',sans-serif; font-size:18px; fill:#FFFFFF; font-weight:600; }
+      .tws { font-family:'IBM Plex Mono',monospace; font-size:13.5px; fill:#8FD3B0; }
+      .lane{ font-family:'IBM Plex Mono',monospace; font-size:15px; font-weight:600; letter-spacing:.09em; }
+      .ln  { stroke:#1B6B45; stroke-width:2.5; fill:none; marker-end:url(#ar); }
+      .ln2 { stroke:#A8410C; stroke-width:2.5; fill:none; marker-end:url(#ar2); }
+    </style>
+
+    <!-- lane 1 : reading -->
+    <text class="lane" x="0" y="14" fill="#1B6B45">READING · A QUESTION</text>
+    <rect class="bx"  x="0"    y="30" width="222" height="70" rx="8"/>
+    <text class="t"   x="16"   y="59">Documents</text>
+    <text class="ts"  x="16"   y="82">PDF · XLSX · drawings</text>
+
+    <rect class="bx"  x="258"  y="30" width="200" height="70" rx="8"/>
+    <text class="t"   x="274"  y="59">Page images</text>
+    <text class="ts"  x="274"  y="82">rendered, not parsed</text>
+
+    <rect class="bxa" x="494"  y="30" width="200" height="70" rx="8"/>
+    <text class="t"   x="510"  y="59">ColPali v1.2</text>
+    <text class="ts"  x="510"  y="82">patch embeddings</text>
+
+    <rect class="bx"  x="730"  y="30" width="196" height="70" rx="8"/>
+    <text class="t"   x="746"  y="59">ChromaDB</text>
+    <text class="ts"  x="746"  y="82">per-account index</text>
+
+    <rect class="bxa" x="962"  y="30" width="200" height="70" rx="8"/>
+    <text class="t"   x="978"  y="59">MaxSim</text>
+    <text class="ts"  x="978"  y="82">top-k pages + score</text>
+
+    <rect class="bxk" x="1198" y="30" width="252" height="70" rx="8"/>
+    <text class="tw"  x="1214" y="59">Answer + evidence</text>
+    <text class="tws" x="1214" y="82">Gemini · CLIProxyAPI</text>
+
+    <line class="ln" x1="222"  y1="65" x2="250"  y2="65"/>
+    <line class="ln" x1="458"  y1="65" x2="486"  y2="65"/>
+    <line class="ln" x1="694"  y1="65" x2="722"  y2="65"/>
+    <line class="ln" x1="926"  y1="65" x2="954"  y2="65"/>
+    <line class="ln" x1="1162" y1="65" x2="1190" y2="65"/>
+    <text class="ts" x="1468" y="60" fill="#1B6B45">the cited page</text>
+    <text class="ts" x="1468" y="79" fill="#1B6B45">travels with it</text>
+
+    <!-- lane 2 : writing -->
+    <text class="lane" x="0" y="158" fill="#A8410C">WRITING · A COMMAND</text>
+    <rect class="bx"  x="0"    y="182" width="222" height="70" rx="8"/>
+    <text class="t"   x="16"   y="211">A sentence</text>
+    <text class="ts"  x="16"   y="234">“create a project…”</text>
+
+    <rect class="bxa" x="258"  y="182" width="222" height="70" rx="8"/>
+    <text class="t"   x="274"  y="211">entity_schema</text>
+    <text class="ts"  x="274"  y="234">mandatory fields</text>
+
+    <rect class="bx"  x="516"  y="182" width="222" height="70" rx="8"/>
+    <text class="t"   x="532"  y="211">What is missing?</text>
+    <text class="ts"  x="532"  y="234">references checked</text>
+
+    <rect class="bx"  x="774"  y="182" width="222" height="70" rx="8"/>
+    <text class="t"   x="790"  y="211">Prefilled form</text>
+    <text class="ts"  x="790"  y="234">reviewed by a person</text>
+
+    <rect class="bxk" x="1032" y="182" width="252" height="70" rx="8"/>
+    <text class="tw"  x="1048" y="211">POST /api/…</text>
+    <text class="tws" x="1048" y="234">permission + validator</text>
+
+    <rect class="bx"  x="1320" y="182" width="150" height="70" rx="8"/>
+    <text class="t"   x="1336" y="211">Record</text>
+    <text class="ts"  x="1336" y="234">written once</text>
+
+    <line class="ln2" x1="222"  y1="217" x2="250"  y2="217"/>
+    <line class="ln2" x1="480"  y1="217" x2="508"  y2="217"/>
+    <line class="ln2" x1="738"  y1="217" x2="766"  y2="217"/>
+    <line class="ln2" x1="996"  y1="217" x2="1024" y2="217"/>
+    <line class="ln2" x1="1284" y1="217" x2="1312" y2="217"/>
+
+    <!-- the loop that is the whole point of lane 2 -->
+    <path class="ln2" d="M 627 252 L 627 283 L 130 283 L 130 256"/>
+    <text class="ts" x="642" y="288" fill="#A8410C">ask in chat · keep what is settled · loop until nothing mandatory is missing</text>
+
+    <line x1="0" y1="290" x2="1660" y2="290" stroke="#CFDAD4" stroke-width="2"/>
+    <text class="ts" x="0" y="308">Each account holds its own documents, index and settings — isolation is structural, not a filter.  ·  Retrieval runs locally; pages are never uploaded to search them.</text>
+  </svg>
+</section>
+
+<!-- ═══ Beyond + numbers ════════════════════════════════════════════ -->
+<section class="tail">
+  <div class="more">
+    <p class="band-title">The rest of the platform</p>
+    <ul>
+      <li><b>Document onboarding</b>A programme or cost plan becomes a reviewable draft — you confirm before anything is committed.</li>
+      <li><b>Earned value &amp; flow</b>SPI, CPI and the 50/50 rule computed from the live programme, with rule-based risk flags.</li>
+      <li><b>Google &amp; Microsoft 365</b>Drive indexing, mail drafting, calendar and Meet — every booking behind an explicit confirm.</li>
+      <li><b>Generated reports</b>Phase-by-phase project reports rendered to PDF from the same cited evidence.</li>
+      <li><b>Structural multi-tenancy</b>Each account keeps its own documents, index, projects and settings — nothing is shared by default.</li>
+      <li><b>Evidence viewer</b>Open the cited page itself, at the region that matched, without leaving the answer.</li>
+    </ul>
+  </div>
+  <div>
+    <p class="band-title">Built and tested</p>
+    <div class="numbers">
+      <div><p class="n">591</p><p class="l">test cases passing,<br>from 529 test functions</p></div>
+      <div><p class="n">112</p><p class="l">API routes across<br>23 backend modules</p></div>
+      <div><p class="n">11</p><p class="l">record types creatable<br>from a sentence</p></div>
+      <div><p class="n">26k</p><p class="l">lines of Python<br>and JavaScript</p></div>
+      <div><p class="n">0</p><p class="l">invented references<br>accepted, by design</p></div>
+      <div><p class="n">1</p><p class="l">consumer GPU —<br>runs fully on-premises</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ Footer ══════════════════════════════════════════════════════ -->
+<footer>
+  <div class="qr"><img src="assets/qr.png" alt="QR code linking to the project repository"></div>
+  <div class="grow">
+    <p><b>BuildMarshalAI</b> — evidence-cited retrieval and schema-bound record creation for construction project management.</p>
+    <p class="mono">github.com/Mobasharul-Islam/BuildMarshalAI_capstone &nbsp;·&nbsp; FastAPI · ColPali v1.2 · ChromaDB · Gemini via CLIProxyAPI · vanilla JS</p>
+  </div>
+  <div class="mono" style="text-align:right; line-height:1.55">
+    Level-4 Capstone Project<br>Dept. of CSE, BUET &nbsp;·&nbsp; 2026
+  </div>
+</footer>
+
+</body>
+</html>

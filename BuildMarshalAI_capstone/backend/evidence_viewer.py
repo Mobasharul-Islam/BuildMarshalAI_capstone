@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import re
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Mapping
 
 from fastapi import Depends, HTTPException
@@ -95,14 +93,7 @@ def register_evidence_viewer_routes(namespace: Mapping[str, Any]) -> dict[str, A
         raise HTTPException(status_code=404, detail="Document page not found")
 
     def read_feedback(workspace: Any) -> list[dict[str, Any]]:
-        path = workspace.evidence_file
-        if not path.exists():
-            return []
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return []
-        return loaded if isinstance(loaded, list) else []
+        return workspace.load_evidence()
 
     @app.get("/api/evidence/{doc_id}/{page_num}")
     async def evidence_detail(
@@ -131,7 +122,6 @@ def register_evidence_viewer_routes(namespace: Mapping[str, Any]) -> dict[str, A
     ) -> dict[str, Any]:
         workspace = context.workspace
         document, _ = find_page(workspace, body.doc_id, body.page)
-        records = read_feedback(workspace)
         record = {
             "id": uuid.uuid4().hex,
             "doc_id": body.doc_id,
@@ -144,12 +134,8 @@ def register_evidence_viewer_routes(namespace: Mapping[str, Any]) -> dict[str, A
             "user_id": context.user_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
-        records.append(record)
-        records = records[-5000:]
-        path = workspace.evidence_file
-        temporary = path.with_name(path.name + ".tmp")
-        temporary.write_text(json.dumps(records, indent=2), encoding="utf-8")
-        temporary.replace(path)
+        # One row, and the log trimmed to its newest 5,000, in one transaction.
+        workspace.add_evidence(record, keep=5000)
         return {"status": "saved", "feedback_id": record["id"]}
 
     @app.get("/api/evidence-feedback/stats")

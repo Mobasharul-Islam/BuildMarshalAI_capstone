@@ -19,12 +19,11 @@ already serves generated documents.
 
 from __future__ import annotations
 
-import json
 import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from fastapi import Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -546,25 +545,13 @@ def register_project_report_routes(namespace: Mapping[str, Any]) -> dict[str, An
         insights = parse_insights(raw)
         return insights if insights.get("summary") else rule_based_summary(stats)
 
-    def registry_path(workspace: Any) -> Path:
-        return Path(workspace.generated_registry)
-
+    # Reports share the generated-document register with document generation,
+    # so a report downloads through the route that already serves those.
     def load_registry(workspace: Any) -> dict[str, Any]:
-        path = registry_path(workspace)
-        if not path.exists():
-            return {}
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
-        except (OSError, json.JSONDecodeError):
-            return {}
+        return workspace.load_generated()
 
     def save_registry(workspace: Any, data: Mapping[str, Any]) -> None:
-        path = registry_path(workspace)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(path.name + ".tmp")
-        temporary.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        temporary.replace(path)
+        workspace.save_generated(data)
 
     @app.get("/api/projects/{project_id}/report/preview")
     async def preview_report(project_id: str, rule: str = DEFAULT_PROGRESS_RULE,

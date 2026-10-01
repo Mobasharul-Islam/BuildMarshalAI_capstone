@@ -2,13 +2,17 @@
 
 Two roles are built in and cannot be created or deleted:
 
-* **Super Admin** holds every permission, and is the only role that may manage
-  roles themselves. That authority is deliberately not expressible as a
+* **Head (Super Admin)** holds every permission, and is the only role that may
+  manage roles themselves. That authority is deliberately not expressible as a
   permission, so it can never be delegated to a role someone creates.
-* **System Admin** keeps the account-administration reach it has always had.
+* **Head (System Admin)** keeps the account-administration reach it has always had.
 
 Every other role is created per account and is exactly the set of permissions
-the Super Admin ticked. Nothing else is hardcoded.
+the Head (Super Admin) ticked. Nothing else is hardcoded.
+
+The two were called "Super Admin" and "System Admin" before. Stored users were
+renamed by database migration 2, and :func:`canonical_role` still reads the old
+labels, so an older client or import cannot create a third spelling.
 
 Adding a permission later means appending one entry to ``PERMISSIONS``; the
 roles page, the API, and the checks all read from this list.
@@ -19,11 +23,41 @@ from __future__ import annotations
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SUPER_ADMIN_ROLE = "Super Admin"
-SYSTEM_ADMIN_ROLE = "System Admin"
+SUPER_ADMIN_ROLE = "Head (Super Admin)"
+SYSTEM_ADMIN_ROLE = "Head (System Admin)"
 
 #: Roles that exist without being created, and may not be edited or removed.
 BUILTIN_ROLES: tuple[str, ...] = (SUPER_ADMIN_ROLE, SYSTEM_ADMIN_ROLE)
+
+#: The built-ins' former names. Reserved, so no custom role can take them.
+LEGACY_ROLE_NAMES: dict[str, str] = {
+    "Super Admin": SUPER_ADMIN_ROLE,
+    "System Admin": SYSTEM_ADMIN_ROLE,
+}
+
+#: Stable ids for the built-ins, independent of their display names.
+BUILTIN_ROLE_IDS: dict[str, str] = {
+    SUPER_ADMIN_ROLE: "builtin-super-admin",
+    SYSTEM_ADMIN_ROLE: "builtin-system-admin",
+}
+
+
+def canonical_role(name: Any) -> str:
+    """A role label with a built-in's former name replaced by its current one."""
+    text = str(name or "").strip()
+    folded = text.casefold()
+    for legacy, current in LEGACY_ROLE_NAMES.items():
+        if folded == legacy.casefold():
+            return current
+    for builtin in BUILTIN_ROLES:
+        if folded == builtin.casefold():
+            return builtin
+    return text
+
+
+def reserved_role_names() -> set[str]:
+    """Names no custom role may use: the built-ins, current and former."""
+    return {name.casefold() for name in (*BUILTIN_ROLES, *LEGACY_ROLE_NAMES)}
 
 #: Task fields a role can be granted permission to change, in form order.
 #: ``cost`` is deliberately absent: it answers to the project cost permissions
@@ -134,9 +168,82 @@ PERMISSIONS: tuple[dict[str, str], ...] = tuple([
         "description": "Add, rename, and remove the project types this workspace offers.",
         "group": "Company settings",
     },
+    {
+        "key": "trade.manage",
+        "name": "Create/Edit Trades",
+        "description": "Add, rename, and remove the trades this workspace offers.",
+        "group": "Company settings",
+    },
+    {
+        "key": "vendor.manage",
+        "name": "Create/Edit External Companies",
+        "description": "Add, edit, and remove suppliers, subcontractors, and consultants.",
+        "group": "Company settings",
+    },
+    {
+        "key": "contact.manage",
+        "name": "Manage the Contact Directory",
+        "description": "Add, edit, and remove people in the account's contact directory.",
+        "group": "Company settings",
+    },
+    {
+        "key": "procurement.manage",
+        "name": "Procurement — Add & Update",
+        "description": "Add, edit, and remove the procurement lines on a project.",
+        "group": "Projects",
+    },
+    {
+        "key": "document.upload",
+        "name": "Upload Documents",
+        "description": (
+            "Upload files, and import them from Drive, OneDrive, Gmail or Outlook, "
+            "into the searchable document index."
+        ),
+        "group": "Documents",
+    },
+    {
+        "key": "document.delete",
+        "name": "Delete Documents",
+        "description": "Remove a document and its pages from the index.",
+        "group": "Documents",
+    },
 ])
 
 PERMISSION_KEYS: frozenset[str] = frozenset(entry["key"] for entry in PERMISSIONS)
+
+#: Permissions added after roles already existed, each with the id of the
+#: release that introduced it. Every one guards something that, before it, any
+#: member could do -- so a role that existed then is granted it once, keeping
+#: its people exactly as capable as they were. A role remembers which of these
+#: it has been through, so a key an administrator later takes away stays away,
+#: and a role created afterwards starts without them.
+PERMISSION_UPGRADES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("2026-09-access-controls", (
+        "trade.manage", "vendor.manage", "contact.manage", "procurement.manage",
+        "document.upload", "document.delete",
+    )),
+)
+
+UPGRADE_IDS: tuple[str, ...] = tuple(upgrade_id for upgrade_id, _ in PERMISSION_UPGRADES)
+
+
+def apply_permission_upgrades(roles: Sequence[dict[str, Any]]) -> bool:
+    """Grant each role the upgrades it has not been through yet, once.
+
+    Mutates the roles in place and says whether anything changed, so the
+    caller saves only when it must.
+    """
+    changed = False
+    for role in roles:
+        done = set(role.get("upgrades") or ())
+        for upgrade_id, keys in PERMISSION_UPGRADES:
+            if upgrade_id in done:
+                continue
+            role["permissions"] = sorted(set(clean_permissions(role.get("permissions") or ())) | set(keys))
+            done.add(upgrade_id)
+            changed = True
+        role["upgrades"] = sorted(done)
+    return changed
 
 #: Groups in the order the roles page should render them.
 PERMISSION_GROUPS: tuple[str, ...] = tuple(
@@ -166,13 +273,13 @@ def clean_permissions(values: Iterable[Any]) -> list[str]:
 
 
 def is_super_admin(user: Mapping[str, Any]) -> bool:
-    """Owners are always Super Admin, whatever their stored role label says."""
-    return bool(user.get("is_owner")) or user.get("role") == SUPER_ADMIN_ROLE
+    """Owners are always Head (Super Admin), whatever their stored role label says."""
+    return bool(user.get("is_owner")) or canonical_role(user.get("role")) == SUPER_ADMIN_ROLE
 
 
 def is_builtin_admin(user: Mapping[str, Any]) -> bool:
-    """Super Admin or System Admin: the two roles that administer the account."""
-    return is_super_admin(user) or user.get("role") == SYSTEM_ADMIN_ROLE
+    """Head (Super Admin) or Head (System Admin): the two roles that administer the account."""
+    return is_super_admin(user) or canonical_role(user.get("role")) == SYSTEM_ADMIN_ROLE
 
 
 def resolve_permissions(user: Mapping[str, Any],
@@ -205,8 +312,9 @@ def role_names(roles: Sequence[Mapping[str, Any]]) -> list[str]:
 
 
 __all__ = [
-    "BUILTIN_ROLES", "PERMISSIONS", "PERMISSION_GROUPS", "PERMISSION_KEYS",
-    "SUPER_ADMIN_ROLE", "SYSTEM_ADMIN_ROLE", "TASK_FIELD_PERMISSIONS",
-    "clean_permissions", "is_builtin_admin", "is_super_admin",
-    "permission_catalogue", "resolve_permissions", "role_names",
+    "BUILTIN_ROLES", "BUILTIN_ROLE_IDS", "LEGACY_ROLE_NAMES", "PERMISSIONS", "PERMISSION_GROUPS",
+    "PERMISSION_KEYS", "PERMISSION_UPGRADES", "SUPER_ADMIN_ROLE", "SYSTEM_ADMIN_ROLE",
+    "TASK_FIELD_PERMISSIONS", "UPGRADE_IDS", "apply_permission_upgrades", "canonical_role",
+    "clean_permissions", "is_builtin_admin", "is_super_admin", "permission_catalogue",
+    "reserved_role_names", "resolve_permissions", "role_names",
 ]

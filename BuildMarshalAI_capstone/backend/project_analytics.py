@@ -38,7 +38,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
 from fastapi import Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 try:  # the notebook puts this directory on sys.path
     from project_management import as_date, cost_breakdown, procurement_summary

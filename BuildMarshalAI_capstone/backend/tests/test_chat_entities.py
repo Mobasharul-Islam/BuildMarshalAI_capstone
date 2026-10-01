@@ -6,6 +6,7 @@ was never given, accept a project type or a role that does not exist, or treat
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -245,13 +246,21 @@ class Context:
 
     def require_super_admin(self) -> None:
         if not self._super_admin:
-            raise HTTPException(403, "This action requires a Super Admin")
+            raise HTTPException(403, "This action requires a Head (Super Admin)")
+
+
+#: Every call the fake model received, so a test can see what was sent.
+MODEL_CALLS: list[dict] = []
 
 
 def build_client(context: Context, reply: str = "") -> TestClient:
     app = FastAPI()
 
-    async def vl_generate(prompt, max_tokens=0):
+    # The notebook's real signature, keyword for keyword. A fake that accepted
+    # whatever it was given is what hid a call the real model rejected.
+    def vl_generate(messages: list, max_new_tokens: int = 4096, model: str | None = None) -> str:
+        assert isinstance(messages, list) and messages, "vl_generate takes a messages list"
+        MODEL_CALLS.append({"messages": messages, "max_new_tokens": max_new_tokens})
         return reply
 
     ce.register_chat_entity_routes({
@@ -712,3 +721,49 @@ def test_the_task_name_then_completes_it() -> None:
     assert body["ready"] is True
     assert body["fields"]["name"] == "Site mobilisation"
     assert parent_id == PROJECT_ID
+
+
+def test_the_model_is_called_the_way_the_notebook_defines_it() -> None:
+    """A messages list and max_new_tokens -- and its answer is actually used."""
+    MODEL_CALLS.clear()
+    reply = '{"fields": {"name": "Harbour Point", "project_code": "HP-2030"}}'
+    body = build_client(Context(), reply).post(
+        "/api/assistant/entities/interpret",
+        json={"text": "open a job for the harbour works"}).json()
+    assert MODEL_CALLS, "the model was never called"
+    sent = MODEL_CALLS[-1]
+    assert sent["messages"][-1]["role"] == "user"
+    assert "open a job for the harbour works" in json.dumps(sent["messages"])
+    assert sent["max_new_tokens"] == ce.MAX_INTERPRET_TOKENS
+    assert body["source"] == "model"
+    assert body["fields"]["project_code"] == "HP-2030"
+
+
+@pytest.mark.parametrize("question", [
+    # "open" and "task costs" appear, but this reads data; it was taken for "create a task cost".
+    "Give me a status overview of Padma View Specialised Hospital Extension: how many tasks are "
+    "completed, in progress, blocked and open, and what is the total cost split between baseline, "
+    "additional costs and task costs?",
+    "In Padma View, who has the most tasks assigned and how many of their tasks are finished?",
+    "List every task that is not completed but whose end date has already passed.",
+    "Compare Padma View with TSMC 2nm on total cost and number of tasks.",
+    "How many new tasks were added to the project this week?",
+    "Which open tasks have a task cost above 1,000,000?",
+])
+def test_questions_are_never_creation_requests(question):
+    from backend.chat_entities import detect_kind
+    assert detect_kind(question) == ""
+
+
+@pytest.mark.parametrize("sentence, kind", [
+    ("Create a task called Pour slab", "task"),
+    ("add a task cost of 5000 to Piling", "task_cost"),
+    ("Can you create a new project called Harbour Tower?", "project"),
+    ("Please add a user named Sam", "user"),
+    ("create a project cost for crane hire", "project_cost"),
+    ("start a new project called Riverside", "project"),
+])
+def test_real_creation_requests_still_are(sentence, kind):
+    from backend.chat_entities import detect_kind
+    assert detect_kind(sentence) == kind
+

@@ -9,7 +9,7 @@ isolation is enforced, and what happens to data that predates the change.
   stores.
 - A **user** is a login that belongs to exactly one account. The user created by
   `POST /api/auth/register` is the account **owner**.
-- Owners and users whose role is `Super Admin` or `System Admin` are
+- Owners and users whose role is `Head (Super Admin)` or `Head (System Admin)` are
   account administrators. They manage members through the existing **User**
   page; only the owner can delete the workspace.
 - Members of an account share that account's documents, index, projects,
@@ -20,30 +20,28 @@ isolation is enforced, and what happens to data that predates the change.
 
 ## What each account owns
 
-Everything lives under `BASE_DIR/accounts/<account_id>/`:
+**Records** live in PostgreSQL, in rows keyed by the account's id — see
+[DATABASE.md](DATABASE.md) for every table: documents and pages, catalogues
+(trades, external companies, contacts, task and project types), projects, tasks,
+procurement, roles, settings, company profile, conversations, onboarding drafts,
+the generated-document register, relevance feedback, and the encrypted Google
+and Microsoft 365 OAuth tokens. Accounts, users and sessions are rows too.
+
+**Files** live under `BASE_DIR/accounts/<account_id>/`:
 
 | Path | Contents |
 | --- | --- |
 | `documents/` | Uploaded and imported source files |
-| `pages/` | Rendered page images, audio, and other served assets |
+| `pages/` | Rendered page images and other served assets |
 | `chroma_db/` | The account's own ChromaDB `document_pages` collection |
 | `colpali_v1_2_multivectors/` | Cached ColPali page multi-vectors |
 | `generated_documents/` | Generated PDFs |
 | `google_imports/` | Scratch space for Drive/Gmail imports |
 | `document_generation_vision_cache/` | Downscaled tiles for the composer |
-| `metadata.json` | Document and page metadata |
-| `management.json` | Trades, vendors, team members |
-| `projects.json`, `tasks.json` | Projects and their tasks |
-| `settings.json` | Model, retrieval top-k, voice URL, company details |
-| `conversations.json` | Chat history |
-| `evidence_feedback.json` | Retrieval relevance feedback |
-| `generated_documents.json` | Generated-document registry |
-| `google_workspace_accounts.enc` | Encrypted Google OAuth tokens |
-| `microsoft_accounts.enc` | Encrypted Microsoft 365 OAuth tokens |
 
-`BASE_DIR` itself holds only account-independent state: the shared Hugging Face
-model cache in `hf_models/`, and the `accounts.json`, `users.json`, and
-`sessions.json` registry files.
+`BASE_DIR` itself holds only account-independent files: the shared Hugging Face
+model cache in `hf_models/`, and `.database-binding.json`, which pairs the
+directory with its database.
 
 The ColPali model and processor are shared because they are stateless. The
 vector **index** is not shared: each account gets its own `PersistentClient`, so
@@ -56,8 +54,9 @@ ever omitted.
    and `/api/auth/register` declares `Depends(require_account)`.
 2. `require_account` resolves the bearer token to an `AccountContext` holding the
    user, the account, and its `AccountWorkspace`.
-3. Handlers never touch a module-level path or collection. They read and write
-   through `context.workspace`, which builds every path beneath its own root.
+3. Handlers never touch a module-level path, collection or query. They read and
+   write through `context.workspace`, which builds every path beneath its own
+   root and scopes every database query to its own `account_id`.
 4. Client-supplied ids are constrained to `[A-Za-z0-9._-]` before they reach the
    filesystem, so a document id cannot escape the workspace directory.
 5. `workspace.resolve_page_path()` returns a path only when it resolves inside
@@ -67,16 +66,18 @@ ever omitted.
 
 ## Authentication
 
-- Passwords are PBKDF2-HMAC-SHA256, 240,000 iterations, with a 16-byte per-user
-  salt. Accounts created before this change stored a bare SHA-256 digest; those
-  still authenticate once and are re-hashed transparently on first successful
-  login.
+- Passwords are PBKDF2-HMAC-SHA256, 600,000 iterations (OWASP's current
+  figure), with a 16-byte per-user salt. Any weaker stored hash -- a bare
+  SHA-256 digest from before per-user salting, or PBKDF2 at a lower iteration
+  count from an earlier build -- still authenticates and is re-hashed
+  transparently on the next successful login, without signing other devices out.
 - Sessions are 32-byte random bearer tokens. Only their SHA-256 digest is
   stored, alongside an absolute expiry (12 h) and an idle expiry (4 h).
 - A user id is not a credential. Logging out, changing a password, or being
   deactivated revokes the relevant sessions immediately.
 - Login answers identically for an unknown email and a wrong password, and
-  spends the same time on both.
+  spends the same time on both: an unknown email is checked against one
+  dummy hash built at start-up, so each path costs exactly one key derivation.
 
 ## Endpoints
 
@@ -104,13 +105,15 @@ now require a bearer token and act on the caller's workspace.
 On first start after the upgrade, `migrate_legacy_workspace` moves the shipped
 single-tenant data into one account named **Legacy Workspace**:
 
-- Existing logins in `users.json` are adopted as members of that account; the
-  `Super Admin` becomes its owner, so `admin@buildmarshal.com` / `admin123`
+- Existing logins in the legacy `users.json` are adopted as members of that account; the
+  `Head (Super Admin)` becomes its owner, so `admin@buildmarshal.com` / `admin123`
   keeps working and is upgraded to PBKDF2 on first use.
 - `documents/`, `pages/`, `chroma_db/`, the multi-vector cache, generated
   documents, imports, and the vision cache are moved into the account.
-- Absolute page paths recorded in `metadata.json`, the generated-document
-  registry, and the Chroma index are rewritten to the new location. Embeddings
+- The legacy JSON stores (document metadata, catalogues, the generated-document
+  register, relevance feedback, Google tokens) go into the database.
+- Absolute page paths recorded in the document metadata, the generated-document
+  register, and the Chroma index are rewritten to the new location. Embeddings
   are preserved during the rewrite.
 - `BASE_DIR/.account_migration_complete` marks it done, so it never runs twice.
 
@@ -120,6 +123,7 @@ single-tenant data into one account named **Legacy Workspace**:
 | --- | --- | --- |
 | `BUILDMARSHAL_ALLOWED_ORIGINS` | `http://localhost:5500,http://127.0.0.1:5500,http://localhost:3000,http://127.0.0.1:3000` | Browser origins allowed to call the API |
 | `BUILDMARSHAL_MAX_UPLOAD_BYTES` | `52428800` (50 MB) | Server-side upload ceiling |
+| `BUILDMARSHAL_DATABASE_URL` | — (required) | The PostgreSQL database holding every record; see [DATABASE.md](DATABASE.md) |
 | `GOOGLE_TOKEN_ENCRYPTION_KEY` | — | Fernet key protecting OAuth tokens at rest, server-wide |
 
 ## Frontend

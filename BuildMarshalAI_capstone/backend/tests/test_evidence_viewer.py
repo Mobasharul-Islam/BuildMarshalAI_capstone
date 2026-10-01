@@ -83,7 +83,7 @@ def test_evidence_routes_return_exact_page_and_store_feedback(make_account):
         "score": 0.91,
     })
     assert feedback.status_code == 200
-    assert context.workspace.evidence_file.exists()
+    assert [row["doc_id"] for row in context.workspace.load_evidence()] == ["doc-1"]
     assert client.get("/api/evidence-feedback/stats").json() == {
         "total": 1,
         "relevant": 1,

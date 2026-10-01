@@ -188,8 +188,8 @@ def test_linked_accounts_are_stored_per_buildmarshal_account(make_account):
     first = make_account("first@example.com").workspace
     second = make_account("second@example.com", name="Second").workspace
 
-    store_one = EncryptedAccountStore(first.root / "microsoft_accounts.enc", key)
-    store_two = EncryptedAccountStore(second.root / "microsoft_accounts.enc", key)
+    store_one = EncryptedAccountStore(first.token_store("microsoft"), key)
+    store_two = EncryptedAccountStore(second.token_store("microsoft"), key)
 
     account_id = account_identifier("person@contoso.com")
     store_one.put({
@@ -202,9 +202,9 @@ def test_linked_accounts_are_stored_per_buildmarshal_account(make_account):
     with pytest.raises(KeyError):
         store_two.get(account_id)
 
-    # Tokens are neither returned by list_public nor readable on disk.
+    # Tokens are neither returned by list_public nor readable in the database.
     assert "refresh_token" not in store_one.list_public()[0]
-    assert b"super-secret" not in (first.root / "microsoft_accounts.enc").read_bytes()
+    assert b"super-secret" not in first.token_store("microsoft").read()
 
 
 def test_external_file_names_are_made_safe():

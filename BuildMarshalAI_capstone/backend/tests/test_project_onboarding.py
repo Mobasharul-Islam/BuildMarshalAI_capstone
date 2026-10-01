@@ -79,6 +79,7 @@ def _make_project(data):
         "state": data.get("state", "").strip(),
         "postal_code": data.get("postal_code", "").strip(),
         "country": data.get("country", "").strip(),
+        "currency": str(data.get("currency") or "USD").strip().upper(),
         "archived": False,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -506,7 +507,7 @@ def test_a_role_matches_the_builtins_so_super_admin_is_never_recreated():
     assert match_existing("role_type", {"name": "super admin"}, projects={}, roles=[]) is None
     from backend.permissions import BUILTIN_ROLES
     assert match_existing("role_type", {"name": "super admin"}, projects={},
-                          roles=list(BUILTIN_ROLES))["label"] == "Super Admin"
+                          roles=list(BUILTIN_ROLES))["label"] == "Head (Super Admin)"
 
 
 def test_a_project_code_is_asked_for_rather_than_invented():
@@ -689,7 +690,7 @@ def test_roles_are_skipped_when_the_caller_is_not_a_super_admin(admin):
     add_item(draft, "role_type", {"fields": {"name": "Site Lead"}})
     result = commit(draft, admin, allow_roles=False)
     assert admin.workspace.load_roles() == []
-    assert result["skipped"][0]["reason"] == "only a Super Admin can create roles"
+    assert result["skipped"][0]["reason"] == "only a Head (Super Admin) can create roles"
 
 
 def test_an_item_the_plan_blocked_is_not_created(admin):
@@ -736,7 +737,7 @@ def build_app(context, registry, model=None, documents=None):
     async def require_account():
         return context
 
-    def ingest_document(file_path, doc_id, workspace, display_name=None):
+    def ingest_document(file_path, doc_id, workspace, display_name=None, origin=None):
         """Stands in for the ColPali pipeline: records pages, no embeddings."""
         pages = documents.get(display_name or file_path.name, [
             {"page_num": 1, "text_content": file_path.read_text(encoding="utf-8", errors="replace")},
@@ -796,6 +797,10 @@ def test_the_whole_flow_from_upload_to_onboard(onboarding, registry, admin):
     assert committed["counts"]["project"] == 1 and committed["counts"]["task"] == 3
     assert len(admin.workspace.load_projects()) == 1
     assert committed["draft"]["status"] == "committed"
+    # The document it was onboarded from is now one of the project's documents.
+    (project_id,) = admin.workspace.load_projects()
+    source = admin.workspace.load_metadata()["documents"][uploaded.json()["doc_id"]]
+    assert source["project_ids"] == [project_id] and committed["documents_linked"] == 1
 
     # A committed draft cannot be replayed into a second set of records.
     again = client.post(f"/api/onboarding/drafts/{draft['id']}/commit", json={"confirm": True})
@@ -1262,3 +1267,48 @@ def test_a_failure_part_way_through_leaves_nothing_behind(admin, monkeypatch):
     assert [user["email"] for user in admin._registry.users_for_account(admin.account_id)] \
         == ["owner@example.com"]
     assert draft["status"] == "draft"
+
+
+def test_onboarded_managers_and_assignees_become_user_references():
+    """Names the documents gave are matched to users; anyone given a task joins its project."""
+    from types import SimpleNamespace
+
+    from backend.project_onboarding import _bind_people
+
+    users = [{"id": "u-sam", "name": "Sam Field", "email": "sam@example.com"},
+             {"id": "u-jo1", "name": "Jo Twin", "email": "jo1@example.com"},
+             {"id": "u-jo2", "name": "Jo Twin", "email": "jo2@example.com"}]
+    work = SimpleNamespace(
+        projects={"p1": {"id": "p1", "name": "Tower", "manager": "sam field", "members": []},
+                  "p2": {"id": "p2", "name": "Annex", "manager": "Nobody Known", "members": []},
+                  "old": {"id": "old", "name": "Old", "manager": "Sam Field"}},
+        tasks={"p1": [{"id": "t1", "name": "Pour", "assignee": "Sam Field"},
+                      {"id": "t2", "name": "Tie", "assignee": "Jo Twin"}]},
+    )
+    real_id = {"dp1": "p1", "dp2": "p2", "dt1": "t1", "dt2": "t2"}
+    notes = _bind_people(work, real_id, {}, ["dp1", "dp2", "dt1", "dt2"], users)
+
+    assert work.projects["p1"]["manager_id"] == "u-sam"
+    assert work.projects["p2"]["manager"] == "" and "manager_id" not in work.projects["p2"]
+    assert "manager_id" not in work.projects["old"]             # not created by this commit
+    t1, t2 = work.tasks["p1"]
+    assert t1["assignee_id"] == "u-sam"
+    assert t2["assignee"] == "" and "assignee_id" not in t2     # an ambiguous name names nobody
+    # The manager is already on the project, so no membership is added for Sam.
+    assert work.projects["p1"]["members"] == []
+    assert any("Nobody Known" in note for note in notes) and any("Jo Twin" in note for note in notes)
+
+
+def test_a_drafted_task_outside_its_drafted_projects_dates_is_an_issue():
+    """The review shows it before commit; the commit would refuse it anyway."""
+    draft = new_draft()
+    project = add_item(draft, "project", {"fields": {"name": "Tower", "project_code": "TWR",
+                                                      "start_date": "2027-03-01", "end_date": "2027-06-30"}})
+    inside = add_item(draft, "task", {"fields": {"name": "Pour", "start_time": "2027-04-01T08:00",
+                                                 "end_time": "2027-04-02T08:00"}, "parent_ref": project["id"]})
+    outside = add_item(draft, "task", {"fields": {"name": "Snag", "start_time": "2027-07-01T08:00"},
+                                       "parent_ref": project["id"]})
+    assert item_status(draft, inside)["complete"] is True
+    status = item_status(draft, outside)
+    assert status["complete"] is False and "after Tower ends on 2027-06-30" in status["issues"][0]
+

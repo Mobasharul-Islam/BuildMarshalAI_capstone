@@ -47,8 +47,9 @@ https://build-marshal-ai-capstone.vercel.app/
 - 🗣️ **Create a project or a user from chat** — “create a project called Riverside Tower with code RVT-2027” opens the ordinary New Project dialog with those fields already filled; anything still required is ringed and focused. “add Dana Whitfield as a Site Supervisor” does the same for a person, with a temporary password generated. The mandatory fields come from the application's own schema, a role or type that does not exist is asked about rather than guessed, and the record is created by the ordinary API route with its ordinary permission check (see [docs/CHAT_ENTITY_CREATION.md](docs/CHAT_ENTITY_CREATION.md))
 - 🔗 **Google + Microsoft** — Link Google Workspace and Microsoft 365 accounts side by side: Drive/OneDrive import, Gmail/Outlook read & send, Google/Outlook Calendar (see [docs/MICROSOFT_365_INTEGRATION.md](docs/MICROSOFT_365_INTEGRATION.md))
 - 🏢 **Company Settings** — Company profile plus the task-type and project-type catalogs; everyone can read them, only administrators can change them, enforced on the server (see [docs/COMPANY_SETTINGS.md](docs/COMPANY_SETTINGS.md))
-- 🛡️ **User Roles & Permissions** — Super Admin defines roles from 24 granular permissions (per task field, per cost type); every role is created per account, nothing is hardcoded, and each permission is enforced on the API as well as the UI (see [docs/ROLES_AND_COSTS.md](docs/ROLES_AND_COSTS.md))
+- 🛡️ **User Roles & Permissions** — Head (Super Admin) defines roles from 24 granular permissions (per task field, per cost type); every role is created per account, nothing is hardcoded, and each permission is enforced on the API as well as the UI (see [docs/ROLES_AND_COSTS.md](docs/ROLES_AND_COSTS.md))
 - 🔐 **Accounts & Isolation** — Sign-in required; every account has its own files, vector index, projects, settings, conversations, and Google integrations, with no cross-account access (see [docs/ACCOUNTS_AND_ISOLATION.md](docs/ACCOUNTS_AND_ISOLATION.md))
+- 🗄️ **PostgreSQL storage** — Every record lives in PostgreSQL: typed, indexed columns per entity, account deletion that cascades, database-enforced unique emails, and transactions around multi-record changes such as an onboarding commit. Files (uploads, page images, generated PDFs) stay on disk; a JSON-era installation is imported on first start (see [docs/DATABASE.md](docs/DATABASE.md))
 - 🌙 **Premium Dark UI** — Glassmorphism design with smooth animations
 - 📱 **Responsive** — Works on desktop, tablet, and mobile
 - 🆓 **Free GPU** — Runs on Kaggle's free GPU tier
@@ -183,6 +184,7 @@ See [`docs/DOCUMENT_GENERATION_PIPELINE.md`](docs/DOCUMENT_GENERATION_PIPELINE.m
 |-----------|-----------|
 | Frontend | HTML5, CSS3, Vanilla JavaScript |
 | Backend | Python, FastAPI, Uvicorn |
+| Database | PostgreSQL (psycopg 3) — every record; see [docs/DATABASE.md](docs/DATABASE.md) |
 | Document Retrieval | ColPali v1.2 via Byaldi |
 | AI Generation | Google Gemini (2.5 Flash / Pro) |
 | Tunnel | ngrok (pyngrok) |

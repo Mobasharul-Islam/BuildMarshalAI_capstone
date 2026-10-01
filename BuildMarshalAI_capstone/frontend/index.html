@@ -3,6 +3,25 @@
 
 <head>
   <meta charset="UTF-8">
+  <script>
+    // Someone arriving with no session sees the homepage, not a bare sign-in box.
+    // It runs before anything else in the page so nothing flashes first.
+    //
+    // ?signin and ?signup ask for the sign-in screen itself -- that is where the
+    // homepage's buttons point -- and a stored session goes straight on to the
+    // app, which checks it with the backend exactly as it always has.
+    (function () {
+      try {
+        var params = new URLSearchParams(window.location.search);
+        if (params.has('signin') || params.has('signup')) return;
+        var stored = JSON.parse(window.localStorage.getItem('bmarshal_session') || 'null');
+        if (stored && stored.token) return;
+        window.location.replace('home.html');
+      } catch (e) {
+        // Storage refused (a locked-down browser): the sign-in screen still works.
+      }
+    })();
+  </script>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <meta name="description"
     content="BuildMarshal — AI-powered construction project management platform with document intelligence.">
@@ -17,7 +36,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
     rel="stylesheet">
   <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Outlined" rel="stylesheet">
-  <link rel="stylesheet" href="styles.css?v=20260919-stats">
+  <link rel="stylesheet" href="styles.css?v=20260930-calendar-intent">
 </head>
 
 <body>
@@ -274,7 +293,7 @@
 
       <div class="chat-panel-input">
         <div class="chat-input-row">
-          <button class="btn-icon-only" id="btnChatAttach" aria-label="Attach file" title="Upload document/audio/image">
+          <button class="btn-icon-only" data-requires="document.upload" id="btnChatAttach" aria-label="Attach file" title="Upload document/audio/image">
             <span class="material-icons-outlined">attach_file</span>
           </button>
           <input type="file" id="chatFileInput" multiple accept="*/*" style="display:none">
@@ -310,9 +329,8 @@
             <div class="form-hint">Use the local URL printed by the CLIProxyAPI notebook, or its ngrok URL when enabled.</div>
           </div>
           <div class="form-group">
-            <label class="form-label" for="voiceApiUrlInput">Voice Service URL (Ngrok)</label>
-            <input type="url" class="form-input" id="voiceApiUrlInput" placeholder="https://xxxx-voice.ngrok-free.app" />
-            <div class="form-hint">Paste the URL printed by the separate Whisper notebook.</div>
+            <span class="form-label">Voice input</span>
+            <div class="form-hint" id="voiceServiceStatus" role="status">Checking the local voice service…</div>
           </div>
           <div class="form-group">
             <label class="form-label" for="modelSelect">Gemini Model</label>
@@ -424,7 +442,7 @@
     </aside>
 
     <!-- Toast Notifications -->
-    <div class="toast-container" id="toastContainer"></div>
+    <div class="toast-container" id="toastContainer" role="status" aria-live="polite"></div>
   </div>
 
   <!-- ═══ AUTHENTICATION GATE ═══ -->
@@ -516,7 +534,7 @@
   <script src="https://accounts.google.com/gsi/client" async defer></script>
   <script src="local-config.js?v=20260920-ports"></script>
   <script src="config.js?v=20260920-ports"></script>
-  <script src="app.js?v=20260920-chat-collection"></script>
+  <script src="app.js?v=20260930-calendar-intent"></script>
 </body>
 
 </html>

@@ -11,6 +11,8 @@ transformers==4.57.6
 
 # Backend and persistence
 chromadb==1.5.9
+psycopg[binary]==3.3.6
+psycopg-pool==3.3.3
 fastapi==0.115.6
 nest-asyncio==1.6.0
 python-multipart==0.0.20
@@ -31,7 +33,11 @@ pillow==11.1.0
 pymupdf==1.28.2
 pypdf==5.7.0
 python-docx==1.1.2
-reportlab==4.4.3
+reportlab==5.0.1
+uharfbuzz==0.56.2
+
+# Voice transcription (scripts/run_voice_service.py; also needs ffmpeg on PATH)
+openai-whisper==20250625
 
 # Notebook, HTTP clients, tests, and utilities
 httpx==0.28.1

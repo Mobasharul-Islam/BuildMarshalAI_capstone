@@ -5,13 +5,13 @@ integration modules so the routes resolve the caller's workspace through
 ``require_account``; every record therefore belongs to one account and one
 project inside it.
 
-Storage follows the existing shape:
+Storage follows the existing shape (PostgreSQL tables, through the workspace):
 
 * ``members``, ``baseline_cost`` and ``additional_costs`` are attributes of the
-  project record in ``projects.json``.
-* Task costs are a field on the task in ``tasks.json``.
-* Procurement items get their own ``procurement.json``, keyed by project id,
-  exactly like tasks.
+  project record (the ``projects`` table).
+* Task costs are a field on the task (the ``tasks`` table).
+* Procurement items are their own records, keyed by project id exactly like
+  tasks (the ``procurement_items`` table).
 """
 
 from __future__ import annotations
@@ -21,6 +21,11 @@ from datetime import date, datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
 from fastapi import Depends, HTTPException, Request
+
+try:  # the notebook puts this directory on sys.path
+    from project_people import active, assignee_of, member_id, project_people
+except ModuleNotFoundError:  # imported as backend.project_management
+    from backend.project_people import active, assignee_of, member_id, project_people
 
 
 PROCUREMENT_STATUSES = ("Requested", "Quoted", "Ordered", "Delivered", "Cancelled")
@@ -263,36 +268,22 @@ def register_project_management_routes(namespace: Mapping[str, Any]) -> dict[str
     # ── People ────────────────────────────────────────────────────────────
 
     def member_rows(context: Any, project: Mapping[str, Any]) -> list[dict[str, Any]]:
-        """Resolve stored member ids against the account's own users."""
-        people = {u["id"]: u for u in registry.users_for_account(context.account_id)}
-        rows = []
-        for entry in project.get("members", []) or []:
-            user = people.get(entry.get("user_id") if isinstance(entry, dict) else entry)
-            if not user:
-                continue  # a removed account member drops out of the project
-            rows.append({
-                "user_id": user["id"],
-                "name": user.get("name", ""),
-                "email": user.get("email", ""),
-                "role": user.get("role", ""),
-                "department": user.get("department", ""),
-                "designation": user.get("designation", ""),
-                "status": user.get("status", "Active"),
-                "project_role": (entry.get("project_role", "") if isinstance(entry, dict) else ""),
-                "added_at": (entry.get("added_at") if isinstance(entry, dict) else None),
-            })
-        return rows
+        """Everyone on the project: its manager, its members, and its assignees."""
+        return project_people(project, project_tasks(context.workspace, project["id"]),
+                              registry.users_for_account(context.account_id))
 
     @app.get("/api/projects/{project_id}/members")
     async def list_members(project_id: str, context=Depends(require_account)) -> dict[str, Any]:
         project = project_or_404(context.workspace, project_id)
         members = member_rows(context, project)
-        assigned = {row["user_id"] for row in members}
+        # The picker offers the active users who are not on the project in any
+        # way yet; the manager and the assignees are already there.
+        on_project = {row["user_id"] for row in members}
         available = [
             {"user_id": u["id"], "name": u.get("name", ""), "email": u.get("email", ""),
              "role": u.get("role", ""), "department": u.get("department", "")}
             for u in registry.users_for_account(context.account_id)
-            if u["id"] not in assigned and str(u.get("status", "Active")).lower() == "active"
+            if u["id"] not in on_project and active(u)
         ]
         return {"members": members, "available": available, "total": len(members)}
 
@@ -313,8 +304,12 @@ def register_project_management_routes(namespace: Mapping[str, Any]) -> dict[str
         if unknown:
             raise HTTPException(404, detail="One or more of those people are not in this account")
 
+        inactive = [uid for uid in raw if not active(account_users[uid])]
+        if inactive:
+            raise HTTPException(422, detail="Only active users can be added to a project")
+
         members = list(project.get("members", []) or [])
-        existing = {entry.get("user_id") if isinstance(entry, dict) else entry for entry in members}
+        existing = {member_id(entry) for entry in members}
         added = 0
         for user_id in raw:
             if user_id in existing:
@@ -335,12 +330,23 @@ def register_project_management_routes(namespace: Mapping[str, Any]) -> dict[str
         context.require("project.people.manage", "removing people from a project")
         project = project_or_404(context.workspace, project_id)
         members = list(project.get("members", []) or [])
-        remaining = [
-            entry for entry in members
-            if (entry.get("user_id") if isinstance(entry, dict) else entry) != user_id
-        ]
+        remaining = [entry for entry in members if member_id(entry) != user_id]
         if len(remaining) == len(members):
-            raise HTTPException(404, detail="That person is not on this project")
+            if user_id == project.get("manager_id"):
+                raise HTTPException(409, detail=(
+                    "This is the project manager. Choose a different manager "
+                    "by editing the project instead"))
+            raise HTTPException(404, detail="That person is not a member of this project")
+        # Someone with work on the project is on it whatever the member list
+        # says, so taking them off would leave tasks with a stranger.
+        users = registry.users_for_account(context.account_id)
+        theirs = [task for task in project_tasks(context.workspace, project_id)
+                  if not task.get("archived")
+                  and (assignee_of(task, users) or {}).get("id") == user_id]
+        if theirs:
+            raise HTTPException(409, detail=(
+                f"They are assigned {len(theirs)} open task{'' if len(theirs) == 1 else 's'} "
+                "on this project. Reassign them first"))
         project = {**project, "members": remaining}
         save_project(context.workspace, project)
         return {"removed": True, "members": member_rows(context, project)}
@@ -455,6 +461,7 @@ def register_project_management_routes(namespace: Mapping[str, Any]) -> dict[str
     @app.post("/api/projects/{project_id}/procurement")
     async def create_procurement(project_id: str, request: Request,
                                  context=Depends(require_account)) -> dict[str, Any]:
+        context.require("procurement.manage", "changing procurement")
         project_or_404(context.workspace, project_id)
         data = await request.json()
         if not _text(data.get("name")):
@@ -468,6 +475,7 @@ def register_project_management_routes(namespace: Mapping[str, Any]) -> dict[str
     @app.put("/api/projects/{project_id}/procurement/{item_id}")
     async def update_procurement(project_id: str, item_id: str, request: Request,
                                  context=Depends(require_account)) -> dict[str, Any]:
+        context.require("procurement.manage", "changing procurement")
         project_or_404(context.workspace, project_id)
         store = context.workspace.load_procurement()
         items = store.get(project_id, [])
@@ -485,6 +493,7 @@ def register_project_management_routes(namespace: Mapping[str, Any]) -> dict[str
     @app.delete("/api/projects/{project_id}/procurement/{item_id}")
     async def delete_procurement(project_id: str, item_id: str,
                                  context=Depends(require_account)) -> dict[str, Any]:
+        context.require("procurement.manage", "changing procurement")
         project_or_404(context.workspace, project_id)
         store = context.workspace.load_procurement()
         items = store.get(project_id, [])

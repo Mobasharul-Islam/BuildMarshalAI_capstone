@@ -69,6 +69,10 @@ GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
 # A Teams join URL. Work and school accounts get teams.microsoft.com links;
 # personal Microsoft accounts get teams.live.com ones, which is why matching
 # only the first host missed them.
+#: The characters a OneDrive item id is made of ("ABC123!105"). An id becomes
+#: part of a Graph path, so anything else -- a slash, a query -- is refused.
+ONEDRIVE_ID = re.compile(r"[A-Za-z0-9!._-]{1,200}")
+
 TEAMS_JOIN_URL = re.compile(
     r"https://teams\.(?:microsoft|live)\.com/[^\s\"'<>\\]+",
     re.IGNORECASE,
@@ -354,9 +358,7 @@ def register_microsoft_workspace_routes(namespace: Mapping[str, Any]) -> Any:
         with _stores_lock:
             store = _stores.get(workspace.account_id)
             if store is None:
-                store = EncryptedAccountStore(
-                    Path(workspace.root) / "microsoft_accounts.enc", encryption_key
-                )
+                store = EncryptedAccountStore(workspace.token_store("microsoft"), encryption_key)
                 _stores[workspace.account_id] = store
             return store
 
@@ -608,8 +610,16 @@ def register_microsoft_workspace_routes(namespace: Mapping[str, Any]) -> Any:
     @app.get("/api/microsoft/drive/files")
     async def microsoft_drive_files(
         account_id: str, q: str = "", page_size: int = 50, page_token: str | None = None,
-        context=Depends(require_account),
+        folder_id: str = "", context=Depends(require_account),
     ) -> dict[str, Any]:
+        """One folder's contents, folders first -- or a search across OneDrive.
+
+        The folder id becomes part of a Graph path, so it is held to the
+        characters OneDrive item ids are made of.
+        """
+        folder = str(folder_id or "").strip()
+        if folder and not ONEDRIVE_ID.fullmatch(folder):
+            raise HTTPException(422, "Invalid folder id")
         workspace = context.workspace
         size = min(max(page_size, 1), 100)
         if page_token:
@@ -626,7 +636,8 @@ def register_microsoft_workspace_routes(namespace: Mapping[str, Any]) -> Any:
         else:
             result = graph(
                 workspace, account_id, "GET",
-                "/me/drive/root/children?" + graph_query({
+                (f"/me/drive/items/{folder}/children?" if folder else "/me/drive/root/children?")
+                + graph_query({
                     "$top": size, "$orderby": "lastModifiedDateTime desc",
                     "$select": "id,name,size,file,folder,lastModifiedDateTime,webUrl",
                 }),
@@ -644,12 +655,16 @@ def register_microsoft_workspace_routes(namespace: Mapping[str, Any]) -> Any:
             }
             for item in (result.get("value") or [])
         ]
-        return {"files": files, "next_page_token": result.get("@odata.nextLink")}
+        # Folders first, as Drive does; Graph cannot sort that way itself.
+        files.sort(key=lambda row: not row["is_folder"])
+        return {"files": files, "next_page_token": result.get("@odata.nextLink"),
+                "folder_id": None if q.strip() else (folder or "root")}
 
     @app.post("/api/microsoft/drive/import")
     async def microsoft_drive_import(
         body: ImportRequest, context=Depends(require_account)
     ) -> dict[str, Any]:
+        context.require("document.upload", "adding documents")
         workspace = context.workspace
         imported, errors = [], []
         for item_id in body.item_ids:
@@ -717,6 +732,7 @@ def register_microsoft_workspace_routes(namespace: Mapping[str, Any]) -> Any:
     async def microsoft_mail_import(
         body: ImportRequest, context=Depends(require_account)
     ) -> dict[str, Any]:
+        context.require("document.upload", "adding documents")
         workspace = context.workspace
         imported, errors = [], []
         import_dir = Path(workspace.imports_dir)
@@ -958,6 +974,23 @@ def register_microsoft_workspace_routes(namespace: Mapping[str, Any]) -> Any:
         updated = graph(context.workspace, body.account_id, "PATCH",
                         f"/me/events/{event_id}", json=patch)
         return {"updated": True, "event": shape_event(updated)}
+
+    @app.delete("/api/microsoft/calendar/events/{event_id}")
+    async def microsoft_calendar_delete(
+        event_id: str, account_id: str, confirm: bool = False,
+        context=Depends(require_account),
+    ) -> dict[str, Any]:
+        """Cancel an event in the user's real Outlook calendar.
+
+        The Google route's twin: nothing happens without ``confirm=true``, and
+        the first call names the event. Graph tells attendees it was cancelled.
+        """
+        item = graph(context.workspace, account_id, "GET", f"/me/events/{event_id}")
+        summary = shape_event(item)
+        if not confirm:
+            return {"confirmation_required": True, "action": "delete_calendar_event", "event": summary}
+        graph(context.workspace, account_id, "DELETE", f"/me/events/{event_id}")
+        return {"deleted": True, "event": summary}
 
     @app.post("/api/microsoft/assistant/interpret")
     async def microsoft_assistant_interpret(

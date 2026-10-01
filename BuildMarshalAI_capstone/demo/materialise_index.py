@@ -29,6 +29,9 @@ import fitz  # PyMuPDF
 import numpy as np
 from PIL import Image
 
+from demo_db import demo_database
+from accounts import AccountWorkspace
+
 HERE = Path(__file__).resolve().parent
 RUNTIME = HERE / ".demo-runtime"
 PACK = HERE / "project-pack"
@@ -87,10 +90,10 @@ def main() -> None:
     account_id = json.loads(marker.read_text())["account_id"]
     root = RUNTIME / "accounts" / account_id
     if not root.exists():
-        candidates = [p for p in RUNTIME.rglob("metadata.json")]
-        if not candidates:
-            sys.exit(f"No workspace found under {RUNTIME}")
-        root = candidates[0].parent
+        sys.exit(f"No workspace found for account {account_id} under {RUNTIME}")
+    # The document records are in the demo database; the files are under root.
+    database = demo_database()
+    workspace = AccountWorkspace(root, account_id, lambda _dir: (None, None), database)
 
     docs = root / "documents"
     pages = root / "pages"
@@ -99,7 +102,7 @@ def main() -> None:
     for directory in (docs, pages, vectors, tiles):
         directory.mkdir(parents=True, exist_ok=True)
 
-    meta = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+    meta = workspace.load_metadata()
     documents = meta.get("documents", {})
     written = {"pages": 0, "vectors": 0, "tiles": 0, "bytes": 0}
 
@@ -170,13 +173,14 @@ def main() -> None:
             "pages": pages_of, "page_count": len(pages_of),
             "digest": documents[original]["digest"]}
 
-    (root / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    workspace.save_metadata(meta)
+    database.close()
 
     total = sum(f.stat().st_size for f in root.rglob("*") if f.is_file())
     print(f"  {written['pages']:>3} page images")
     print(f"  {written['vectors']:>3} multi-vector caches")
     print(f"  {written['tiles']:>3} vision tiles")
-    print(f"   14 orphaned caches + 14 orphaned tiles (a document that was deleted)")
+    print("   14 orphaned caches + 14 orphaned tiles (a document that was deleted)")
     print(f"\n  workspace now {total / 1024 / 1024:.1f} MB on disk")
 
 

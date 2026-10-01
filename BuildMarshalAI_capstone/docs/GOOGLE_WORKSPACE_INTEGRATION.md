@@ -57,13 +57,15 @@ Keep this key stable. Changing it makes previously stored Google refresh tokens 
 
 ## 3. Keep Google accounts across Kaggle restarts
 
-Set the main Kaggle notebook's **Persistence** setting to **Files only** (or **Variables and Files**). The backend saves encrypted account credentials to:
-
-```text
-/kaggle/working/buildmarshal/google_workspace_accounts.enc
-```
-
-The exact base directory follows the notebook's existing `BASE_DIR`. The file is ciphertext; access and refresh tokens are never returned to the frontend.
+Linked accounts' credentials are stored encrypted in the PostgreSQL database
+(`oauth_token_stores`, one Fernet-encrypted blob per BuildMarshal account and
+provider), so they survive a Kaggle restart as long as the notebook points at the
+same database: set the Kaggle secret `BUILDMARSHAL_DATABASE_URL` to a reachable
+PostgreSQL server (see [DATABASE.md](DATABASE.md)). The database holds only
+ciphertext; the key is `GOOGLE_TOKEN_ENCRYPTION_KEY`, and access and refresh
+tokens are never returned to the frontend. Uploaded files and page images still
+live under `BASE_DIR`, so keep **Persistence** on **Files only** (or **Variables
+and Files**) as well.
 
 Each Drive/Gmail import request accepts at most 25 selected items. Very large PDFs still consume one ColPali embedding pass per page and are limited by the Kaggle session's disk, memory, runtime, and Google API quotas. Start with one or two modest documents when validating a new deployment.
 

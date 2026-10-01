@@ -26,6 +26,7 @@ than to an error.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from datetime import date
@@ -136,6 +137,26 @@ NOT_CREATION = re.compile(
     r"invite|to-?do\s*list|chart|statistic)s?\b", re.I)
 
 
+#: A question or a request for information: "what", "how many", "give me a
+#: status overview", "show me", "list". Such a sentence reads data; it does
+#: not create any, whatever words it happens to contain ("...blocked and open").
+QUESTION = re.compile(
+    r"^\s*(?:what|what's|which|who|whom|whose|when|where|why|how|is|are|was|were|does|do|did|"
+    r"has|have|will|should|could\s+you\s+(?:tell|show|give|list|explain)|"
+    r"can\s+you\s+(?:tell|show|give|list|explain)|give\s+me|show|list|tell|summari[sz]e|"
+    r"compare|explain|describe|find|check|calculate|report)\b", re.I)
+
+#: An outright request to create, which counts even inside a question.
+ASKS_TO_CREATE = re.compile(
+    r"\b(?:please|can\s+you|could\s+you|would\s+you|i\s+want\s+to|i'?d\s+like\s+to|"
+    r"i\s+need\s+to|let'?s|help\s+me)\s+(?:creat\w+|add|make|set\s*up|register|open|start)\b", re.I)
+
+#: The kind must follow the verb closely -- "create a task cost", "add a new
+#: user called ..." -- not turn up clauses later ("... and open, and what is
+#: the total cost split between ... task costs?").
+NEAR = 40
+
+
 def detect_kind(text: str) -> str:
     """Which record, if any, this sentence asks to create.
 
@@ -145,14 +166,20 @@ def detect_kind(text: str) -> str:
     message = str(text or "")
     if not message.strip() or NOT_CREATION.search(message):
         return ""
-    verb = CREATE_VERB.search(message)
+    asked = ASKS_TO_CREATE.search(message)
+    if not asked and (QUESTION.search(message) or message.rstrip().endswith("?")):
+        return ""
+    verb = CREATE_VERB.search(message, asked.start() if asked else 0)
     if not verb:
         return ""
 
     after = verb.end()
     for kind, pattern in KIND_PATTERNS:
         for found in pattern.finditer(message, after):
-            if not LOCATIVE.search(message[after:found.start()]):
+            gap = message[after:found.start()]
+            if found.start() - after > NEAR or re.search(r"[,;?.!]", gap):
+                continue
+            if not LOCATIVE.search(gap):
                 return kind
     return ""
 
@@ -692,14 +719,33 @@ def register_chat_entity_routes(namespace: Mapping[str, Any]) -> dict[str, Any]:
         return found
 
     async def ask_model(prompt: str) -> str:
+        """One model call, in the notebook's own calling convention.
+
+        ``vl_generate`` takes a chat ``messages`` list and ``max_new_tokens``,
+        and it blocks, so it runs off the event loop -- the same way onboarding
+        and statistics call it. Calling it as ``generate(prompt,
+        max_tokens=...)`` raised a TypeError that the except below swallowed,
+        so every sentence silently fell back to the plain reader.
+        """
         if not callable(generate):
             return ""
+        messages = [
+            {"role": "system", "content": (
+                "You read one sentence from a construction project manager and "
+                "return strict JSON. You never invent a value the sentence did not "
+                "give; leaving a field out is always better than guessing it.")},
+            {"role": "user", "content": [{"type": "text", "text": prompt}]},
+        ]
         try:
-            reply = generate(prompt, max_tokens=MAX_INTERPRET_TOKENS)
+            loop = asyncio.get_running_loop()
+            reply = await loop.run_in_executor(
+                None, lambda: generate(messages, max_new_tokens=MAX_INTERPRET_TOKENS))
             if hasattr(reply, "__await__"):
                 reply = await reply
             return str(reply or "")
         except Exception:  # pragma: no cover - model transport
+            # A model that is down or refuses must not break creation: the plain
+            # reader still runs and the form collects whatever is left.
             return ""
 
     @app.post("/api/assistant/entities/interpret")

@@ -135,7 +135,7 @@ for i in range(torch.cuda.device_count()):
 # CELL 3
 # ======================================================================
 
-import os, re, json, uuid, time, shutil, base64, asyncio, logging, sys
+import os, re, json, uuid, time, shutil, base64, asyncio, logging, sys, tempfile
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from io import BytesIO
@@ -165,11 +165,12 @@ from pyngrok import ngrok
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("BuildMarshalAI")
 
-# BASE_DIR holds only account-independent state: the shared model cache and the
-# accounts/, accounts.json, users.json, and sessions.json registry files.  Every
-# document, page image, vector index, and JSON store belongs to exactly one
-# account and lives under BASE_DIR/accounts/<account_id>/, reached through the
-# AccountWorkspace resolved from the caller's bearer token.
+# Records -- accounts, users, sessions, and every account's projects, tasks,
+# documents and the rest -- live in PostgreSQL (BUILDMARSHAL_DATABASE_URL; see
+# backend/database.py).  BASE_DIR holds files: the shared model cache, and under
+# BASE_DIR/accounts/<account_id>/ each account's uploads, page images, caches,
+# generated PDFs and vector index, reached through the AccountWorkspace resolved
+# from the caller's bearer token.
 BASE_DIR = Path(os.environ.get("BUILDMARSHAL_DATA_DIR", str(RUNTIME_ROOT / "buildmarshal")))
 ACCOUNTS_ROOT = BASE_DIR / "accounts"
 MODEL_ROOT = BASE_DIR / "hf_models"
@@ -404,11 +405,28 @@ _adapter_config_path.write_text(
 MODEL_SNAPSHOT = str(ADAPTER_DIR)
 logger.info(f"ColPali inference files ready: {MODEL_SNAPSHOT}")
 
+def _dtype_kwarg(value):
+    """from_pretrained's argument for the load dtype, in the installed transformers.
+
+    4.56 renamed torch_dtype to dtype and warns on the old name. Older releases --
+    a Kaggle image may carry one -- know only torch_dtype and pass an unknown
+    dtype= through to the model config, loading in float32 and running out of GPU
+    memory. So ask the installed library which one it reads rather than assume.
+    """
+    try:
+        import inspect
+        from transformers import PreTrainedModel
+        if "`torch_dtype` is deprecated" in inspect.getsource(PreTrainedModel.from_pretrained):
+            return {"dtype": value}
+    except Exception:
+        pass
+    return {"torch_dtype": value}
+
 logger.info(f"Loading ColPali v1.2 onto {COLPALI_DEVICE} from local snapshot (fp16)...")
 COLPALI_MODEL = ColPali.from_pretrained(
     MODEL_SNAPSHOT,
     local_files_only=True,
-    torch_dtype=torch.float16,
+    **_dtype_kwarg(torch.float16),
     device_map={"": COLPALI_DEVICE_IDX},
     attn_implementation="sdpa",
     low_cpu_mem_usage=True,
@@ -443,6 +461,11 @@ _COLLECTION_NAME = "document_pages"
 # produces all embeddings externally - ChromaDB never calls this function.
 class _NoOpEF(chromadb.EmbeddingFunction):
     """Stub: ColPali supplies all vectors; ChromaDB never calls this."""
+    # ChromaDB warns that an embedding function without __init__ will be
+    # rejected by a future version; defining one keeps indexing working.
+    def __init__(self):
+        pass
+
     def __call__(self, input):
         raise RuntimeError("_NoOpEF should never be called directly")
 
@@ -504,10 +527,26 @@ def embed_query(query: str) -> Optional[np.ndarray]:
         return None
 
 
-def get_all_pages(workspace, limit: int = 5) -> List[Dict]:
+def scope_documents(workspace, project_id) -> Dict | None:
+    """The documents a search may use: a project's (or several), or None for all.
+
+    ``project_id`` is one id, a list of ids, or None.  A document belongs to
+    every project in its ``project_ids``, so a shared document is found from
+    each of them.
+    """
+    if not project_id:
+        return None
+    from document_links import project_documents
+    wanted = [project_id] if isinstance(project_id, str) else list(project_id)
+    return project_documents(workspace.load_metadata().get("documents", {}), wanted)
+
+
+def get_all_pages(workspace, limit: int = 5, project_id=None) -> List[Dict]:
     """Fallback context for an account whose index is empty or unqueryable."""
     pages = []
-    for doc_id, doc in workspace.load_metadata().get("documents", {}).items():
+    scoped = scope_documents(workspace, project_id)
+    documents = scoped if scoped is not None else workspace.load_metadata().get("documents", {})
+    for doc_id, doc in documents.items():
         for page in doc.get("pages", []):
             pages.append({
                 "doc_name":     doc.get("name", doc_id),
@@ -531,23 +570,28 @@ def retrieve_context(query: str, top_k: int = 5, project_id: str | None = None,
     """
     if workspace is None:
         raise RuntimeError("retrieve_context requires the caller's account workspace")
+    scoped = scope_documents(workspace, project_id)
+    if scoped is not None and not scoped:
+        return []                      # the project has no documents to search
     collection = workspace.collection
     if collection.count() == 0:
         logger.warning("Vector index empty for this account - falling back to all pages")
-        return get_all_pages(workspace, top_k)
+        return get_all_pages(workspace, top_k, project_id)
 
     q_vec = embed_query(query)
     if q_vec is None:
         logger.error("Query embedding failed - falling back to all pages")
-        return get_all_pages(workspace, top_k)
+        return get_all_pages(workspace, top_k, project_id)
 
     kwargs = {
         "query_embeddings": [q_vec.tolist()],
         "n_results": min(top_k, collection.count()),
         "include": ["metadatas", "distances"],
     }
-    if project_id:
-        kwargs["where"] = {"project_id": project_id}
+    if scoped is not None:
+        # Page vectors carry their document id; which projects a document
+        # belongs to lives on the document record, where a link can change.
+        kwargs["where"] = {"doc_id": {"$in": sorted(scoped)}}
     results = collection.query(**kwargs)
 
     pages = []
@@ -582,188 +626,54 @@ print("ColPali ready; per-account ChromaDB vector stores enabled")
 #   for each page:
 #       embed_image(screenshot)  -> float32 numpy vector
 #       workspace.collection.add(id, embedding, metadata, document)
-#   persist the account's metadata.json (for /api/documents and deletion)
+#   save the document record (for /api/documents and deletion)
 # =======================================================================
 
-def process_pdf(file_path: Path, doc_id: str, pages_dir: Path) -> List[Dict]:
-    """Render PDF pages with PyMuPDF (no external Poppler installation)."""
-    import fitz
+# The format half of ingestion -- rendering each format to page images and
+# text, transcribing audio, and the rule for recognising bytes already indexed
+# -- lives in ingestion_formats.py, where it is tested without a GPU.  On Kaggle
+# it is fetched from the same branch as the other modules.
+if IS_KAGGLE:
+    import urllib.request
 
-    logger.info(f"Processing PDF: {file_path.name}")
-    page_infos = []
-    with fitz.open(file_path) as document:
-        scale = 150 / 72
-        matrix = fitz.Matrix(scale, scale)
-        for index, pdf_page in enumerate(document):
-            pixmap = pdf_page.get_pixmap(matrix=matrix, alpha=False)
-            page_img = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
-            page_img.thumbnail((1024, 1024))
-            page_path = pages_dir / f"{doc_id}_page_{index + 1}.png"
-            page_img.save(page_path, "PNG")
-            page_infos.append({
-                "page_num": index + 1,
-                "image_path": str(page_path),
-                "width": page_img.width,
-                "height": page_img.height,
-                "text_content": pdf_page.get_text("text")[:12000],
-            })
-    logger.info(f"PDF: {len(page_infos)} pages extracted")
-    return page_infos
+    _formats_dir = RUNTIME_ROOT / "integration"
+    _formats_dir.mkdir(parents=True, exist_ok=True)
+    for _module in ("ingestion_formats.py", "document_links.py"):
+        urllib.request.urlretrieve(
+            "https://raw.githubusercontent.com/shafitanvir32/BuildMarshalAI_capstone/"
+            f"docgen-pipeline/backend/{_module}",
+            _formats_dir / _module,
+        )
+    sys.path.insert(0, str(_formats_dir))
 
+from ingestion_formats import (
+    AUDIO_EXTENSIONS, UPLOAD_EXTENSIONS, file_digest as _file_digest, find_duplicate, split_pages,
+    transcribe_with_voice_service, voice_service_health,
+    TranscriptionError, VoiceServiceUnavailable,
+    process_pdf, process_excel, process_image, process_docx, process_audio,
+    process_text, process_generic,
+)
+from document_links import (
+    ORIGIN_LABELS, document_listing, link_document, set_document_projects,
+)
 
-def _df_to_image(df, title, out_path):
-    fig, ax = plt.subplots(figsize=(min(20, len(df.columns)*1.5+1),
-                                    min(20, len(df)*0.4+1)))
-    ax.axis('off')
-    data = df.head(50).fillna('').astype(str)
-    tbl  = ax.table(cellText=data.values, colLabels=data.columns,
-                    cellLoc='left', loc='center')
-    tbl.auto_set_font_size(False); tbl.set_fontsize(8); tbl.scale(1, 1.3)
-    for (r, c), cell in tbl.get_celld().items():
-        if r == 0:
-            cell.set_facecolor('#4472C4')
-            cell.set_text_props(color='white', fontweight='bold')
-        else:
-            cell.set_facecolor('#f0f0f0' if r % 2 == 0 else 'white')
-    plt.title(title, fontsize=10, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(str(out_path), dpi=120, bbox_inches='tight', facecolor='white')
-    plt.close(fig)
+# The local Whisper voice service (backend/voice_service.py), which
+# START-BUILDMARSHAL.ps1 starts on this machine.  The chat microphone and
+# uploaded recordings both reach it through this backend, never directly.
+LOCAL_VOICE_URL = "http://127.0.0.1:8903"
+VOICE_SERVICE_URL = os.environ.get("BUILDMARSHAL_VOICE_URL", "").strip() or LOCAL_VOICE_URL
 
 
-def process_excel(file_path: Path, doc_id: str, pages_dir: Path) -> List[Dict]:
-    page_infos = []
-    dfs = ({"Sheet1": pd.read_csv(str(file_path))}
-           if file_path.suffix == '.csv'
-           else pd.read_excel(str(file_path), sheet_name=None))
-    for sheet_name, df in dfs.items():
-        page_path = pages_dir / f"{doc_id}_sheet_{sheet_name}.png"
-        try:
-            _df_to_image(df, f"{file_path.stem} — {sheet_name}", page_path)
-            page_infos.append({
-                "page_num":    len(page_infos) + 1,
-                "image_path":  str(page_path),
-                "sheet_name":  sheet_name,
-                "text_content": df.head(100).to_string(),
-            })
-        except Exception as e:
-            logger.warning(f"Sheet render failed: {e}")
-            page_infos.append({
-                "page_num":    len(page_infos) + 1,
-                "image_path":  None,
-                "sheet_name":  sheet_name,
-                "text_content": df.head(100).to_string(),
-            })
-    return page_infos
+def audio_transcriber():
+    """The transcriber for uploaded recordings: the local voice service."""
+    url = VOICE_SERVICE_URL
+    if not url:
+        return None
+    return lambda path: transcribe_with_voice_service(path, url)
 
 
-def process_image(file_path: Path, doc_id: str, pages_dir: Path) -> List[Dict]:
-    img = Image.open(str(file_path)).convert("RGB")
-    img.thumbnail((1024, 1024))
-    page_path = pages_dir / f"{doc_id}_img.png"
-    img.save(str(page_path), "PNG")
-    return [{
-        "page_num": 1, "image_path": str(page_path),
-        "width": img.width, "height": img.height, "text_content": "",
-    }]
-
-
-def process_docx(file_path: Path, doc_id: str, pages_dir: Path) -> List[Dict]:
-    from docx import Document as DocxDocument
-    doc       = DocxDocument(str(file_path))
-    full_text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-    page_infos = []
-    chunks = [full_text[i:i+2000] for i in range(0, max(len(full_text), 1), 2000)]
-    for idx, chunk in enumerate(chunks):
-        page_path = pages_dir / f"{doc_id}_page_{idx+1}.png"
-        try:
-            fig, ax = plt.subplots(figsize=(10, 14)); ax.axis('off')
-            ax.text(0.05, 0.95, chunk, transform=ax.transAxes, fontsize=9,
-                    verticalalignment='top', fontfamily='monospace', wrap=True)
-            plt.title(f"{file_path.stem} — Page {idx+1}")
-            plt.savefig(str(page_path), dpi=120, bbox_inches='tight', facecolor='white')
-            plt.close(fig)
-            page_infos.append({
-                "page_num":    idx + 1,
-                "image_path":  str(page_path),
-                "text_content": chunk,
-            })
-        except Exception as e:
-            page_infos.append({
-                "page_num":    idx + 1,
-                "image_path":  None,
-                "text_content": chunk,
-            })
-    return page_infos
-def process_audio(file_path: Path, doc_id: str, pages_dir: Path) -> List[Dict]:
-    """
-    Audio files can't be visually embedded; store as a single 'page'.
-    The pages endpoint will serve the raw audio file for playback.
-    """
-    # Copy audio to pages dir for serving
-    page_path = pages_dir / f"{doc_id}_audio{file_path.suffix}"
-    shutil.copy2(str(file_path), str(page_path))
-    
-    return [{
-        "page_num": 1,
-        "image_path": str(page_path),  # repurpose image_path for serving
-        "text_content": f"Audio file: {file_path.name}",
-    }]
-
-
-def process_text(file_path: Path, doc_id: str, pages_dir: Path) -> List[Dict]:
-    """Process plain text files (txt, json, xml, code files etc.)."""
-    text = file_path.read_text(encoding="utf-8", errors="replace")
-    page_infos = []
-    chunks = [text[i:i+3000] for i in range(0, max(len(text), 1), 3000)]
-    
-    for idx, chunk in enumerate(chunks):
-        page_path = pages_dir / f"{doc_id}_page_{idx+1}.png"
-        try:
-            fig, ax = plt.subplots(figsize=(10, 14)); ax.axis('off')
-            ax.text(0.05, 0.95, chunk, transform=ax.transAxes, fontsize=8,
-                    verticalalignment='top', fontfamily='monospace', wrap=True)
-            plt.title(f"{file_path.stem} — Page {idx+1}")
-            plt.savefig(str(page_path), dpi=120, bbox_inches='tight', facecolor='white')
-            plt.close(fig)
-            page_infos.append({
-                "page_num": idx + 1,
-                "image_path": str(page_path),
-                "text_content": chunk,
-            })
-        except Exception:
-            page_infos.append({
-                "page_num": idx + 1,
-                "image_path": None,
-                "text_content": chunk,
-            })
-    return page_infos
-
-
-def process_generic(file_path: Path, doc_id: str, pages_dir: Path) -> List[Dict]:
-    """Fallback — store file metadata only."""
-    page_path = pages_dir / f"{doc_id}_file{file_path.suffix}"
-    shutil.copy2(str(file_path), str(page_path))
-    return [{
-        "page_num": 1,
-        "image_path": str(page_path),
-        "text_content": f"File: {file_path.name} ({file_path.stat().st_size} bytes)",
-    }]
-
-
-def _file_digest(path: Path, chunk: int = 1024 * 1024) -> str:
-    """A content hash of an upload, read in chunks so a large file never lands
-    in memory.  Matches document_storage.digest_of."""
-    import hashlib
-
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        while block := handle.read(chunk):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def ingest_document(file_path: Path, doc_id: str, workspace, display_name: str | None = None) -> Dict:
+def ingest_document(file_path: Path, doc_id: str, workspace, display_name: str | None = None,
+                    project_id: str | None = None, origin: str | None = None) -> Dict:
     """
     Convert document to page screenshots, embed each with ColPali,
     and store the resulting vector + metadata in ChromaDB.
@@ -773,7 +683,16 @@ def ingest_document(file_path: Path, doc_id: str, workspace, display_name: str |
       embedding : ColPali mean-pooled float32 vector (provided as list)
       metadata  : doc_id, doc_name, page_num, image_path, text_content
       document  : text_content (ChromaDB full-text field)
+
+    Every ingestion path comes through here -- upload, project sources,
+    onboarding, Drive/OneDrive/mail imports -- so this is where the same bytes
+    are recognised.  Bytes already indexed anywhere in the account are not
+    indexed again: the redundant stored copy is removed, the existing document is
+    linked to ``project_id`` if it is not already, and it comes back with
+    ``status: "duplicate"`` and its own ``id``, which callers must use.
+    ``origin`` records where the file came in (see document_links.ORIGIN_LABELS).
     """
+    file_path = Path(file_path)
     ext  = file_path.suffix.lower()
     # The file on disk is named after its id, so the caller supplies the name
     # the user actually uploaded.  It reaches the document list, the citations
@@ -783,21 +702,33 @@ def ingest_document(file_path: Path, doc_id: str, workspace, display_name: str |
     collection = workspace.collection
     meta = workspace.load_metadata()
 
-    if ext == '.pdf':
-        pages = process_pdf(file_path, doc_id, pages_dir)
-    elif ext in ('.xlsx', '.xls', '.csv'):
-        pages = process_excel(file_path, doc_id, pages_dir)
-    elif ext in ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff'):
-        pages = process_image(file_path, doc_id, pages_dir)
-    elif ext in ('.doc', '.docx'):
-        pages = process_docx(file_path, doc_id, pages_dir)
-    elif ext in ('.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac', '.wma', '.opus'):
-        pages = process_audio(file_path, doc_id, pages_dir)
-    elif ext in ('.txt', '.csv', '.json', '.xml', '.html', '.css', '.js', '.py', 
-                 '.java', '.c', '.cpp', '.md', '.rtf'):
-        pages = process_text(file_path, doc_id, pages_dir)
-    else:
-        pages = process_generic(file_path, doc_id, pages_dir)  # fallback instead of error
+    # Indexing is the expensive part -- rendering every page, embedding each one,
+    # and storing the result.  Look before doing the work.
+    digest = _file_digest(file_path)
+    duplicate = find_duplicate(meta.get("documents", {}), digest, doc_id, project_id)
+    if duplicate:
+        try:
+            if (file_path.parent.resolve() == Path(workspace.docs_dir).resolve()
+                    and file_path.stem == doc_id):
+                file_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        linked = False
+        if project_id:
+            stored = meta["documents"][duplicate["id"]]
+            linked = link_document(stored, project_id)
+            if linked:
+                workspace.save_metadata(meta)
+            duplicate = {**stored, "id": duplicate["id"]}
+        logger.info(f"Duplicate of {duplicate['id']} ({duplicate.get('name')}); reused, not re-indexed"
+                    + (f"; linked to project {project_id}" if linked else ""))
+        return {**duplicate, "status": "duplicate", "duplicate_of": duplicate["id"], "linked": linked}
+
+    pages, transcription = split_pages(
+        file_path, doc_id, pages_dir,
+        transcribe=audio_transcriber() if ext in AUDIO_EXTENSIONS else None,
+        display_name=display_name,
+    )
 
     logger.info(f"Embedding {len(pages)} pages and storing in ChromaDB...")
     embedded = 0
@@ -856,12 +787,18 @@ def ingest_document(file_path: Path, doc_id: str, workspace, display_name: str |
         "size":       file_path.stat().st_size,
         # A content hash, so the same file uploaded twice is recognised rather
         # than re-rendered, re-embedded and stored again.  See document_storage.
-        "digest":     _file_digest(file_path),
+        "digest":     digest,
         "pages":      pages,
         "page_count": len(pages),
         "status":     "indexed",
         "created_at": datetime.now().isoformat(),
     }
+    if transcription is not None:
+        # Whether a recording's words are searchable, and if not, why not.
+        doc_meta["transcription"] = transcription
+    if origin in ORIGIN_LABELS:
+        doc_meta["origin"] = origin
+    set_document_projects(doc_meta, [project_id] if project_id else [])
     meta.setdefault("documents", {})[doc_id] = doc_meta
     workspace.save_metadata(meta)
     return doc_meta
@@ -1118,20 +1055,46 @@ async def generate_response(
     context_pages: List[Dict],
     history: List[Dict],
     model: str | None = None,
+    records: str = "",
+    documents: str = "",
 ) -> Dict:
     system_prompt = (
         "You are BuildMarshalAI, an intelligent construction document assistant.\n"
-        "Answer only from the supplied project-document evidence. If the evidence does not "
-        "contain the answer, say so. Cite document names and page numbers. Use clear markdown "
-        "and describe relevant drawings or diagrams. Cite factual claims using the supplied "
-        "numeric source labels, for example [1] or [2]. Never invent a citation number."
+        "Answer only from the supplied evidence: the workspace's project and task records "
+        "(when given) and the project-document pages. If neither contains the answer, say so. "
+        "For facts from the records -- people, dates, status, costs, procurement -- say they come "
+        "from the project records. For facts from documents, cite document names and page numbers "
+        "using the supplied numeric source labels, for example [1] or [2]. Never invent a citation "
+        "number. Use clear markdown and describe relevant drawings or diagrams.\n"
+        "The project and task records are read from the workspace at the moment of each "
+        "question. People edit them during a conversation -- reassigning tasks, changing status, "
+        "dates and costs -- so the records in the latest message are the only current ones. "
+        "Always work the answer out again from them. Never reuse names, counts, dates or figures "
+        "from your earlier answers in this conversation: they describe the data as it was then.\n"
+        "When the full text of the project's documents is supplied, read all of it, not only the "
+        "numbered pages; cite it by document name and page, e.g. (Cost-Plan.csv p.1). When a "
+        "question compares records with documents, give both figures and say which came from where.\n"
+        "Use only the projects named in the evidence. Never answer about one project from another "
+        "project's records or documents; if the named project's evidence is silent, say you do "
+        "not know.\n"
+        "For forecasts or estimates, state the basis and the assumption, or say it cannot be known "
+        "from the evidence. If only the one-line project overview is supplied, say that the answer "
+        "is estimated from those summary figures.\n"
+        "You cannot change any record. If asked to, say that nothing was changed and where in the "
+        "app it can be done.\n"
+        "Use every task in the records when a question is about tasks, not just the first few.\n"
+        "If a task named in the question exists in more than one project's records, say so and "
+        "answer for each project, naming it, rather than silently picking one."
     )
     messages = [{"role": "system", "content": system_prompt}]
     for message in history[-6:]:
-        messages.append({
-            "role": message.get("role", "user"),
-            "content": message.get("content", ""),
-        })
+        role = message.get("role", "user")
+        content = message.get("content", "")
+        if role == "assistant" and records:
+            # Said before the latest edits: label it, so it is read as history
+            # rather than repeated as the answer to the same question asked again.
+            content = f"[Earlier answer, from the records as they were then; may be out of date]\n{content}"
+        messages.append({"role": role, "content": content})
 
     user_content = []
     images_added = 0
@@ -1143,7 +1106,18 @@ async def generate_response(
             user_content.append({"type": "image", "image": image_path})
             images_added += 1
 
-    context_text = "Relevant document pages:\n"
+    context_text = ""
+    if records:
+        # The workspace's own records for the projects and tasks the question
+        # names: always current, and exact where documents may be out of date.
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        context_text += (f"Project and task records, read from the workspace just now ({stamp}); "
+                         f"they supersede anything said earlier in this conversation:\n{records}\n\n")
+    if documents:
+        context_text += ("Full text of every document linked to the project(s) in question:\n"
+                         f"{documents}\n\n")
+    context_text += ("Pages retrieved as most relevant to the question (numbered sources):\n"
+                     if context_pages else "No document pages were retrieved.\n")
     for index, page in enumerate(context_pages):
         context_text += (
             f"\n[Source {index + 1}: {page['doc_name']}, Page {page['page']}"
@@ -1151,7 +1125,7 @@ async def generate_response(
         )
         if page.get("text_content"):
             context_text += f"\n{page['text_content'][:800]}"
-    user_content.append({"type": "text", "text": f"{context_text}\n\nUser question: {query}"})
+    user_content.append({"type": "text", "text": f"{context_text}\n\nToday is {datetime.now():%Y-%m-%d}.\nUser question: {query}"})
     messages.append({"role": "user", "content": user_content})
 
     try:
@@ -1274,6 +1248,24 @@ async def health_check(context=Depends(optional_account)):
         "generator": CLIPROXY_LABEL,
         "cliproxy_base_url": CLIPROXY_CLIENT.base_url,
     }
+    # Every record lives in PostgreSQL; say whether it is reachable.  The
+    # database is published by the account routes, registered later.
+    database = globals().get("DATABASE")
+    if database is None:
+        payload["database"] = {"connected": False, "detail": "not initialised"}
+    else:
+        try:
+            payload["database"] = {"connected": True, "schema_version": database.schema_version()}
+        except Exception as exc:
+            payload["database"] = {"connected": False, "detail": str(exc)[:200]}
+            payload["status"] = "degraded"
+    # Whether generated PDFs can draw Bangla (a font plus HarfBuzz shaping).
+    _docgen = globals().get("DOCUMENT_GENERATION_SERVICE")
+    if _docgen is not None:
+        payload["pdf_bangla"] = _docgen.renderer.bangla_status()
+    # Voice is optional: without it only the microphone and audio transcripts
+    # are missing, so it never degrades the backend's own status.
+    payload["voice"] = await asyncio.to_thread(voice_service_health, VOICE_SERVICE_URL)
     # Corpus sizes describe one account, so they are reported only to a caller
     # that has one.
     if context is not None:
@@ -1310,32 +1302,52 @@ async def get_status(context=Depends(require_account)):
     }
 
 
+VOICE_UPLOAD_LIMIT = 20 * 1024 * 1024
+VOICE_EXTENSIONS = {".webm", ".wav", ".mp3", ".m4a", ".mp4", ".ogg", ".opus", ".flac", ".aac"}
+
+
+@app.post("/api/voice/transcribe")
+async def transcribe_voice(file: UploadFile = File(...), context=Depends(require_account)):
+    """A spoken message, transcribed by the local voice service.
+
+    The browser never talks to the voice service itself: it posts here, and a
+    service that is not running comes back as a 503 that says how to start it.
+    """
+    suffix = Path(file.filename or "voice.webm").suffix.lower() or ".webm"
+    if suffix not in VOICE_EXTENSIONS:
+        raise HTTPException(415, detail=f"Unsupported audio type: {suffix}")
+    data = await file.read(VOICE_UPLOAD_LIMIT + 1)
+    if len(data) > VOICE_UPLOAD_LIMIT:
+        raise HTTPException(413, detail="Audio file exceeds the 20 MB limit")
+    if not data:
+        raise HTTPException(400, detail="The recording is empty")
+    with tempfile.TemporaryDirectory() as folder:
+        recording = Path(folder) / f"voice-message{suffix}"
+        recording.write_bytes(data)
+        try:
+            return await asyncio.to_thread(transcribe_with_voice_service, recording, VOICE_SERVICE_URL)
+        except VoiceServiceUnavailable as error:
+            raise HTTPException(503, detail=str(error))
+        except TranscriptionError as error:
+            raise HTTPException(422, detail=str(error))
+
+
 @app.post("/api/upload")
 async def upload_document(
     file: UploadFile = File(...),
     doc_id: str = Form(None),
+    origin: str = Form("documents"),
     context=Depends(require_account),
 ):
+    context.require("document.upload", "adding documents")
     workspace = context.workspace
     doc_id = sanitize_doc_id(doc_id)
     ext    = Path(file.filename or "").suffix.lower()
+    # Only the two places that use this route may be named; anything else is
+    # recorded as the Documents page.
+    origin = origin if origin in ("documents", "chat") else "documents"
 
-    allowed = {
-    # Documents
-    '.pdf', '.xlsx', '.xls', '.csv', '.doc', '.docx', '.pptx', '.ppt',
-    '.txt', '.rtf', '.odt', '.ods',
-    # Images
-    '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff',
-    # Audio
-    '.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac', '.wma', '.opus',
-    # Video
-    '.mp4', '.webm', '.mov', '.avi', '.mkv',
-    # Archives & Code
-    '.zip', '.rar', '.7z', '.tar', '.gz',
-    '.json', '.xml', '.html', '.css', '.js', '.py', '.java', '.c', '.cpp', '.md',
-}
-
-    if ext not in allowed:
+    if ext not in UPLOAD_EXTENSIONS:
         raise HTTPException(400, detail=f"Unsupported file type: {ext}")
     save_path = workspace.docs_dir / f"{doc_id}{ext}"
     # Stream to disk so a large upload cannot exhaust memory, and stop as soon
@@ -1357,34 +1369,25 @@ async def upload_document(
     except Exception as e:
         save_path.unlink(missing_ok=True)
         raise HTTPException(500, detail=f"Could not save file: {e}")
-    # Indexing is the expensive part -- rendering every page, embedding each one,
-    # and storing the result.  The same bytes already indexed cost all of that
-    # again for nothing, so look before doing the work.
     try:
-        digest = _file_digest(save_path)
-        existing = next(
-            (dict(stored, id=stored_id)
-             for stored_id, stored in workspace.load_metadata().get("documents", {}).items()
-             if stored_id != doc_id and stored.get("digest") == digest),
-            None,
-        )
-    except Exception:
-        existing = None
-    if existing:
-        save_path.unlink(missing_ok=True)
-        return {
-            "id":      existing["id"],
-            "name":    existing.get("name", file.filename),
-            "pages":   existing.get("page_count", 0),
-            "status":  "duplicate",
-            "message": (
-                f"Already indexed as \"{existing.get('name', existing['id'])}\"; "
-                "the existing copy was reused."
-            ),
-        }
-
-    try:
-        doc_meta = ingest_document(save_path, doc_id, workspace, display_name=file.filename)
+        # ingest_document recognises bytes already indexed and removes the
+        # redundant stored copy itself.
+        doc_meta = ingest_document(save_path, doc_id, workspace, display_name=file.filename,
+                                   origin=origin)
+        if doc_meta.get("status") == "duplicate":
+            return {
+                "id":      doc_meta["id"],
+                "name":    doc_meta.get("name", file.filename),
+                "pages":   doc_meta.get("page_count", 0),
+                "status":  "duplicate",
+                "message": (
+                    f"Already indexed as \"{doc_meta.get('name', doc_meta['id'])}\"; "
+                    "the existing copy was reused."
+                ),
+            }
+        transcription = doc_meta.get("transcription") or {}
+        note = (f" Audio not transcribed: {transcription.get('reason')}."
+                if transcription.get("status") in ("unavailable", "failed") else "")
         return {
             "id":      doc_id,
             "name":    file.filename,
@@ -1392,8 +1395,9 @@ async def upload_document(
             "status":  "indexed",
             "message": (
                 f"Indexed {doc_meta['page_count']} pages "
-                f"(account index total: {workspace.collection.count()})"
+                f"(account index total: {workspace.collection.count()})" + note
             ),
+            **({"transcription": transcription} if transcription else {}),
         }
     except Exception as e:
         logger.error(f"Ingestion error: {e}")
@@ -1402,20 +1406,15 @@ async def upload_document(
 
 
 @app.get("/api/documents")
-async def list_documents(context=Depends(require_account)):
-    meta = context.workspace.load_metadata()
-    return {"documents": [
-        {
-            "id":         did,
-            "name":       d["name"],
-            "type":       d["type"],
-            "size":       d.get("size", 0),
-            "pages":      d.get("page_count", 0),
-            "status":     d.get("status", "indexed"),
-            "created_at": d.get("created_at"),
-        }
-        for did, d in meta.get("documents", {}).items()
-    ]}
+async def list_documents(scope: str = "all", project_id: str = "",
+                         context=Depends(require_account)):
+    """Every document, with the projects it belongs to.
+
+    ``scope=unassigned`` lists the orphans -- documents linked to no project --
+    and ``project_id`` those linked to one project.  A link to a project that no
+    longer exists is not a link.
+    """
+    return document_listing(context.workspace, scope=scope, project_id=project_id)
 
 
 @app.get("/api/documents/{doc_id}/status")
@@ -1485,6 +1484,7 @@ def delete_document_files(workspace, doc_id: str) -> None:
 
 @app.delete("/api/documents/{doc_id}")
 async def delete_document(doc_id: str, context=Depends(require_account)):
+    context.require("document.delete", "deleting documents")
     delete_document_files(context.workspace, doc_id)
     return {"message": "Document deleted", "id": doc_id}
 
@@ -1502,17 +1502,86 @@ async def chat(request: Request, context=Depends(require_account)):
     model   = body.get("model") or settings.get("model")
     top_k   = min(int(body.get("top_k") or settings.get("top_k", 5)), 20)
     project_id = body.get("project_id")
-    if project_id and project_id not in workspace.load_projects():
+    projects = workspace.load_projects()
+    if project_id and project_id not in projects:
         raise HTTPException(404, detail="Project not found")
 
     logger.info(f"Query [{context.account_id}]: {query[:80]}...")
 
-    # Step 1: Retrieve top-k pages from this account's index only
-    context_pages = retrieve_context(query, top_k=top_k, project_id=project_id, workspace=workspace)
-    logger.info(f"Retrieved {len(context_pages)} pages for account {context.account_id}")
+    # Step 1: which documents may answer.  A project named in the question
+    # limits the search to that project's documents; otherwise the project page
+    # it was asked from does; otherwise the whole account.
+    from chat_scope import resolve_chat_scope
+    from chat_records import records_context
+    from chat_records import documents_context
+    scope = resolve_chat_scope(query, projects, project_id)
+    records_query = query
+    live_projects = [pid for pid, p in projects.items() if not p.get("archived")]
+    if not scope["project_ids"] and len(live_projects) == 1 and not history:
+        # With one project in the workspace, a question that names none -- or
+        # names it in a language its name is not stored in -- is about it.
+        only = live_projects[0]
+        scope = {"project_ids": [only], "reason": "the only project in the workspace",
+                 "projects": [{"id": only, "name": projects[only].get("name", ""), "matched": ""}]}
+    if not scope["project_ids"]:
+        # A follow-up ("Who is assigned to it?") names nothing: it is about
+        # what the conversation was about, so take the project -- and any task
+        # -- from the most recent earlier question that named one.
+        for earlier in reversed([m.get("content", "") for m in history if m.get("role") == "user"][-6:]):
+            found = resolve_chat_scope(earlier, projects, None)
+            if found["project_ids"]:
+                scope = {**found, "reason": "named earlier in the conversation"}
+                records_query = f"{query}\n{earlier}"
+                break
+        if not scope["project_ids"] and len(live_projects) == 1:
+            only = live_projects[0]
+            scope = {"project_ids": [only], "reason": "the only project in the workspace",
+                     "projects": [{"id": only, "name": projects[only].get("name", ""), "matched": ""}]}
+    scoped = scope["project_ids"] or None
+    names = ", ".join(row["name"] for row in scope["projects"])
 
-    # Step 2: Generate through CLIProxyAPI using text plus retrieved page images
-    return await generate_response(query, context_pages, history, model=model)
+    # Step 2: the records of the projects and tasks the question names -- read
+    # from the database, so they cost milliseconds and no model call.
+    records = records_context(records_query, workspace, ACCOUNT_REGISTRY.users_for_account(context.account_id),
+                              scope["project_ids"])
+    if records["project_ids"] and not scoped:
+        # Naming a task names its project: search that project's documents.
+        scoped = records["project_ids"]
+        scope = {**scope, "project_ids": scoped,
+                 "projects": [{"id": pid, "name": projects[pid].get("name", ""), "matched": ""}
+                              for pid in scoped],
+                 "reason": "a task in the question belongs to it"}
+
+    # Step 3: retrieve pages within the scope. A project with no documents is
+    # answered from its records alone, without a retrieval pass.
+    has_documents = not scoped or bool(scope_documents(workspace, scoped))
+    context_pages = []
+    if has_documents:
+        # Retrieval adds pages; it is never the only source. If ColPali fails,
+        # the answer still goes ahead on the records.
+        try:
+            context_pages = retrieve_context(query, top_k=top_k, project_id=scoped, workspace=workspace)
+        except Exception as exc:
+            logger.warning(f"Retrieval failed, answering from the records only: {exc}")
+    logger.info(f"Retrieved {len(context_pages)} pages for account {context.account_id}"
+                + (f" (scope: {names})" if scoped else "")
+                + (f"; records for {len(records['project_ids'])} project(s), {len(records['task_ids'])} task(s)"
+                   if records["text"] else ""))
+    if scoped and not has_documents and not records["text"]:
+        return {"response": f"No documents or records were found for **{names}**.",
+                "sources": [], "model_used": None, "scope": scope}
+    # Every document of the project(s), in full: retrieval's pages add images
+    # and a ranking, but the answer never depends on them alone.
+    docs = documents_context(workspace, scoped or [])
+    if docs["text"]:
+        logger.info(f"Sending the full text of {docs['documents']} document(s)"
+                    + (" (cut at the limit)" if docs["truncated"] else ""))
+
+    # Step 4: generate from the records, every document, and the retrieved pages.
+    result = await generate_response(query, context_pages, history, model=model,
+                                     records=records["text"], documents=docs["text"])
+    return {**result, "scope": {**scope, "records": {"project_ids": records["project_ids"],
+                                                     "task_ids": records["task_ids"]}}}
 
 
 @app.get("/api/pages/{doc_id}/{page_num}")
@@ -1547,6 +1616,40 @@ async def get_page_image(doc_id: str, page_num: int, context=Depends(require_acc
                 with open(img_path, "rb") as f:
                     return StreamingResponse(BytesIO(f.read()), media_type=ct)
     raise HTTPException(404, detail="Page not found")
+
+
+MEDIA_TYPES = {
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg", ".m4a": "audio/mp4",
+    ".flac": "audio/flac", ".aac": "audio/aac", ".wma": "audio/x-ms-wma", ".opus": "audio/ogg",
+    ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
+}
+
+
+@app.get("/api/documents/{doc_id}/media")
+async def get_document_media(doc_id: str, context=Depends(require_account)):
+    """A document's original recording or video, for playback.
+
+    An audio document's pages are its transcript, so the recording is served
+    from the original upload rather than as a page.  Older audio documents kept
+    a playable copy as their first page; that is used when no original is left.
+    """
+    from fastapi.responses import FileResponse
+
+    workspace = context.workspace
+    doc = workspace.load_metadata().get("documents", {}).get(sanitize_doc_id(doc_id))
+    if not doc:
+        raise HTTPException(404, detail="Document not found")
+    candidates = [path for path in workspace.docs_dir.iterdir()
+                  if path.is_file() and path.stem == doc_id]
+    first_page = (doc.get("pages") or [{}])[0]
+    legacy = workspace.resolve_page_path(first_page.get("image_path"))
+    if legacy:
+        candidates.append(Path(legacy))
+    for path in candidates:
+        media_type = MEDIA_TYPES.get(path.suffix.lower())
+        if media_type:
+            return FileResponse(str(path), media_type=media_type)
+    raise HTTPException(404, detail="This document has no playable media")
 
 
 @app.get("/api/chroma/stats")
@@ -1711,17 +1814,25 @@ def export_chat_pdf(req: ChatExportRequest, context=Depends(require_account)):
 # =============================================================================
 # Projects + Tasks
 #
-# Projects and tasks are stored in the caller's workspace (projects.json and
-# tasks.json) rather than in process memory, so they survive a restart and stay
+# Projects and tasks are the caller's workspace records (the projects and
+# tasks tables) rather than process memory, so they survive a restart and stay
 # consistent with the documents that reference them by project_id.
 # =============================================================================
 
 def _make_project(data: dict) -> dict:
+    """A new project record.
+
+    ``manager_id`` is the user managing it; ``manager`` beside it is only their
+    display name, which the routes refresh from the user record on every read.
+    The create route has already checked the user exists.
+    """
     return {
         "id":           str(uuid.uuid4()),
         "name":         data.get("name", "").strip(),
         "project_code": data.get("project_code", "").strip(),
-        "manager":      data.get("manager", "").strip(),
+        "manager_id":   str(data.get("manager_id") or "").strip(),
+        "manager":      str(data.get("manager") or "").strip(),
+        "members":      [dict(entry) for entry in data.get("members", []) or []],
         "type":         data.get("type", "").strip(),
         "status":       data.get("status", "Active").strip(),
         "start_date":   data.get("start_date", ""),
@@ -1733,15 +1844,67 @@ def _make_project(data: dict) -> dict:
         "state":        data.get("state", "").strip(),
         "postal_code":  data.get("postal_code", "").strip(),
         "country":      data.get("country", "").strip(),
+        # Costs are counted in this; the routes check it is one we can format.
+        "currency":     str(data.get("currency") or "USD").strip().upper(),
         "archived":     False,
         "created_at":   datetime.now(timezone.utc).isoformat(),
     }
+
+def _check_project_currency(data: dict) -> None:
+    """Refuse a currency the application cannot format, rather than store it."""
+    if "currency" not in data:
+        return
+    from entity_schema import PROJECT_CURRENCIES
+    code = str(data.get("currency") or "USD").strip().upper()
+    if code not in PROJECT_CURRENCIES:
+        raise HTTPException(status_code=422,
+                            detail=f"Unsupported currency {code!r}; use one of {', '.join(PROJECT_CURRENCIES)}")
+    data["currency"] = code
 
 def _project_or_404(workspace, project_id: str) -> dict:
     project = workspace.load_projects().get(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     return project
+
+
+def _account_users(context) -> list:
+    return list(ACCOUNT_REGISTRY.users_for_account(context.account_id))
+
+
+def _bind_manager(data: dict, users: list, *, required: bool) -> None:
+    """Swap whatever names the manager in ``data`` for a real user id and name."""
+    from project_people import resolve_manager
+    user = resolve_manager(data, users, required=required)
+    if user is not None:
+        data["manager_id"] = user["id"]
+        data["manager"] = user.get("name") or user.get("email") or ""
+
+
+def _initial_members(data: dict, users: list) -> list:
+    """The ``member_ids`` a new project starts with, each an active user."""
+    from project_people import active, resolve_user
+    raw = data.get("member_ids") or []
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=422, detail="member_ids must be a list of user ids")
+    members, seen = [], set()
+    for user_id in raw:
+        user = resolve_user(users, user_id=user_id)
+        if user is None:
+            raise HTTPException(status_code=422, detail="One or more project members are not users in this account")
+        if not active(user):
+            raise HTTPException(status_code=422, detail=f"{user.get('name') or user.get('email')} is not an active user")
+        if user["id"] in seen:
+            continue
+        seen.add(user["id"])
+        members.append({"user_id": user["id"], "project_role": "",
+                        "added_at": datetime.now(timezone.utc).isoformat()})
+    return members
+
+
+def _present(project: dict, users: list) -> dict:
+    from project_people import present_project
+    return present_project(project, users)
 
 
 # ── Project Routes ─────────────────────────────────────────────────────────────
@@ -1761,7 +1924,8 @@ async def list_projects(
     per_page:      int = 10,
     context=Depends(require_account),
 ):
-    projects = list(context.workspace.load_projects().values())
+    users = _account_users(context)
+    projects = [_present(p, users) for p in context.workspace.load_projects().values()]
 
     # Archived filter
     if not show_archived:
@@ -1771,7 +1935,7 @@ async def list_projects(
     if name and len(name) >= 2:
         projects = [p for p in projects if name.lower() in p["name"].lower()]
     if manager and len(manager) >= 2:
-        projects = [p for p in projects if manager.lower() in p["manager"].lower()]
+        projects = [p for p in projects if manager.lower() in str(p.get("manager") or "").lower()]
 
     # Multi-value filters (comma-separated)
     if type:
@@ -1807,7 +1971,7 @@ async def list_projects(
 
 @app.get("/api/projects/{project_id}")
 async def get_project(project_id: str, context=Depends(require_account)):
-    return _project_or_404(context.workspace, project_id)
+    return _present(_project_or_404(context.workspace, project_id), _account_users(context))
 
 
 @app.post("/api/projects")
@@ -1818,6 +1982,13 @@ async def create_project(req: Request, context=Depends(require_account)):
         raise HTTPException(status_code=422, detail="Name is required")
     if not data.get("project_code", "").strip():
         raise HTTPException(status_code=422, detail="Project code is required")
+    _check_project_currency(data)
+    from tasks import check_project_dates
+    check_project_dates(data)
+    # The manager is chosen from the account's users, never typed in.
+    users = _account_users(context)
+    _bind_manager(data, users, required=True)
+    data["members"] = _initial_members(data, users)
     workspace = context.workspace
     projects = workspace.load_projects()
     # Project codes are unique within an account, not across the install.
@@ -1830,7 +2001,7 @@ async def create_project(req: Request, context=Depends(require_account)):
     tasks = workspace.load_tasks()
     tasks[project["id"]] = []
     workspace.save_tasks(tasks)
-    return project
+    return _present(project, users)
 
 
 @app.put("/api/projects/{project_id}")
@@ -1842,7 +2013,19 @@ async def update_project(project_id: str, req: Request, context=Depends(require_
     if not p:
         raise HTTPException(status_code=404, detail="Project not found")
     data = await req.json()
-    for field in ["name", "project_code", "manager", "type", "status",
+    _check_project_currency(data)
+    users = _account_users(context)
+    if "manager_id" in data or "manager" in data:
+        # A new manager must be one of the account's users; clearing it is not
+        # an option, since every project is run by someone.
+        _bind_manager(data, users, required=True)
+    if any(field in data and str(data[field] or "") != str(p.get(field) or "")
+           for field in ("start_date", "end_date")):
+        # Moving the project's dates must not strand any of its tasks.
+        from tasks import check_project_dates
+        check_project_dates({**p, **{k: data[k] for k in ("start_date", "end_date") if k in data}},
+                            workspace.load_tasks().get(project_id, []))
+    for field in ["name", "project_code", "manager_id", "manager", "type", "status", "currency",
                   "start_date", "end_date", "description",
                   "address_line1", "address_line2", "city", "state",
                   "postal_code", "country", "archived"]:
@@ -1850,11 +2033,16 @@ async def update_project(project_id: str, req: Request, context=Depends(require_
             p[field] = data[field]
     projects[project_id] = p
     workspace.save_projects(projects)
-    return p
+    return _present(p, users)
 
 
 @app.delete("/api/projects/{project_id}")
 async def delete_project(project_id: str, context=Depends(require_account)):
+    # Deleting a project takes its tasks and procurement with it, and there is
+    # no project.delete permission to grant, so it is an administrator's call
+    # -- the same bar as deactivating a user. Without this any member, a
+    # Viewer included, could delete any project.
+    context.require_admin()
     workspace = context.workspace
     projects = workspace.load_projects()
     if project_id not in projects:
@@ -1871,12 +2059,12 @@ async def delete_project(project_id: str, context=Depends(require_account)):
         workspace.save_procurement(procurement)
     # Documents keep their content but lose the link to a project that is gone,
     # so /api/documents and retrieval stay consistent.
+    # A document shared with other projects stays linked to them.
+    from document_links import unlink_document
     metadata = workspace.load_metadata()
     detached = False
     for document in metadata.get("documents", {}).values():
-        if document.get("project_id") == project_id:
-            document["project_id"] = None
-            detached = True
+        detached = unlink_document(document, project_id) or detached
     if detached:
         workspace.save_metadata(metadata)
     return {"message": "Project deleted", "id": project_id}
@@ -1894,8 +2082,8 @@ async def delete_project(project_id: str, context=Depends(require_account)):
 # =======================================================================
 # Management APIs (Trades, Vendors, Team Members)
 #
-# Each account gets its own management.json, seeded with the standard trade
-# list the first time it is read.  A new workspace therefore starts with the
+# Each account gets its own catalogues, seeded with the standard trade list
+# the first time they are read.  A new workspace therefore starts with the
 # same defaults the product has always shipped, but nothing is shared.
 # =======================================================================
 
@@ -1906,6 +2094,7 @@ async def list_trades(context=Depends(require_account)):
 
 @app.post("/api/trades")
 async def create_trade(request: Request, context=Depends(require_account)):
+    context.require("trade.manage", "changing trades")
     body = await request.json()
     mgmt = context.workspace.load_mgmt()
     trade = {
@@ -1922,6 +2111,7 @@ async def create_trade(request: Request, context=Depends(require_account)):
 
 @app.put("/api/trades/{trade_id}")
 async def update_trade(trade_id: str, request: Request, context=Depends(require_account)):
+    context.require("trade.manage", "changing trades")
     body = await request.json()
     mgmt = context.workspace.load_mgmt()
     for t in mgmt["trades"]:
@@ -1935,6 +2125,7 @@ async def update_trade(trade_id: str, request: Request, context=Depends(require_
 
 @app.delete("/api/trades/{trade_id}")
 async def delete_trade(trade_id: str, context=Depends(require_account)):
+    context.require("trade.manage", "changing trades")
     mgmt = context.workspace.load_mgmt()
     remaining = [t for t in mgmt["trades"] if t["id"] != trade_id]
     if len(remaining) == len(mgmt["trades"]):
@@ -1952,6 +2143,7 @@ async def list_vendors(context=Depends(require_account)):
 
 @app.post("/api/vendors")
 async def create_vendor(request: Request, context=Depends(require_account)):
+    context.require("vendor.manage", "changing external companies")
     body = await request.json()
     mgmt = context.workspace.load_mgmt()
     vendor = {
@@ -1970,6 +2162,7 @@ async def create_vendor(request: Request, context=Depends(require_account)):
 
 @app.put("/api/vendors/{vendor_id}")
 async def update_vendor(vendor_id: str, request: Request, context=Depends(require_account)):
+    context.require("vendor.manage", "changing external companies")
     body = await request.json()
     mgmt = context.workspace.load_mgmt()
     for v in mgmt["vendors"]:
@@ -1984,6 +2177,7 @@ async def update_vendor(vendor_id: str, request: Request, context=Depends(requir
 
 @app.delete("/api/vendors/{vendor_id}")
 async def delete_vendor(vendor_id: str, context=Depends(require_account)):
+    context.require("vendor.manage", "changing external companies")
     mgmt = context.workspace.load_mgmt()
     remaining = [v for v in mgmt["vendors"] if v["id"] != vendor_id]
     if len(remaining) == len(mgmt["vendors"]):
@@ -2000,6 +2194,7 @@ async def list_team_members(context=Depends(require_account)):
 
 @app.post("/api/team-members")
 async def create_team_member(request: Request, context=Depends(require_account)):
+    context.require("contact.manage", "changing the contact directory")
     body = await request.json()
     mgmt = context.workspace.load_mgmt()
     member = {
@@ -2019,6 +2214,7 @@ async def create_team_member(request: Request, context=Depends(require_account))
 
 @app.put("/api/team-members/{member_id}")
 async def update_team_member(member_id: str, request: Request, context=Depends(require_account)):
+    context.require("contact.manage", "changing the contact directory")
     body = await request.json()
     mgmt = context.workspace.load_mgmt()
     for m in mgmt["team_members"]:
@@ -2032,6 +2228,7 @@ async def update_team_member(member_id: str, request: Request, context=Depends(r
 
 @app.delete("/api/team-members/{member_id}")
 async def delete_team_member(member_id: str, context=Depends(require_account)):
+    context.require("contact.manage", "changing the contact directory")
     mgmt = context.workspace.load_mgmt()
     remaining = [m for m in mgmt["team_members"] if m["id"] != member_id]
     if len(remaining) == len(mgmt["team_members"]):
@@ -2049,16 +2246,22 @@ async def delete_team_member(member_id: str, context=Depends(require_account)):
 import importlib.util, os, subprocess, sys, urllib.request
 from pathlib import Path
 
-_integration_modules = ("reportlab", "pypdf", "googleapiclient", "google.auth", "cryptography")
+# uharfbuzz shapes Bangla in generated PDFs (joined conjuncts, vowel signs in place).
+_integration_modules = ("reportlab", "pypdf", "uharfbuzz", "googleapiclient", "google.auth", "cryptography",
+                        "psycopg", "psycopg_pool")
 if any(importlib.util.find_spec(name) is None for name in _integration_modules):
     subprocess.run([
         sys.executable, "-m", "pip", "install", "-q",
-        "reportlab==4.4.3", "pypdf==5.7.0",
+        "reportlab==5.0.1", "uharfbuzz==0.56.2", "pypdf==5.7.0",
         "google-api-python-client==2.176.0", "google-auth==2.40.3",
-        "cryptography==45.0.5",
+        "cryptography==45.0.5", "psycopg[binary]==3.3.6", "psycopg-pool==3.3.3",
     ], check=True)
 else:
     print("Document-generation and Google integration packages already installed")
+
+# A Bangla font for generated PDFs; Windows ships Nirmala UI, Linux needs Noto.
+if IS_KAGGLE and not Path("/usr/share/fonts/truetype/noto/NotoSansBengali-Regular.ttf").exists():
+    subprocess.run(["apt-get", "install", "-y", "-qq", "fonts-noto-core"], check=False)
 
 if IS_KAGGLE:
     try:
@@ -2069,6 +2272,9 @@ if IS_KAGGLE:
             "GOOGLE_TOKEN_ENCRYPTION_KEY", "GOOGLE_ALLOWED_ORIGINS",
             "MICROSOFT_CLIENT_ID", "MICROSOFT_CLIENT_SECRET",
             "MICROSOFT_TENANT_ID", "MICROSOFT_ALLOWED_ORIGINS",
+            # Records live in PostgreSQL; on Kaggle it must be a reachable
+            # server (a managed database), given as a secret.
+            "BUILDMARSHAL_DATABASE_URL",
         ):
             try:
                 _value = _secrets.get_secret(_name)
@@ -2082,15 +2288,12 @@ if IS_KAGGLE:
 if IS_KAGGLE:
     integration_dir = RUNTIME_ROOT / "integration"
     integration_dir.mkdir(parents=True, exist_ok=True)
-    (integration_dir / "hybrid_retrieval.py").write_text(
-        "\"\"\"Hybrid text + ColPali late-interaction retrieval for BuildMarshalAI.\"\"\"\n\nfrom __future__ import annotations\n\nimport logging\nimport os\nimport re\nfrom collections import Counter\nfrom pathlib import Path\nfrom typing import Any, Mapping\n\nimport numpy as np\nimport torch\nfrom PIL import Image\n\n\nLOGGER = logging.getLogger(\"BuildMarshalAI.retrieval\")\n\nSTOPWORDS = {\n    \"a\", \"an\", \"and\", \"are\", \"about\", \"can\", \"could\", \"details\", \"do\", \"for\",\n    \"from\", \"give\", \"i\", \"in\", \"is\", \"me\", \"of\", \"on\", \"please\", \"show\", \"tell\",\n    \"the\", \"this\", \"to\", \"very\", \"what\", \"with\", \"you\",\n}\n\n\ndef search_tokens(value: str) -> list[str]:\n    return [\n        token\n        for token in re.findall(r\"[a-z0-9]+\", str(value).casefold())\n        if token not in STOPWORDS\n    ]\n\n\ndef lexical_score(query: str, page: Mapping[str, Any]) -> float:\n    query_tokens = search_tokens(query)\n    if not query_tokens:\n        return 0.0\n    haystack = f\"{page.get('doc_name', '')} {page.get('text_content', '')}\".casefold()\n    haystack_tokens = search_tokens(haystack)\n    if not haystack_tokens:\n        return 0.0\n    counts = Counter(haystack_tokens)\n    unique_query = list(dict.fromkeys(query_tokens))\n    matched = sum(1 for token in unique_query if counts.get(token, 0))\n    coverage = matched / max(len(unique_query), 1)\n    frequency = sum(min(counts.get(token, 0), 4) for token in unique_query) / max(len(unique_query), 1)\n    phrase = \" \".join(unique_query)\n    phrase_bonus = 4.0 if len(unique_query) >= 2 and phrase in \" \".join(haystack_tokens) else 0.0\n    detail_intent = bool(re.search(\n        r\"\\b(detail|details|describe|description|information|spec|specification|specifications)\\b\",\n        query.casefold(),\n    ))\n    index_page = any(marker in haystack for marker in (\n        \"item index\", \"drawing index\", \"table of contents\", \"sheet index\",\n    )) or \"index\" in search_tokens(str(page.get(\"doc_name\", \"\")))\n    # An index often contains the exact requested label but only points to the\n    # real answer. For detail/specification questions, prefer the richer page.\n    richness_bonus = (\n        min(2.0, len(haystack_tokens) / 400.0)\n        if detail_intent and phrase_bonus\n        else 0.0\n    )\n    index_penalty = 3.0 if detail_intent and index_page else 0.0\n    return max(\n        0.0,\n        phrase_bonus + 3.0 * coverage + 0.35 * frequency\n        + richness_bonus - index_penalty,\n    )\n\n\ndef normalize_scores(values: Mapping[str, float]) -> dict[str, float]:\n    if not values:\n        return {}\n    low, high = min(values.values()), max(values.values())\n    if high - low < 1e-9:\n        return {key: (1.0 if high > 0 else 0.0) for key in values}\n    return {key: (value - low) / (high - low) for key, value in values.items()}\n\n\nclass HybridColPaliRetriever:\n    \"\"\"Retrieve candidates lexically and visually, then apply ColPali MaxSim.\"\"\"\n\n    def __init__(self, namespace: Mapping[str, Any]):\n        # The ColPali model and processor are stateless and shared.  Everything\n        # that holds data -- the vector collection, the page metadata, and the\n        # multi-vector cache -- comes from the workspace passed per call, so one\n        # retriever instance can never mix two accounts' pages.\n        self.model = namespace[\"COLPALI_MODEL\"]\n        self.processor = namespace[\"COLPALI_PROCESSOR\"]\n        self.device = namespace.get(\"COLPALI_DEVICE\", \"cuda:0\")\n\n    def _cache_path(self, image_path: str, workspace: Any) -> Path:\n        safe_stem = re.sub(r\"[^A-Za-z0-9._-]+\", \"_\", Path(image_path).stem)\n        cache_dir = Path(workspace.multivector_dir)\n        cache_dir.mkdir(parents=True, exist_ok=True)\n        return cache_dir / f\"{safe_stem}.npy\"\n\n    @torch.no_grad()\n    def _encode_image(self, image_path: str) -> torch.Tensor | None:\n        try:\n            with Image.open(image_path) as source:\n                image = source.convert(\"RGB\")\n            batch = self.processor.process_images([image]).to(self.model.device)\n            return self.model(**batch).squeeze(0).to(torch.float16).cpu()\n        except Exception as exc:\n            LOGGER.error(\"ColPali page encoding failed for %s: %s\", image_path, exc)\n            return None\n\n    def _page_multivector(self, image_path: str, workspace: Any) -> torch.Tensor | None:\n        cache_path = self._cache_path(image_path, workspace)\n        if cache_path.exists():\n            try:\n                return torch.from_numpy(np.load(cache_path, allow_pickle=False))\n            except Exception as exc:\n                LOGGER.warning(\"Discarding invalid ColPali cache %s: %s\", cache_path.name, exc)\n                cache_path.unlink(missing_ok=True)\n        vector = self._encode_image(image_path)\n        if vector is not None:\n            np.save(cache_path, vector.numpy())\n        return vector\n\n    @torch.no_grad()\n    def _query_multivector(self, query: str) -> torch.Tensor | None:\n        try:\n            batch = self.processor.process_queries([query]).to(self.model.device)\n            return self.model(**batch).squeeze(0).to(torch.float16).cpu()\n        except Exception as exc:\n            LOGGER.error(\"ColPali query encoding failed: %s\", exc)\n            return None\n\n    def embed_image(self, image_path: str, workspace: Any = None) -> np.ndarray | None:\n        multi = (\n            self._page_multivector(image_path, workspace)\n            if workspace is not None else self._encode_image(image_path)\n        )\n        return None if multi is None else multi.float().mean(dim=0).numpy()\n\n    def embed_query(self, query: str) -> np.ndarray | None:\n        multi = self._query_multivector(query)\n        return None if multi is None else multi.float().mean(dim=0).numpy()\n\n    def _pages(self, project_id: str | None, workspace: Any) -> list[dict[str, Any]]:\n        pages: list[dict[str, Any]] = []\n        for doc_id, document in workspace.load_metadata().get(\"documents\", {}).items():\n            doc_project = document.get(\"project_id\")\n            if project_id and doc_project != project_id:\n                continue\n            for page in document.get(\"pages\", []):\n                page_num = int(page.get(\"page_num\", 1))\n                pages.append({\n                    \"id\": f\"{doc_id}_p{page_num}\",\n                    \"doc_name\": document.get(\"name\", doc_id),\n                    \"doc_id\": doc_id,\n                    \"page\": page_num,\n                    \"image_path\": workspace.resolve_page_path(page.get(\"image_path\", \"\")),\n                    \"text_content\": page.get(\"text_content\", \"\"),\n                    \"project_id\": doc_project,\n                    \"source_type\": document.get(\"source_type\", \"project_document\"),\n                })\n        return pages\n\n    def retrieve(self, query: str, top_k: int = 5, project_id: str | None = None,\n                 workspace: Any = None) -> list[dict[str, Any]]:\n        if workspace is None:\n            raise RuntimeError(\"Hybrid retrieval requires the caller's account workspace\")\n        collection = workspace.collection\n        pages = self._pages(project_id, workspace)\n        if not pages:\n            LOGGER.warning(\"No indexed pages match project_id=%r\", project_id)\n            return []\n        by_id = {page[\"id\"]: page for page in pages}\n        candidate_limit = min(len(pages), max(12, top_k * 3))\n        lexical_raw = {page[\"id\"]: lexical_score(query, page) for page in pages}\n        lexical_ids = sorted(lexical_raw, key=lexical_raw.get, reverse=True)[:candidate_limit]\n\n        query_multi = self._query_multivector(query)\n        pooled_raw: dict[str, float] = {}\n        if query_multi is not None and collection.count() > 0:\n            pooled_query = query_multi.float().mean(dim=0).numpy()\n            try:\n                kwargs: dict[str, Any] = {\n                    \"query_embeddings\": [pooled_query.tolist()],\n                    \"n_results\": min(candidate_limit, collection.count()),\n                    \"include\": [\"metadatas\", \"distances\"],\n                }\n                if project_id:\n                    kwargs[\"where\"] = {\"project_id\": project_id}\n                result = collection.query(**kwargs)\n                for item_id, distance in zip(result[\"ids\"][0], result[\"distances\"][0]):\n                    if item_id in by_id:\n                        pooled_raw[item_id] = 1.0 - float(distance)\n            except Exception as exc:\n                LOGGER.warning(\"Chroma candidate retrieval failed: %s\", exc)\n\n        preliminary_ids = set(lexical_ids) | set(pooled_raw)\n        if len(preliminary_ids) > candidate_limit:\n            lexical_norm = normalize_scores({key: lexical_raw.get(key, 0.0) for key in preliminary_ids})\n            pooled_norm = normalize_scores({key: pooled_raw.get(key, 0.0) for key in preliminary_ids})\n            preliminary_ids = set(sorted(\n                preliminary_ids,\n                key=lambda key: 0.75 * lexical_norm.get(key, 0.0) + 0.25 * pooled_norm.get(key, 0.0),\n                reverse=True,\n            )[:candidate_limit])\n        candidates = [by_id[item_id] for item_id in preliminary_ids]\n\n        late_raw: dict[str, float] = {}\n        if query_multi is not None:\n            vectors, vector_ids = [], []\n            for page in candidates:\n                image_path = page.get(\"image_path\", \"\")\n                if image_path and os.path.exists(image_path):\n                    vector = self._page_multivector(image_path, workspace)\n                    if vector is not None:\n                        vectors.append(vector)\n                        vector_ids.append(page[\"id\"])\n            if vectors:\n                try:\n                    scores = self.processor.score_multi_vector(\n                        [query_multi], vectors, batch_size=8, device=self.device\n                    )[0].tolist()\n                    late_raw = {item_id: float(score) for item_id, score in zip(vector_ids, scores)}\n                except Exception as exc:\n                    LOGGER.warning(\"ColPali MaxSim reranking failed: %s\", exc)\n\n        lexical = normalize_scores({key: lexical_raw.get(key, 0.0) for key in preliminary_ids})\n        pooled = normalize_scores({key: pooled_raw.get(key, 0.0) for key in preliminary_ids})\n        late = normalize_scores({key: late_raw.get(key, 0.0) for key in preliminary_ids})\n        strong_exact_match = max(lexical_raw.values(), default=0.0) >= 6.0\n        weights = {\n            \"lexical\": (0.70 if strong_exact_match else 0.55) if lexical_raw else 0.0,\n            \"late\": (0.28 if strong_exact_match else 0.40) if late_raw else 0.0,\n            \"pooled\": (0.02 if strong_exact_match else 0.05) if pooled_raw else 0.0,\n        }\n        total_weight = sum(weights.values()) or 1.0\n        ranked = []\n        for page in candidates:\n            item_id = page[\"id\"]\n            score = (\n                weights[\"lexical\"] * lexical.get(item_id, 0.0)\n                + weights[\"late\"] * late.get(item_id, 0.0)\n                + weights[\"pooled\"] * pooled.get(item_id, 0.0)\n            ) / total_weight\n            lexical_value = lexical.get(item_id, 0.0)\n            late_value = late.get(item_id, 0.0)\n            pooled_value = pooled.get(item_id, 0.0)\n            methods = []\n            if lexical_raw.get(item_id, 0.0) > 0:\n                methods.append(\"text match\")\n            if item_id in late_raw:\n                methods.append(\"ColPali MaxSim\")\n            if item_id in pooled_raw:\n                methods.append(\"vector candidate\")\n            haystack = f\"{page.get('doc_name', '')} {page.get('text_content', '')}\".casefold()\n            ranked.append({\n                **page,\n                \"score\": round(max(0.0, min(1.0, score)), 4),\n                \"retrieval_method\": \" + \".join(methods) or \"metadata fallback\",\n                \"score_breakdown\": {\n                    \"text\": round(lexical_value, 4),\n                    \"colpali\": round(late_value, 4),\n                    \"vector\": round(pooled_value, 4),\n                },\n                \"matched_terms\": [\n                    token for token in dict.fromkeys(search_tokens(query)) if token in haystack\n                ],\n            })\n        ranked.sort(key=lambda page: page[\"score\"], reverse=True)\n        selected = ranked[: min(top_k, len(ranked))]\n        if selected:\n            LOGGER.info(\n                \"Hybrid retrieval selected %d pages; top=%s p%d score=%.3f\",\n                len(selected), selected[0][\"doc_name\"], selected[0][\"page\"], selected[0][\"score\"],\n            )\n        torch.cuda.empty_cache()\n        return selected\n\n\ndef install_hybrid_retrieval(namespace: dict[str, Any]) -> HybridColPaliRetriever:\n    \"\"\"Replace the pooled-vector helpers with the hybrid retriever.\n\n    ``retrieve_context``, ``embed_image``, and ``embed_query`` are looked up as\n    globals at call time, so rebinding them here upgrades every existing caller.\n    Both signatures keep the ``workspace`` keyword the callers already pass.\n    \"\"\"\n    retriever = HybridColPaliRetriever(namespace)\n    namespace[\"HYBRID_RETRIEVER\"] = retriever\n    namespace[\"embed_image\"] = retriever.embed_image\n    namespace[\"embed_query\"] = retriever.embed_query\n    namespace[\"retrieve_context\"] = retriever.retrieve\n    return retriever\n", encoding="utf-8"
-    )
-    (integration_dir / "evidence_viewer.py").write_text(
-        "\"\"\"Exact-page evidence inspection and relevance feedback for BuildMarshalAI.\"\"\"\n\nfrom __future__ import annotations\n\nimport json\nimport re\nimport uuid\nfrom datetime import datetime, timezone\nfrom pathlib import Path\nfrom typing import Any, Mapping\n\nfrom fastapi import Depends, HTTPException\nfrom pydantic import BaseModel, Field\n\n\nEVIDENCE_STOPWORDS = {\n    \"a\", \"about\", \"an\", \"and\", \"are\", \"for\", \"from\", \"give\", \"i\", \"in\",\n    \"is\", \"me\", \"of\", \"on\", \"please\", \"show\", \"tell\", \"the\", \"this\", \"to\",\n    \"very\", \"what\", \"with\", \"you\",\n}\n\n\ndef evidence_terms(query: str) -> list[str]:\n    \"\"\"Return stable, useful query terms for evidence highlighting.\"\"\"\n    return list(dict.fromkeys(\n        token for token in re.findall(r\"[a-z0-9]+\", str(query).casefold())\n        if token not in EVIDENCE_STOPWORDS\n    ))\n\n\ndef best_evidence_snippet(text: str, query: str, max_chars: int = 1400) -> str:\n    \"\"\"Select the densest query-matching window from a page's extracted text.\"\"\"\n    clean = re.sub(r\"\\s+\", \" \", str(text or \"\")).strip()\n    if len(clean) <= max_chars:\n        return clean\n    terms = evidence_terms(query)\n    if not terms:\n        return clean[:max_chars].rstrip() + \"\u2026\"\n\n    lowered = clean.casefold()\n    candidates: list[int] = []\n    for term in terms:\n        candidates.extend(match.start() for match in re.finditer(rf\"\\b{re.escape(term)}\\b\", lowered))\n    if not candidates:\n        return clean[:max_chars].rstrip() + \"\u2026\"\n\n    best_start, best_score = 0, -1\n    half = max_chars // 2\n    for position in candidates:\n        start = max(0, min(position - half, len(clean) - max_chars))\n        window = lowered[start:start + max_chars]\n        score = sum(len(re.findall(rf\"\\b{re.escape(term)}\\b\", window)) for term in terms)\n        if score > best_score:\n            best_start, best_score = start, score\n\n    if best_start:\n        boundary = clean.find(\" \", best_start)\n        if 0 <= boundary < best_start + 80:\n            best_start = boundary + 1\n    snippet = clean[best_start:best_start + max_chars].strip()\n    return (\"\u2026\" if best_start else \"\") + snippet + (\"\u2026\" if best_start + max_chars < len(clean) else \"\")\n\n\nclass EvidenceFeedbackRequest(BaseModel):\n    doc_id: str = Field(min_length=1, max_length=200)\n    page: int = Field(ge=1)\n    rating: str = Field(pattern=r\"^(relevant|not_relevant)$\")\n    query: str = Field(default=\"\", max_length=4000)\n    message_id: str | None = Field(default=None, max_length=200)\n    score: float | None = Field(default=None, ge=0.0, le=1.0)\n\n\ndef register_evidence_viewer_routes(namespace: Mapping[str, Any]) -> dict[str, Any]:\n    \"\"\"Register evidence-detail and relevance-feedback routes on the notebook app.\n\n    Both the document lookup and the feedback log resolve through the caller's\n    account workspace, so a document id from another account reads as missing\n    rather than as someone else's page.\n    \"\"\"\n    required = (\"app\", \"require_account\")\n    missing = [name for name in required if name not in namespace]\n    if missing:\n        raise RuntimeError(f\"Evidence viewer integration is missing: {', '.join(missing)}\")\n\n    app = namespace[\"app\"]\n    require_account = namespace[\"require_account\"]\n\n    def find_page(workspace: Any, doc_id: str, page_num: int) -> tuple[Mapping[str, Any], Mapping[str, Any]]:\n        document = workspace.load_metadata().get(\"documents\", {}).get(doc_id)\n        if not document:\n            raise HTTPException(status_code=404, detail=\"Document not found\")\n        for page in document.get(\"pages\", []):\n            if int(page.get(\"page_num\", 0)) == page_num:\n                return document, page\n        raise HTTPException(status_code=404, detail=\"Document page not found\")\n\n    def read_feedback(workspace: Any) -> list[dict[str, Any]]:\n        path = workspace.evidence_file\n        if not path.exists():\n            return []\n        try:\n            loaded = json.loads(path.read_text(encoding=\"utf-8\"))\n        except (OSError, json.JSONDecodeError):\n            return []\n        return loaded if isinstance(loaded, list) else []\n\n    @app.get(\"/api/evidence/{doc_id}/{page_num}\")\n    async def evidence_detail(\n        doc_id: str, page_num: int, query: str = \"\", context=Depends(require_account),\n    ) -> dict[str, Any]:\n        workspace = context.workspace\n        document, page = find_page(workspace, doc_id, page_num)\n        text = str(page.get(\"text_content\", \"\"))\n        return {\n            \"doc_id\": doc_id,\n            \"doc_name\": document.get(\"name\", doc_id),\n            \"page\": page_num,\n            \"page_count\": int(document.get(\"page_count\", len(document.get(\"pages\", [])))),\n            \"project_id\": document.get(\"project_id\"),\n            \"source_type\": document.get(\"source_type\", \"project_document\"),\n            \"text_content\": text,\n            \"evidence_text\": best_evidence_snippet(text, query),\n            \"matched_terms\": evidence_terms(query),\n            \"has_page_image\": bool(workspace.resolve_page_path(page.get(\"image_path\"))),\n            \"image_endpoint\": f\"/api/pages/{doc_id}/{page_num}\",\n        }\n\n    @app.post(\"/api/evidence/feedback\")\n    async def evidence_feedback(\n        body: EvidenceFeedbackRequest, context=Depends(require_account),\n    ) -> dict[str, Any]:\n        workspace = context.workspace\n        document, _ = find_page(workspace, body.doc_id, body.page)\n        records = read_feedback(workspace)\n        record = {\n            \"id\": uuid.uuid4().hex,\n            \"doc_id\": body.doc_id,\n            \"doc_name\": document.get(\"name\", body.doc_id),\n            \"page\": body.page,\n            \"rating\": body.rating,\n            \"query\": body.query,\n            \"message_id\": body.message_id,\n            \"score\": body.score,\n            \"user_id\": context.user_id,\n            \"created_at\": datetime.now(timezone.utc).isoformat(),\n        }\n        records.append(record)\n        records = records[-5000:]\n        path = workspace.evidence_file\n        temporary = path.with_name(path.name + \".tmp\")\n        temporary.write_text(json.dumps(records, indent=2), encoding=\"utf-8\")\n        temporary.replace(path)\n        return {\"status\": \"saved\", \"feedback_id\": record[\"id\"]}\n\n    @app.get(\"/api/evidence-feedback/stats\")\n    async def evidence_feedback_stats(context=Depends(require_account)) -> dict[str, Any]:\n        records = read_feedback(context.workspace)\n        relevant = sum(item.get(\"rating\") == \"relevant\" for item in records)\n        not_relevant = sum(item.get(\"rating\") == \"not_relevant\" for item in records)\n        return {\"total\": len(records), \"relevant\": relevant, \"not_relevant\": not_relevant}\n\n    return {\"scoped\": \"per-account\"}\n\n\n__all__ = [\n    \"EvidenceFeedbackRequest\", \"best_evidence_snippet\", \"evidence_terms\",\n    \"register_evidence_viewer_routes\",\n]\n", encoding="utf-8"
-    )
     repository = "https://raw.githubusercontent.com/shafitanvir32/BuildMarshalAI_capstone/docgen-pipeline/backend"
-    for filename in ("accounts.py", "external_imports.py", "oauth_tokens.py",
+    for filename in ("database.py", "json_storage_import.py", "ingestion_formats.py",
+                     "hybrid_retrieval.py", "evidence_viewer.py",
+                     "accounts.py", "external_imports.py", "oauth_tokens.py",
                      "tasks.py", "project_management.py", "company_settings.py",
+                     "project_people.py", "document_links.py", "chat_scope.py", "chat_records.py",
                      "permissions.py", "user_roles.py",
                      "todo_lists.py",
                      "entity_schema.py",
@@ -2113,6 +2316,8 @@ else:
     integration_dir = next(
         (candidate for candidate in candidates
          if (candidate / "accounts.py").exists()
+         and (candidate / "database.py").exists()
+         and (candidate / "json_storage_import.py").exists()
          and (candidate / "tasks.py").exists()
          and (candidate / "project_management.py").exists()
          and (candidate / "company_settings.py").exists()
@@ -2251,16 +2456,32 @@ def resolve_backend_port():
 
 
 def publish_backend_port(port):
-    """Write the port where the frontend reads it: a browser has no environment."""
+    """Write the port where the frontend reads it: a browser has no environment.
+
+    A second instance -- a test run, a scratch copy on another port -- must not
+    repoint the frontend away from the real one, so BUILDMARSHAL_PUBLISH_PORT=0
+    turns this off. And the file is only written when its contents change, so a
+    normal restart leaves nothing to show up in version control.
+    """
+    if os.environ.get("BUILDMARSHAL_PUBLISH_PORT", "1").strip() == "0":
+        print("Not publishing the backend port (BUILDMARSHAL_PUBLISH_PORT=0).")
+        return
     here = Path(globals()["__file__"]).resolve().parent if "__file__" in globals() else Path.cwd()
     for parent in (here, *here.parents[:3]):
         frontend = parent / "frontend"
         if frontend.is_dir():
-            (frontend / "local-config.js").write_text(
-                "// Written by the backend at startup -- do not edit.\n"
-                "// A URL entered on the sign-in screen still wins over this.\n"
-                f"window.BMARSHAL_API_URL = 'http://127.0.0.1:{port}';\n",
-                encoding="utf-8")
+            target = frontend / "local-config.js"
+            text = ("// Written by the backend at startup -- do not edit.\n"
+                    "// A URL entered on the sign-in screen still wins over this.\n"
+                    f"window.BMARSHAL_API_URL = 'http://127.0.0.1:{port}';\n")
+            try:
+                current = target.read_text(encoding="utf-8")
+            except OSError:
+                current = ""
+            # Already pointing here: the line that matters is the same, whatever
+            # wrote the comments above it.
+            if f"127.0.0.1:{port}'" not in current:
+                target.write_text(text, encoding="utf-8")
             return
 
 

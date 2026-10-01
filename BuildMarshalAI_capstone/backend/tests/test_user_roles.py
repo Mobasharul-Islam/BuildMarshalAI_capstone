@@ -8,7 +8,9 @@ from backend.accounts import AccountContext
 from backend.permissions import (
     BUILTIN_ROLES,
     PERMISSION_KEYS,
+    canonical_role,
     clean_permissions,
+    is_builtin_admin,
     is_super_admin,
     permission_catalogue,
     resolve_permissions,
@@ -38,7 +40,7 @@ def test_every_permission_has_a_name_a_description_and_a_group():
 
 
 def test_role_management_is_not_offered_as_a_permission():
-    """Super Admin authority must not be delegatable through a custom role."""
+    """Head (Super Admin) authority must not be delegatable through a custom role."""
     forbidden = ("role", "permission", "company")
     for key in PERMISSION_KEYS:
         assert not any(word in key.split(".")[0] for word in forbidden), key
@@ -76,15 +78,43 @@ def test_an_unknown_or_missing_role_holds_nothing():
 
 
 def test_only_super_admin_and_owners_count_as_super_admin():
-    assert is_super_admin({"role": "Super Admin"})
+    assert is_super_admin({"role": "Head (Super Admin)"})
     assert is_super_admin({"role": "Site Lead", "is_owner": True})
-    assert not is_super_admin({"role": "System Admin"})
+    assert not is_super_admin({"role": "Head (System Admin)"})
     assert not is_super_admin({"role": "Site Lead"})
+
+
+def test_the_builtins_carry_their_new_names():
+    assert BUILTIN_ROLES == ("Head (Super Admin)", "Head (System Admin)")
+
+
+def test_a_former_builtin_name_still_means_the_builtin():
+    """An older client or an import may still send the old labels."""
+    assert canonical_role("Super Admin") == "Head (Super Admin)"
+    assert canonical_role("system admin") == "Head (System Admin)"
+    assert canonical_role("Site Lead") == "Site Lead"
+    assert is_super_admin({"role": "Super Admin"})
+    assert is_builtin_admin({"role": "System Admin"})
+    assert not is_super_admin({"role": "System Admin"})
+
+
+def test_no_custom_role_may_take_a_builtin_name_old_or_new(owner, registry):
+    client = build_app(owner, registry)
+    for name in ("Head (Super Admin)", "Head (System Admin)", "Super Admin", "system admin"):
+        refused = client.post("/api/user-roles", json={"name": name})
+        assert refused.status_code == 409, name
+
+
+def test_the_builtin_rows_have_stable_ids(owner, registry):
+    roles = build_app(owner, registry).get("/api/user-roles").json()["roles"]
+    builtin = {r["name"]: r["id"] for r in roles if r["builtin"]}
+    assert builtin == {"Head (Super Admin)": "builtin-super-admin",
+                       "Head (System Admin)": "builtin-system-admin"}
 
 
 def test_assignable_names_are_the_builtins_plus_created_roles():
     names = role_names([{"name": "Site Lead"}, {"name": "Estimator"}])
-    assert names == ["Super Admin", "System Admin", "Site Lead", "Estimator"]
+    assert names == ["Head (Super Admin)", "Head (System Admin)", "Site Lead", "Estimator"]
 
 
 # ── routes ────────────────────────────────────────────────────────────────────
@@ -137,9 +167,9 @@ def test_a_super_admin_can_create_edit_and_delete_a_role(owner, registry):
     assert [r["name"] for r in client.get("/api/user-roles").json()["roles"]] == list(BUILTIN_ROLES)
 
 
-@pytest.mark.parametrize("role", ["System Admin", "Site Lead", ""])
+@pytest.mark.parametrize("role", ["Head (System Admin)", "Site Lead", ""])
 def test_only_a_super_admin_may_manage_roles(owner, registry, role):
-    """System Admin included: role management is Super Admin work alone."""
+    """Head (System Admin) included: role management is Head (Super Admin) work alone."""
     build_app(owner, registry).post("/api/user-roles", json={"name": "Site Lead"})
     client = build_app(as_role(owner, role), registry)
 

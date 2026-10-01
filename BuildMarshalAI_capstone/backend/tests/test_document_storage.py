@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from backend.document_storage import (
     AREAS,
     DEFAULT_POLICY,
+    DEFAULT_SWEEP_ACTIONS,
     SWEEP_ACTIONS,
     area_usage,
     cold_documents,
@@ -456,6 +457,19 @@ def test_a_sweep_without_confirmation_removes_nothing(admin):
     body = build_app(admin).post("/api/storage/sweep", json={"actions": ["orphans"]}).json()
     assert body["confirmation_required"] is True and body["bytes"] > 0
     assert find_orphans(admin.workspace)["count"] > 0
+
+
+def test_a_sweep_naming_no_action_plans_and_runs_the_same_safe_default(admin):
+    metadata = admin.workspace.load_metadata()
+    del metadata["documents"]["d1"]
+    admin.workspace.save_metadata(metadata)
+    client = build_app(admin)
+
+    plan = client.post("/api/storage/sweep", json={"actions": []}).json()
+    assert [row["key"] for row in plan["actions"]] == list(DEFAULT_SWEEP_ACTIONS) == ["orphans"]
+    done = client.post("/api/storage/sweep", json={"actions": [], "confirm": True}).json()
+    assert [row["key"] for row in done["performed"]] == [row["key"] for row in plan["actions"]]
+    assert done["bytes"] == plan["bytes"]
 
 
 def test_a_confirmed_sweep_reclaims_and_reports_the_new_position(admin):

@@ -150,6 +150,13 @@ PROJECT_STATUSES: tuple[str, ...] = (
     "Active", "Planning", "On Hold", "Completed", "Cancelled",
 )
 
+#: The currencies a project may be priced in. The frontend formats each of these,
+#: and the lakh/crore ones (BDT, INR, PKR, LKR, NPR) the South Asian way.
+PROJECT_CURRENCIES: tuple[str, ...] = (
+    "USD", "GBP", "EUR", "JPY", "INR", "ZAR", "BDT", "PKR", "LKR", "NPR",
+    "CAD", "AUD", "NZD", "AED", "SAR", "SGD",
+)
+
 _PROJECT_FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("name", "Project name", required=True),
     FieldSpec("project_code", "Project code", required=True,
@@ -157,6 +164,8 @@ _PROJECT_FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("type", "Project type", type="reference", reference="project_type"),
     FieldSpec("manager", "Manager"),
     FieldSpec("status", "Status", type="select", options=PROJECT_STATUSES),
+    FieldSpec("currency", "Currency", type="select", options=PROJECT_CURRENCIES,
+              help="What the project's costs are counted in."),
     FieldSpec("start_date", "Start date", type="date"),
     FieldSpec("end_date", "End date", type="date"),
     FieldSpec("baseline_cost", "Baseline cost", type="money",
@@ -236,7 +245,7 @@ ENTITIES: dict[str, EntitySpec] = {
     ),
     "trade": EntitySpec(
         kind="trade", label="Trade", plural="Trades",
-        stored_in="Company Settings → Trades",
+        stored_in="Company Settings → Trades", permission="trade.manage",
         fields=(
             FieldSpec("name", "Trade", required=True),
             FieldSpec("description", "Description"),
@@ -245,7 +254,7 @@ ENTITIES: dict[str, EntitySpec] = {
     ),
     "vendor": EntitySpec(
         kind="vendor", label="External company", plural="External companies",
-        stored_in="Company Settings → External Companies",
+        stored_in="Company Settings → External Companies", permission="vendor.manage",
         fields=(
             FieldSpec("name", "Company name", required=True),
             FieldSpec("vendorType", "Type", type="select",
@@ -318,7 +327,7 @@ ENTITIES: dict[str, EntitySpec] = {
     "procurement": EntitySpec(
         kind="procurement", label="Procurement item", plural="Procurement",
         parent="project", parent_label="Project",
-        stored_in="the project's Procurement tab",
+        stored_in="the project's Procurement tab", permission="procurement.manage",
         fields=_PROCUREMENT_FIELDS,
     ),
 }
@@ -474,7 +483,8 @@ def coerce_fields(kind: str, data: Mapping[str, Any]) -> dict[str, Any]:
 def validate_entity(kind: str, fields: Mapping[str, Any], *,
                     siblings: Sequence[Mapping[str, Any]] = (),
                     roles: Sequence[Mapping[str, Any]] = (),
-                    ignore_id: str | None = None) -> None:
+                    ignore_id: str | None = None,
+                    project: Mapping[str, Any] | None = None) -> None:
     """Run the application's own rules over a candidate record.
 
     Every branch calls the function the live route calls.  Nothing is decided
@@ -486,8 +496,9 @@ def validate_entity(kind: str, fields: Mapping[str, Any], *,
             raise HTTPException(422, detail=f"{item.label} is required")
 
     if kind == "task":
-        # The real task validator: statuses, priorities, and end-before-start.
-        validate_task({**fields, "parent_id": ""}, list(siblings))
+        # The real task validator: statuses, priorities, end-before-start, and
+        # the project's dates when the task's project is known.
+        validate_task({**fields, "parent_id": ""}, list(siblings), project=project)
     elif kind == "user":
         validate_email(fields.get("email", ""))
     elif kind == "role_type":
@@ -578,7 +589,8 @@ def reconcile(builders: Mapping[str, Callable[[], Mapping[str, Any]]],
         if unknown:
             raise RuntimeError(
                 f"entity_schema declares field(s) {sorted(unknown)} for \"{kind}\" that "
-                f"{build.__name__} does not accept. Update entity_schema.py."
+                f"{build.__name__} does not accept (it produced {sorted(produced)}). "
+                f"Update entity_schema.py."
             )
         undeclared = produced - declared
         if undeclared:

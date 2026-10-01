@@ -8,25 +8,27 @@ title is hardcoded anywhere.
 
 | Role | What it is |
 | --- | --- |
-| **Super Admin** | Full access. The only role that can create, edit, or delete roles. The registering user gets it, and an account owner counts as one whatever their stored label says. |
-| **System Admin** | Account administration, unchanged from before roles became configurable: users, company information, and the workspace catalogues. |
+| **Head (Super Admin)** | Full access. The only role that can create, edit, or delete roles. The registering user gets it, and an account owner counts as one whatever their stored label says. |
+| **Head (System Admin)** | Account administration, unchanged from before roles became configurable: users, company information, and the workspace catalogues. |
+
+The two were called **Super Admin** and **System Admin** until database migration 2, which renamed every stored user. The old labels are still understood (an older client, an import, or an onboarding document may use them) and always mean the renamed built-in; no custom role may take either name, old or new.
 
 Neither can be edited, deleted, or redefined — `POST /api/user-roles` with
 either name returns 409.
 
 ### Where the brief conflicted
 
-§1 says Super Admin "remains the only role allowed to manage system-level
-permissions **and company information**". §2 says to keep System Admin's
+§1 says Head (Super Admin) "remains the only role allowed to manage system-level
+permissions **and company information**". §2 says to keep Head (System Admin)'s
 "current permissions/functionality **intact**", and editing company information
-is current System Admin functionality.
+is current Head (System Admin) functionality.
 
 Resolved as:
 
-* **Role management → Super Admin only.** This is new functionality, so
-  restricting it alters nothing System Admin previously had.
-* **Company information → unchanged (Super Admin + System Admin).** Taking it
-  away would alter System Admin's existing reach, which §2 forbids.
+* **Role management → Head (Super Admin) only.** This is new functionality, so
+  restricting it alters nothing Head (System Admin) previously had.
+* **Company information → unchanged (Head (Super Admin) + Head (System Admin)).** Taking it
+  away would alter Head (System Admin)'s existing reach, which §2 forbids.
 
 Neither is delegatable to a custom role either way. Change
 `require_super_admin` on `PUT /api/company` if you want the stricter reading.
@@ -35,7 +37,7 @@ Neither is delegatable to a custom role either way. Change
 
 The catalogue deliberately contains no key for creating roles, editing roles,
 assigning roles, or editing company information. A permission that could be
-ticked would be an authority a Super Admin could hand out by accident. The
+ticked would be an authority a Head (Super Admin) could hand out by accident. The
 check is `context.require_super_admin()`, and `test_user_roles.py` asserts no
 catalogue key starts with `role.`, `permission.`, or `company.`.
 
@@ -60,7 +62,7 @@ against an older build cannot grant something undefined.
 
 ```python
 def resolve_permissions(user, roles):
-    if is_builtin_admin(user):          # Super Admin or System Admin
+    if is_builtin_admin(user):          # Head (Super Admin) or Head (System Admin)
         return PERMISSION_KEYS
     ...match user["role"] against the account's roles, case-insensitively...
     return frozenset()                   # unknown or missing role: nothing
@@ -112,7 +114,7 @@ Server-side on every write. A few examples:
 | `POST /api/projects/{id}/tasks` | `task.create` (+ cost rule if priced) |
 | `PUT /api/projects/{id}/tasks/{id}` | per changed field, plus the cost rule |
 | `POST/PUT/DELETE /api/task-types` | `task_type.manage` or an administrator |
-| `POST/PUT/DELETE /api/user-roles` | **Super Admin only** |
+| `POST/PUT/DELETE /api/user-roles` | **Head (Super Admin) only** |
 
 `GET /api/user-roles` returns `can_manage` and `my_permissions`; the cost
 breakdown returns `can_edit_baseline`, `can_edit_additional`, and
@@ -129,14 +131,14 @@ permissions for anything named "Project Manager". Nobody loses access when
 roles become data. It runs once; after that the file is the source of truth.
 
 A brand-new account has **no** custom roles, because none are shipped. A user
-can still be created without one — they hold no permissions until a Super Admin
+can still be created without one — they hold no permissions until a Head (Super Admin)
 assigns them a role, which fails closed.
 
 ## Storage
 
 | Record | File under `accounts/<account_id>/` |
 | --- | --- |
-| Roles | `user_roles.json` |
+| Roles | the `roles` table |
 
 Roles are per account and isolated like everything else; a role created in one
 workspace is invisible in another.

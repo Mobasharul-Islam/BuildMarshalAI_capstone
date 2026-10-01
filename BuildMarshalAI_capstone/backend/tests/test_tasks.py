@@ -8,6 +8,7 @@ from backend.tasks import (
     TASK_PRIORITIES,
     TASK_STATUSES,
     apply_task_updates,
+    check_project_dates,
     detach_children,
     filter_tasks,
     make_task,
@@ -158,21 +159,34 @@ def test_deleting_a_task_lifts_its_children_to_the_grandparent():
 
 # ── routes ────────────────────────────────────────────────────────────────────
 
-def build_app(context):
+def build_app(context, registry):
     app = FastAPI()
 
     async def require_account():
         return context
 
-    register_task_routes({"app": app, "require_account": require_account})
+    register_task_routes({"app": app, "require_account": require_account,
+                          "ACCOUNT_REGISTRY": registry})
     return TestClient(app)
 
 
+def add_person(registry, context, name, email):
+    return registry.create_user(account_id=context.account_id, name=name, email=email,
+                                password="Passw0rd!123", role="")
+
+
 @pytest.fixture
-def project(make_account):
+def project(make_account, registry):
     context = make_account("owner@example.com")
-    context.workspace.save_projects({"p1": {"id": "p1", "name": "Tower", "project_code": "TWR"}})
-    return context, build_app(context)
+    sam = add_person(registry, context, "Sam", "sam@example.com")
+    # Priya is in the account but not on this project.
+    add_person(registry, context, "Priya", "priya@example.com")
+    context.workspace.save_projects({"p1": {
+        "id": "p1", "name": "Tower", "project_code": "TWR",
+        "start_date": "2027-03-01", "end_date": "2027-06-30",
+        "manager_id": context.user["id"], "members": [{"user_id": sam["id"]}],
+    }})
+    return context, build_app(context, registry)
 
 
 def test_tasks_can_be_created_listed_read_edited_and_deleted(project):
@@ -234,15 +248,15 @@ def test_tasks_of_an_unknown_project_are_not_found(project):
     assert client.delete("/api/projects/p1/tasks/nope").status_code == 404
 
 
-def test_another_accounts_project_is_invisible(make_account):
+def test_another_accounts_project_is_invisible(make_account, registry):
     """A task list must resolve the project through the caller's workspace."""
     neighbour = make_account("neighbour@example.com", name="Neighbour")
     neighbour.workspace.save_projects({"shared-id": {"id": "shared-id", "name": "Theirs"}})
-    neighbour_client = build_app(neighbour)
+    neighbour_client = build_app(neighbour, registry)
     neighbour_client.post("/api/projects/shared-id/tasks", json={"name": "Private task"})
 
     mine = make_account("owner@example.com")
-    my_client = build_app(mine)
+    my_client = build_app(mine, registry)
     # Same project id, different workspace: it must read as missing.
     assert my_client.get("/api/projects/shared-id/tasks").status_code == 404
     assert neighbour_client.get("/api/projects/shared-id/tasks").json()["total"] == 1
@@ -268,3 +282,157 @@ def test_the_routes_reject_a_loop_and_an_invalid_status(project):
 
     bad = client.put(f"/api/projects/p1/tasks/{child['id']}", json={"status": "Nope"})
     assert bad.status_code == 422
+
+
+# ── assignment: only the project's people ─────────────────────────────────────
+
+def test_a_task_is_assigned_to_a_user_by_id_and_carries_their_name(project, registry):
+    context, client = project
+    sam = next(u for u in registry.users_for_account(context.account_id) if u["name"] == "Sam")
+    task = client.post("/api/projects/p1/tasks", json={"name": "Rebar", "assignee_id": sam["id"]})
+    assert task.status_code == 200
+    assert task.json()["assignee_id"] == sam["id"] and task.json()["assignee"] == "Sam"
+
+
+def test_the_assignee_list_is_the_projects_people(project):
+    context, client = project
+    people = client.get("/api/projects/p1/assignees").json()["assignees"]
+    assert {p["name"] for p in people} == {"Owner", "Sam"}        # not Priya
+    manager = next(p for p in people if p["name"] == "Owner")
+    assert manager["sources"] == ["Manager"]
+
+
+def test_a_task_cannot_go_to_someone_outside_the_project(project, registry):
+    context, client = project
+    priya = next(u for u in registry.users_for_account(context.account_id) if u["name"] == "Priya")
+    for body in ({"name": "X", "assignee_id": priya["id"]}, {"name": "X", "assignee": "Priya"}):
+        refused = client.post("/api/projects/p1/tasks", json=body)
+        assert refused.status_code == 422
+        assert "not on Tower" in refused.json()["detail"]
+    task = client.post("/api/projects/p1/tasks", json={"name": "Y", "assignee": "Sam"}).json()
+    moved = client.put(f"/api/projects/p1/tasks/{task['id']}", json={"assignee_id": priya["id"]})
+    assert moved.status_code == 422
+    assert client.get(f"/api/projects/p1/tasks/{task['id']}").json()["assignee"] == "Sam"
+
+
+def test_a_name_that_is_nobody_is_refused_and_a_task_can_be_unassigned(project):
+    _, client = project
+    ghost = client.post("/api/projects/p1/tasks", json={"name": "X", "assignee": "Nobody Here"})
+    assert ghost.status_code == 422 and "not a user" in ghost.json()["detail"]
+    task = client.post("/api/projects/p1/tasks", json={"name": "Y", "assignee": "sam"}).json()
+    assert task["assignee"] == "Sam"                     # matched regardless of case
+    cleared = client.put(f"/api/projects/p1/tasks/{task['id']}",
+                         json={"assignee": "", "assignee_id": ""}).json()
+    assert cleared["assignee"] == "" and cleared["assignee_id"] == ""
+
+
+def test_resaving_an_older_task_keeps_its_assignee(project):
+    """A task from before ids carries only a name; saving the form must still work."""
+    context, client = project
+    tasks = context.workspace.load_tasks()
+    tasks["p1"] = [make_task({"name": "Legacy", "assignee": "Someone Who Left"}, "p1")]
+    context.workspace.save_tasks(tasks)
+    legacy = tasks["p1"][0]
+    saved = client.put(f"/api/projects/p1/tasks/{legacy['id']}",
+                       json={"name": "Legacy", "assignee": "Someone Who Left", "status": "Completed"})
+    assert saved.status_code == 200 and saved.json()["status"] == "Completed"
+
+
+# ── dates ─────────────────────────────────────────────────────────────────────
+
+# The fixture's project runs 2027-03-01 → 2027-06-30.
+
+def test_a_task_inside_its_projects_dates_is_accepted_up_to_the_last_minute(project):
+    _, client = project
+    edges = client.post("/api/projects/p1/tasks", json={
+        "name": "Whole programme", "start_time": "2027-03-01T00:00", "end_time": "2027-06-30T23:59"})
+    assert edges.status_code == 200
+    as_dates = client.post("/api/projects/p1/tasks", json={
+        "name": "Dates only", "start_time": "2027-03-01", "end_time": "2027-06-30"})
+    assert as_dates.status_code == 200
+
+
+@pytest.mark.parametrize("body, word", [
+    ({"start_time": "2027-02-28T17:00", "end_time": "2027-03-02T09:00"}, "before Tower starts on 2027-03-01"),
+    ({"start_time": "2027-06-01T08:00", "end_time": "2027-07-01T08:00"}, "after Tower ends on 2027-06-30"),
+    ({"start_time": "2027-07-02T08:00"}, "Start time 2027-07-02 08:00 is after"),
+    ({"end_time": "2027-01-15T08:00"}, "End time 2027-01-15 08:00 is before"),
+])
+def test_a_task_outside_its_projects_dates_is_refused(project, body, word):
+    """Project start <= task start <= task end <= project end, on the API itself."""
+    _, client = project
+    refused = client.post("/api/projects/p1/tasks", json={"name": "Out of range", **body})
+    assert refused.status_code == 422 and word in refused.json()["detail"]
+    assert client.get("/api/projects/p1/tasks").json()["total"] == 0
+
+
+def test_editing_a_task_is_held_to_the_same_dates(project):
+    _, client = project
+    task = client.post("/api/projects/p1/tasks", json={
+        "name": "Pour", "start_time": "2027-04-01T08:00", "end_time": "2027-04-02T17:00"}).json()
+    early = client.put(f"/api/projects/p1/tasks/{task['id']}", json={"start_time": "2027-02-01T08:00"})
+    late = client.put(f"/api/projects/p1/tasks/{task['id']}", json={"end_time": "2027-08-01T08:00"})
+    assert early.status_code == 422 and late.status_code == 422
+    stored = client.get(f"/api/projects/p1/tasks/{task['id']}").json()
+    assert (stored["start_time"], stored["end_time"]) == ("2027-04-01T08:00", "2027-04-02T17:00")
+    ok = client.put(f"/api/projects/p1/tasks/{task['id']}", json={"end_time": "2027-06-30T12:00"})
+    assert ok.status_code == 200
+
+
+def test_an_older_task_outside_the_dates_can_still_have_other_fields_edited(project):
+    """Saved before the rule; only moving it is held to the project's dates."""
+    context, client = project
+    tasks = context.workspace.load_tasks()
+    tasks["p1"] = [make_task({"name": "Old", "start_time": "2026-12-01T08:00",
+                              "end_time": "2026-12-02T08:00"}, "p1")]
+    context.workspace.save_tasks(tasks)
+    old = tasks["p1"][0]
+    whole_form = client.put(f"/api/projects/p1/tasks/{old['id']}", json={
+        "name": "Old", "status": "Completed", "start_time": "2026-12-01T08:00", "end_time": "2026-12-02T08:00"})
+    assert whole_form.status_code == 200 and whole_form.json()["status"] == "Completed"
+    moved = client.put(f"/api/projects/p1/tasks/{old['id']}", json={"end_time": "2026-12-03T08:00"})
+    assert moved.status_code == 422
+
+
+def test_a_project_without_dates_does_not_bound_its_tasks(project):
+    context, client = project
+    projects = context.workspace.load_projects()
+    projects["p1"] = {**projects["p1"], "start_date": "", "end_date": ""}
+    context.workspace.save_projects(projects)
+    assert client.post("/api/projects/p1/tasks", json={
+        "name": "Any time", "start_time": "2020-01-01T08:00", "end_time": "2035-01-01T08:00"}).status_code == 200
+    # Only one side set: only that side bounds.
+    projects["p1"]["start_date"] = "2027-03-01"
+    context.workspace.save_projects(projects)
+    assert client.post("/api/projects/p1/tasks", json={"name": "Late", "end_time": "2035-01-01T08:00"}).status_code == 200
+    assert client.post("/api/projects/p1/tasks", json={"name": "Early", "start_time": "2027-02-01T08:00"}).status_code == 422
+
+
+def test_project_dates_that_would_strand_tasks_are_refused():
+    tasks = [{"id": "t1", "name": "Pour", "start_time": "2027-04-01T08:00", "end_time": "2027-04-02T08:00"},
+             {"id": "t2", "name": "Archived", "start_time": "2020-01-01", "archived": True}]
+    check_project_dates({"name": "Tower", "start_date": "2027-03-01", "end_date": "2027-06-30"}, tasks)
+    with pytest.raises(HTTPException) as stranded:
+        check_project_dates({"name": "Tower", "start_date": "2027-04-02", "end_date": "2027-06-30"}, tasks)
+    assert "1 task would fall outside" in stranded.value.detail and "Pour" in stranded.value.detail
+    with pytest.raises(HTTPException) as backwards:
+        check_project_dates({"start_date": "2027-06-30", "end_date": "2027-03-01"})
+    assert "end date cannot be earlier" in backwards.value.detail
+    with pytest.raises(HTTPException):
+        check_project_dates({"start_date": "soon"})
+
+
+def test_genuinely_invalid_dates_are_still_refused(project):
+    _, client = project
+    backwards = client.post("/api/projects/p1/tasks", json={
+        "name": "X", "start_time": "2027-03-02T09:00", "end_time": "2027-03-01T09:00"})
+    assert backwards.status_code == 422 and "End time" in backwards.json()["detail"]
+    for field in ("start_time", "end_time", "due_date"):
+        nonsense = client.post("/api/projects/p1/tasks", json={"name": "X", field: "not a date"})
+        assert nonsense.status_code == 422 and "not a valid date" in nonsense.json()["detail"]
+    impossible = client.post("/api/projects/p1/tasks", json={"name": "X", "due_date": "2027-02-30"})
+    assert impossible.status_code == 422
+    # A date and a date-time on the same day compare as dates.
+    same_day = client.post("/api/projects/p1/tasks", json={
+        "name": "X", "start_time": "2027-03-01", "end_time": "2027-03-01T10:00"})
+    assert same_day.status_code == 200

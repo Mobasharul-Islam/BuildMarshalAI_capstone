@@ -162,8 +162,13 @@ rather than growing a second, divergent cleanup path.
 `ingest_document` records a SHA-256 content hash. An upload whose bytes are
 already indexed short-circuits before the expensive part — rendering every page,
 embedding each one, storing the result — and reuses the existing document,
-reporting `status: "duplicate"`. The same tender PDF uploaded to three projects
-now costs one index instead of three.
+reporting `status: "duplicate"`. The check lives in `ingest_document` itself,
+so every path uses it: the Documents upload, project sources, onboarding, and
+Drive/OneDrive/mail imports. Its scope is the project the file is being filed
+into (`ingestion_formats.find_duplicate`): the same tender uploaded twice to one
+project is indexed once, while the same tender as a source of two projects is
+indexed for each, because a document belongs to one project and reusing it
+would move it out of the other.
 
 ### Knowing warm from cold
 

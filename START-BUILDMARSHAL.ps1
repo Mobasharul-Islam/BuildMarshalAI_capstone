@@ -12,6 +12,7 @@ $proxyConfig = Join-Path $packageRoot "cliproxyapi\config.yaml"
 $homeProxyConfig = Join-Path $env:USERPROFILE ".cli-proxy-api\config.yaml"
 $notebook = Join-Path $repoRoot "backend\Local_Working_with_Document_Generation_CLIProxyAPI.ipynb"
 $backendScript = Join-Path $repoRoot "backend\run_backend.py"
+$voiceScript = Join-Path $repoRoot "scripts\run_voice_service.py"
 $frontendDir = Join-Path $repoRoot "frontend"
 $logDir = Join-Path $packageRoot "logs"
 
@@ -172,6 +173,43 @@ if (-not (Test-PortListening $frontendPort)) {
         -WorkingDirectory $repoRoot -WindowStyle Hidden
 }
 
+# ==========================================================================
+# Voice service
+# ==========================================================================
+# The local Whisper voice service (backend/voice_service.py). The chat
+# microphone and uploaded recordings reach it through the backend, which is
+# told its address below. It is optional: without Whisper or ffmpeg, voice
+# input and audio transcripts are unavailable and say so.
+$voicePort = 8903
+$voiceReady = Test-PortListening $voicePort
+if (-not $voiceReady) {
+    & $venvPython -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('whisper') else 1)"
+    $hasWhisper = ($LASTEXITCODE -eq 0)
+    $hasFfmpeg = [bool](Get-Command ffmpeg -ErrorAction SilentlyContinue)
+    if (-not (Test-PortBindable $voicePort)) {
+        Show-PortReservation $voicePort "the voice service"
+    } elseif ($hasWhisper -and $hasFfmpeg) {
+        Start-Process -FilePath $venvPython -ArgumentList @($voiceScript, "--port", "$voicePort") `
+            -WorkingDirectory $repoRoot -WindowStyle Hidden `
+            -RedirectStandardOutput (Join-Path $logDir "voice.out.log") `
+            -RedirectStandardError (Join-Path $logDir "voice.err.log")
+        # Loading Whisper takes seconds, or a minute the first time (download).
+        $deadline = (Get-Date).AddSeconds(120)
+        while (-not (Test-PortListening $voicePort) -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+        }
+        $voiceReady = Test-PortListening $voicePort
+        if (-not $voiceReady) {
+            Write-Host "The voice service did not start; see $logDir\voice.err.log" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "Local voice service skipped: it needs openai-whisper and ffmpeg." -ForegroundColor Yellow
+    }
+}
+if ($voiceReady) {
+    $env:BUILDMARSHAL_VOICE_URL = "http://127.0.0.1:$voicePort"
+}
+
 $backendPort = 8000
 if (-not (Test-PortListening $backendPort) -and -not (Test-PortBindable $backendPort)) {
     Show-PortReservation $backendPort "the backend"
@@ -228,6 +266,11 @@ Write-Host "BuildMarshalAI Services Status" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host "CLIProxyAPI : http://127.0.0.1:$proxyPort/v1" -ForegroundColor Green
 Write-Host "Frontend    : http://localhost:$frontendPort" -ForegroundColor Green
+if ($voiceReady) {
+    Write-Host "Voice       : http://127.0.0.1:$voicePort (local Whisper service)" -ForegroundColor Green
+} else {
+    Write-Host "Voice       : not running - install openai-whisper and ffmpeg, then rerun this script" -ForegroundColor Yellow
+}
 if (Test-PortListening $backendPort) {
     Write-Host "Backend API : http://127.0.0.1:$backendPort" -ForegroundColor Green
     Write-Host "API Docs    : http://127.0.0.1:$backendPort/docs" -ForegroundColor Green
@@ -243,5 +286,6 @@ if ($backendPort -ne 8000) {
     Write-Host "by hand, clear it on the sign-in screen or set it to http://127.0.0.1:$backendPort." -ForegroundColor Yellow
     Write-Host "RESERVE-PORTS.ps1, run once as Administrator, gets the usual ports back." -ForegroundColor Yellow
 }
-Write-Host "Sign in at http://localhost:$frontendPort (each account has its own data)." -ForegroundColor Cyan
+Write-Host "Open http://localhost:$frontendPort for the homepage, or sign in directly at" -ForegroundColor Cyan
+Write-Host "  http://localhost:$frontendPort/index.html?signin (each account has its own data)." -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan

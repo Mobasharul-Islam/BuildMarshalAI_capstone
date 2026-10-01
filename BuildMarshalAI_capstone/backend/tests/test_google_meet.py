@@ -131,9 +131,7 @@ def link_google_account(context, email="person@example.com"):
     from backend.google_workspace import _account_id
     from backend.oauth_tokens import EncryptedAccountStore
 
-    store = EncryptedAccountStore(
-        context.workspace.root / "google_workspace_accounts.enc", GOOGLE_KEY
-    )
+    store = EncryptedAccountStore(context.workspace.token_store("google"), GOOGLE_KEY)
     account_id = _account_id(email)
     store.put({
         "id": account_id, "provider": "google", "email": email, "name": "Person",

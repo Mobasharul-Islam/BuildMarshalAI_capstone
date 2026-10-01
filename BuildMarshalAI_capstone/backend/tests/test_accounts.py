@@ -7,6 +7,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from backend import accounts as accounts_module
 from backend.user_roles import register_user_role_routes
 from backend.accounts import (
     hash_password,
@@ -68,6 +69,56 @@ def test_legacy_sha256_hash_still_verifies_and_asks_for_rehash():
     # password itself has verified.
     assert verify_password("nope", legacy) == (False, True)
     assert verify_password("admin123", "not-a-hash") == (False, False)
+
+
+def weak_pbkdf2(plain: str, rounds: int = 1_000) -> str:
+    """A PBKDF2 hash as an older build, with a lower work factor, stored it."""
+    salt = b"0123456789abcdef"
+    digest = hashlib.pbkdf2_hmac("sha256", plain.encode(), salt, rounds)
+    return f"pbkdf2_sha256${rounds}${salt.hex()}${digest.hex()}"
+
+
+def test_a_hash_below_the_current_work_factor_asks_for_rehash():
+    assert accounts_module.PBKDF2_ITERATIONS >= 600_000     # OWASP's current figure
+    assert verify_password(PASSWORD, weak_pbkdf2(PASSWORD)) == (True, True)
+    assert verify_password(PASSWORD, hash_password(PASSWORD)) == (True, False)
+
+
+def test_sign_in_upgrades_a_weak_hash_without_signing_other_devices_out(api):
+    client, _, registry = api
+    other_device = register(client, "upgrade@example.com")["token"]
+    user_id = registry.find_by_email("upgrade@example.com")["id"]
+    # As an older build stored it: the same password at a lower work factor.
+    with registry.db.transaction() as cur:
+        cur.execute("UPDATE users SET data = jsonb_set(data, '{password_hash}', to_jsonb(%s::text)) "
+                    "WHERE id = %s", (weak_pbkdf2(PASSWORD), user_id))
+
+    response = client.post("/api/auth/login", json={"email": "upgrade@example.com", "password": PASSWORD})
+    assert response.status_code == 200
+
+    stored = registry.get_user(user_id)["password_hash"]
+    assert stored.split("$")[1] == str(accounts_module.PBKDF2_ITERATIONS)
+    assert verify_password(PASSWORD, stored) == (True, False)
+    # The credential did not change, so no session was revoked.
+    assert client.get("/api/auth/me", headers=auth(other_device)).status_code == 200
+
+
+def test_an_unknown_email_costs_one_key_derivation_like_a_wrong_password(api, monkeypatch):
+    client, _, _ = api
+    register(client, "timing@example.com")
+    derivations = []
+    real = hashlib.pbkdf2_hmac
+
+    def counting(*args, **kwargs):
+        derivations.append(args[3])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(accounts_module.hashlib, "pbkdf2_hmac", counting)
+    for email, password in (("nobody@example.com", PASSWORD), ("timing@example.com", "wrong-pass")):
+        derivations.clear()
+        assert client.post("/api/auth/login", json={"email": email, "password": password}).status_code == 401
+        # One derivation at the current work factor, whichever way the login fails.
+        assert derivations == [accounts_module.PBKDF2_ITERATIONS], email
 
 
 def test_safe_identifier_rejects_traversal():
@@ -294,7 +345,7 @@ def test_only_the_owner_can_delete_an_account(api):
     owner = register(client, "keeper@example.com")
     client.post("/api/users", headers=auth(owner["token"]), json={
         "name": "Admin Member", "email": "adminmember@example.com",
-        "password": PASSWORD, "role": "System Admin",
+        "password": PASSWORD, "role": "Head (System Admin)",
     })
     member = client.post("/api/auth/login", json={
         "email": "adminmember@example.com", "password": PASSWORD,
@@ -324,7 +375,7 @@ def test_legacy_single_tenant_data_moves_into_one_owned_account(tmp_path):
     (base / "users.json").write_text(json.dumps({
         "legacy-admin": {
             "id": "legacy-admin", "name": "Administrator",
-            "email": "admin@buildmarshal.com", "role": "Super Admin",
+            "email": "admin@buildmarshal.com", "role": "Head (Super Admin)",
             "password_hash": hashlib.sha256(b"admin123").hexdigest(), "status": "Active",
         }
     }), encoding="utf-8")
@@ -405,7 +456,7 @@ def test_member_cannot_promote_themselves(api):
     }).json()["token"]
 
     escalate = client.put(f"/api/users/{member['id']}", headers=auth(token),
-                          json={"role": "Super Admin"})
+                          json={"role": "Head (Super Admin)"})
     assert escalate.status_code == 403
     reactivate = client.put(f"/api/users/{member['id']}", headers=auth(token),
                             json={"status": "Inactive"})

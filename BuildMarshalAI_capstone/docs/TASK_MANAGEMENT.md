@@ -2,7 +2,7 @@
 
 Tasks belong to a project, and projects belong to an account, so a user only
 ever sees and edits tasks in their own workspace. Records live in
-`accounts/<account_id>/tasks.json` keyed by project id.
+the `tasks` table, keyed by account, project and task id, in order.
 
 ## Where it appears
 
@@ -34,10 +34,10 @@ ever sees and edits tasks in their own workspace. Records live in
 | `task_type` | From the account's task types |
 | `parent_id` | `null` for a root task; must be another task in the same project |
 | `trade` | From the account's trades |
-| `assignee` | An account member |
+| `assignee_id`, `assignee` | The user the task is given to, and their name. Only someone on the project (its manager, a member, or an assignee of another of its tasks) can be chosen; anyone else is refused with 422, in the form and on the API |
 | `field_worker` | A team member |
-| `start_time`, `end_time` | `datetime-local`; the end cannot precede the start |
-| `due_date` | Kept for compatibility with earlier task records |
+| `start_time`, `end_time` | `datetime-local` or a date. They must be real dates, the end cannot precede the start, and both must fall within the project's dates: project start ≤ task start ≤ task end ≤ project end (the project's last day counts up to 23:59). The form's pickers are limited to that window, and the API refuses anything outside it with 422, on create and whenever an edit changes the dates. A project with no dates imposes no bound, and one with only a start date or only an end date bounds only that side. A task saved before this rule can still have its other fields edited; moving it must bring it inside |
+| `due_date` | Kept for compatibility with earlier task records; must be a real date |
 | `priority` | `Low`, `Normal`, `High`, `Urgent` |
 | `status` | `Open`, `In Progress`, `Blocked`, `Completed` |
 | `delegation`, `description` | Free text |
@@ -54,6 +54,7 @@ All require `Authorization: Bearer <session token>`.
 | --- | --- | --- |
 | GET | `/api/projects/{project_id}/tasks` | List, with `name`, `trade`, `status` (comma-separated), `assignee`, `priority`, `parent_id` (`root` or an id), `show_archived` |
 | GET | `/api/projects/{project_id}/tasks/{task_id}` | One task plus its `subtasks` and `parent` |
+| GET | `/api/projects/{project_id}/assignees` | The people a task on this project may be assigned to |
 | POST | `/api/projects/{project_id}/tasks` | Create |
 | PUT | `/api/projects/{project_id}/tasks/{task_id}` | Partial update |
 | DELETE | `/api/projects/{project_id}/tasks/{task_id}` | Delete; subtasks are lifted to the deleted task's own parent |

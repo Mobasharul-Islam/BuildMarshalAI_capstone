@@ -21,6 +21,7 @@ This folder is a self-contained handover of the working local BuildMarshalAI pip
 3. Python 3.13 installed and available through the Windows `py` launcher.
 4. VS Code with the Python and Jupyter extensions.
 5. Internet access for Gemini through CLIProxyAPI and for Google Workspace APIs. The ColPali model itself is bundled for offline loading.
+6. PostgreSQL 14 or newer running on this PC (developed on 18), and its superuser (`postgres`) password. Every record — accounts, projects, tasks, documents, linked Google/Microsoft accounts — is stored there; see `BuildMarshalAI_capstone/docs/DATABASE.md`.
 
 ## First start
 
@@ -30,7 +31,7 @@ Open PowerShell in this folder and run:
 powershell -ExecutionPolicy Bypass -File .\START-BUILDMARSHAL.ps1
 ```
 
-The script performs the one-time setup, creates `.venv-gpu` from the pinned package list when needed, starts CLIProxyAPI on port 8317, starts the frontend on port 5500 (moving either one if Windows has reserved its port -- see **If a service will not start on its port** below), and opens the backend notebook in VS Code. The first environment setup downloads Python packages and can take several minutes; the model weights are already bundled and are not downloaded again.
+The script performs the one-time setup, creates `.venv-gpu` from the pinned package list when needed, creates the BuildMarshalAI database on first use (it asks once for the PostgreSQL superuser password, which is not stored — or run `SETUP-DATABASE.ps1` yourself beforehand), starts CLIProxyAPI on port 8317, starts the frontend on port 5500 (moving either one if Windows has reserved its port -- see **If a service will not start on its port** below), and opens the backend notebook in VS Code. The first environment setup downloads Python packages and can take several minutes; the model weights are already bundled and are not downloaded again.
 
 To create only the Python environment yourself, run:
 
@@ -53,6 +54,14 @@ Health checks:
 - API docs: `http://127.0.0.1:8000/docs`
 - CLIProxy: `http://127.0.0.1:8000/api/cliproxy/status`
 - Frontend: `http://localhost:5500`
+
+## The database
+
+`SETUP-DATABASE.ps1` creates a `buildmarshal` role and the `buildmarshal`, `buildmarshal_test` and `buildmarshal_demo` databases, and records their URLs in `secrets\runtime-secrets.json`. The backend will not start without its database; `BuildMarshalAI_capstone\scripts\check_database.py` says whether it answers.
+
+A data folder from before the database (JSON files) is imported automatically on the first start: every record goes into PostgreSQL in one transaction and the JSON files are moved to `.buildmarshal_runtime\buildmarshal\json-storage-backup\`, not deleted.
+
+**Moving this installation to another PC** now means the data folder *and* the database: back up with `pg_dump` and restore with `pg_restore` (commands in `docs/DATABASE.md`). The data folder carries a `.database-binding.json` that must match the database it came with.
 
 ## Signing in
 

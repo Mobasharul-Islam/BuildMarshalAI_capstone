@@ -2,12 +2,15 @@
 
 Google Workspace and Microsoft 365 both hold refresh tokens for accounts a user
 has linked.  Those tokens are the most sensitive thing the product stores, so
-they live encrypted at rest in the workspace of the BuildMarshal account that
-linked them and are never returned by an API response.
+they live encrypted at rest -- one Fernet-encrypted blob per BuildMarshal
+account and provider, in the database's ``oauth_token_stores`` table -- and are
+never returned by an API response.
 
-The store is provider-agnostic; each provider passes its own file path, so one
-account's Google tokens and Microsoft tokens sit in separate files and neither
-is reachable from another BuildMarshal account.
+The store is provider-agnostic; each provider passes its own storage (see
+``AccountWorkspace.token_store``), so one account's Google tokens and Microsoft
+tokens are separate blobs and neither is reachable from another BuildMarshal
+account.  The database only ever holds ciphertext: the key is in the process
+environment, not in the database.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 
 
 # Fields safe to hand back to a browser.  Everything else in a record --
@@ -51,10 +54,31 @@ def account_identifier(email: str, length: int = 32) -> str:
     return hashlib.sha256(str(email or "").strip().lower().encode("utf-8")).hexdigest()[:length]
 
 
+class TokenStorage(Protocol):
+    """Somewhere to keep one encrypted blob: ``read()`` it back, ``write()`` it."""
+
+    def read(self) -> bytes | None: ...
+
+    def write(self, ciphertext: bytes) -> None: ...
+
+
+class MemoryTokenStorage:
+    """A blob held in memory -- for tests and tools, never for real tokens."""
+
+    def __init__(self, ciphertext: bytes | None = None):
+        self.ciphertext = ciphertext
+
+    def read(self) -> bytes | None:
+        return self.ciphertext
+
+    def write(self, ciphertext: bytes) -> None:
+        self.ciphertext = ciphertext
+
+
 class EncryptedAccountStore:
     """A Fernet-encrypted JSON map of linked external accounts."""
 
-    def __init__(self, path: Path, key: str):
+    def __init__(self, storage: TokenStorage, key: str):
         from cryptography.fernet import Fernet
 
         if not key:
@@ -66,22 +90,17 @@ class EncryptedAccountStore:
                 "The OAuth token encryption key must be a Fernet key; generate one with "
                 "Fernet.generate_key().decode()"
             ) from exc
-        self.path = Path(path)
+        self.storage = storage
         self.lock = threading.RLock()
 
     def _load(self) -> dict[str, dict[str, Any]]:
-        if not self.path.exists():
-            return {}
-        encrypted = self.path.read_bytes()
+        encrypted = self.storage.read()
         if not encrypted:
             return {}
         return json.loads(self.fernet.decrypt(encrypted).decode("utf-8"))
 
     def _save(self, records: Mapping[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temp = self.path.with_suffix(".tmp")
-        temp.write_bytes(self.fernet.encrypt(json.dumps(records).encode("utf-8")))
-        temp.replace(self.path)
+        self.storage.write(self.fernet.encrypt(json.dumps(records).encode("utf-8")))
 
     def list_public(self) -> list[dict[str, Any]]:
         with self.lock:
@@ -116,6 +135,7 @@ class EncryptedAccountStore:
 
 
 __all__ = [
-    "EncryptedAccountStore", "PUBLIC_ACCOUNT_FIELDS", "account_identifier",
+    "EncryptedAccountStore", "MemoryTokenStorage", "PUBLIC_ACCOUNT_FIELDS", "TokenStorage",
+    "account_identifier",
     "iso", "safe_name", "utcnow",
 ]

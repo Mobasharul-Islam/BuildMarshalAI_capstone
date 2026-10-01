@@ -119,7 +119,8 @@ workspace.
   calendar create return `{"confirmation_required": true}` unless the request
   carries `confirm: true`; `assistant/interpret` only ever proposes.
 - **Refresh tokens are encrypted at rest** in the linking account's workspace
-  (`microsoft_accounts.enc`) and are never in an API response.
+  (Fernet ciphertext in the database's `oauth_token_stores`) and are never in an
+  API response.
 - **Account ids do not cross accounts.** A Microsoft account id from one
   BuildMarshal workspace reads as 404 in another.
 - **Office documents are converted to PDF on import** by Graph, so OneDrive

@@ -2,7 +2,7 @@
 
 The Company Settings section of the product. All three are per account and
 readable by any member; only account administrators -- the owner, or a user
-whose role is Super Admin or System Admin -- may change them. The
+whose role is Head (Super Admin) or Head (System Admin) -- may change them. The
 permission check lives here on the server, so a client that hides its buttons is
 a convenience, not the control.
 """
@@ -25,7 +25,7 @@ COMPANY_FIELDS = (
 )
 
 CATALOGS = {
-    # url segment -> (management.json key, human label)
+    # url segment -> (management-store key, human label)
     "task-types": ("task_types", "Task type"),
     "project-types": ("project_types", "Project type"),
 }

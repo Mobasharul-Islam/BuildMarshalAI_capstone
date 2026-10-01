@@ -8,26 +8,31 @@ here so they can be tested without a GPU or a running backend.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
 from fastapi import Depends, HTTPException, Request
 
 try:  # the notebook puts this directory on sys.path
     from permissions import TASK_FIELD_PERMISSIONS
+    from project_people import assignable_people, resolve_assignee
 except ModuleNotFoundError:  # imported as backend.tasks
     from backend.permissions import TASK_FIELD_PERMISSIONS
+    from backend.project_people import assignable_people, resolve_assignee
 
 #: Task field -> the permission needed to change it.
 TASK_UPDATE_PERMISSIONS = {
     field: f"task.update.{field}" for field, _label in TASK_FIELD_PERMISSIONS
 }
+# The assignee is held as a user id beside the display name; changing either
+# is the same act.
+TASK_UPDATE_PERMISSIONS["assignee_id"] = TASK_UPDATE_PERMISSIONS["assignee"]
 
 
 # Fields a client may set on a task. Everything else on the record -- id,
 # project_id, created_at -- is server-owned.
 TASK_FIELDS = (
-    "name", "task_type", "parent_id", "trade", "assignee", "field_worker",
+    "name", "task_type", "parent_id", "trade", "assignee", "assignee_id", "field_worker",
     "start_time", "end_time", "due_date", "priority", "status", "delegation",
     "description", "cost", "archived",
 )
@@ -69,7 +74,10 @@ def make_task(data: Mapping[str, Any], project_id: str) -> dict[str, Any]:
         # None means the task sits at the root of the project.
         "parent_id":    parent or None,
         "trade":        _text(data.get("trade")),
+        # The display name; ``assignee_id`` is the user it refers to. The
+        # routes fill both from the user record, never from free text alone.
         "assignee":     _text(data.get("assignee")),
+        "assignee_id":  _text(data.get("assignee_id")),
         "field_worker": _text(data.get("field_worker")),
         "start_time":   _text(data.get("start_time")),
         "end_time":     _text(data.get("end_time")),
@@ -103,15 +111,98 @@ def apply_task_updates(task: dict[str, Any], data: Mapping[str, Any]) -> dict[st
     return task
 
 
+def project_window(project: Mapping[str, Any] | None) -> tuple[datetime | None, datetime | None]:
+    """The first and last moments a task of this project may be scheduled.
+
+    A project's dates are whole days, so its window runs from the start of its
+    first day to the end of its last. A missing (or unreadable) date leaves that
+    side open.
+    """
+    if not project:
+        return None, None
+
+    def day(value: Any) -> date | None:
+        text = _text(value)[:10]
+        try:
+            return date.fromisoformat(text) if text else None
+        except ValueError:
+            return None
+
+    first, last = day(project.get("start_date")), day(project.get("end_date"))
+    return (datetime.combine(first, time.min) if first else None,
+            datetime.combine(last, time.max) if last else None)
+
+
+def check_within_project(data: Mapping[str, Any], project: Mapping[str, Any] | None) -> None:
+    """Refuse a task scheduled outside its project: start <= task start <= task end <= end."""
+    low, high = project_window(project)
+    if low is None and high is None:
+        return
+    name = _text((project or {}).get("name")) or "the project"
+    for field, label in (("start_time", "Start time"), ("end_time", "End time")):
+        when = parse_when(data.get(field), label)
+        if when is None:
+            continue
+        if low is not None and when < low:
+            raise HTTPException(422, detail=(
+                f"{label} {when:%Y-%m-%d %H:%M} is before {name} starts on {low:%Y-%m-%d}. "
+                "A task must fall within its project's dates"))
+        if high is not None and when > high:
+            raise HTTPException(422, detail=(
+                f"{label} {when:%Y-%m-%d %H:%M} is after {name} ends on {high:%Y-%m-%d}. "
+                "A task must fall within its project's dates"))
+
+
+def tasks_outside_project(project: Mapping[str, Any],
+                          tasks: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """The live tasks a project's (new) dates would leave outside them."""
+    outside = []
+    for task in tasks:
+        if task.get("archived"):
+            continue
+        try:
+            check_within_project(task, project)
+        except HTTPException:
+            outside.append(dict(task))
+    return outside
+
+
+def check_project_dates(project: Mapping[str, Any],
+                        tasks: Iterable[Mapping[str, Any]] = ()) -> None:
+    """Refuse project dates that end before they start, or that would leave
+    one of the project's live tasks outside them."""
+    for field, label in (("start_date", "Start date"), ("end_date", "End date")):
+        text = _text(project.get(field))
+        if text:
+            try:
+                date.fromisoformat(text[:10])
+            except ValueError:
+                raise HTTPException(422, detail=f"{label} {text!r} is not a valid date") from None
+    low, high = project_window(project)
+    if low and high and high < low:
+        raise HTTPException(422, detail="The project's end date cannot be earlier than its start date")
+    outside = tasks_outside_project(project, tasks)
+    if outside:
+        names = ", ".join(_text(t.get("name")) or "(unnamed)" for t in outside[:3])
+        more = f" and {len(outside) - 3} more" if len(outside) > 3 else ""
+        raise HTTPException(422, detail=(
+            f"{len(outside)} task{'' if len(outside) == 1 else 's'} would fall outside those dates "
+            f"({names}{more}). Move {'it' if len(outside) == 1 else 'them'} first, or keep the "
+            "project's dates wide enough"))
+
+
 def validate_task(
     data: Mapping[str, Any],
     project_tasks: Sequence[Mapping[str, Any]],
     task_id: str | None = None,
+    project: Mapping[str, Any] | None = None,
 ) -> None:
     """Reject values the UI must not be able to store.
 
     ``task_id`` is the task being edited, if any; it enables the checks that a
-    task is not its own parent and that a move cannot create a loop.
+    task is not its own parent and that a move cannot create a loop. ``project``
+    is the task's project when its dates are being set: the task must then fall
+    within the project's dates.
     """
     status = data.get("status")
     if status and status not in TASK_STATUSES:
@@ -121,9 +212,14 @@ def validate_task(
     if priority and priority not in TASK_PRIORITIES:
         raise HTTPException(422, detail=f"Priority must be one of: {', '.join(TASK_PRIORITIES)}")
 
-    start, end = _text(data.get("start_time")), _text(data.get("end_time"))
+    # Dates must be real dates, a task cannot end before it starts, and it must
+    # fall within its project: project start <= task start <= task end <= project end.
+    start = parse_when(data.get("start_time"), "Start time")
+    end = parse_when(data.get("end_time"), "End time")
+    parse_when(data.get("due_date"), "Due date")
     if start and end and end < start:
         raise HTTPException(422, detail="End time cannot be earlier than start time")
+    check_within_project(data, project)
 
     parent_id = _text(data.get("parent_id")) or None
     if not parent_id:
@@ -147,6 +243,26 @@ def validate_task(
             break
         seen.add(cursor)
         cursor = by_id.get(cursor, {}).get("parent_id")
+
+
+def parse_when(value: Any, label: str) -> datetime | None:
+    """A task date or date-time as a datetime, None if empty, 422 if not a date."""
+    text = _text(value)
+    if not text:
+        return None
+    candidate = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        try:
+            parsed = datetime.combine(date.fromisoformat(candidate[:10]), datetime.min.time()) \
+                if len(candidate) == 10 else None
+        except ValueError:
+            parsed = None
+        if parsed is None:
+            raise HTTPException(422, detail=f"{label} {text!r} is not a valid date") from None
+    # Compare everything as naive local time: the forms send no zone.
+    return parsed.replace(tzinfo=None)
 
 
 def filter_tasks(
@@ -222,13 +338,28 @@ def register_task_routes(namespace: Mapping[str, Any]) -> dict[str, Any]:
     from wherever the notebook resolved it, and so the routes can resolve the
     caller's workspace through ``require_account``.
     """
-    required = ("app", "require_account")
+    required = ("app", "require_account", "ACCOUNT_REGISTRY")
     missing = [name for name in required if name not in namespace]
     if missing:
         raise RuntimeError(f"Task integration is missing: {', '.join(missing)}")
 
     app = namespace["app"]
     require_account = namespace["require_account"]
+    registry = namespace["ACCOUNT_REGISTRY"]
+
+    def account_users(context: Any) -> list[dict[str, Any]]:
+        return list(registry.users_for_account(context.account_id))
+
+    def bind_assignee(context: Any, project: Mapping[str, Any],
+                      project_tasks: Sequence[Mapping[str, Any]], data: dict[str, Any]) -> None:
+        """Replace whatever the client sent for the assignee with a real person.
+
+        Only someone already on the project -- its manager, a member, or an
+        assignee of one of its tasks -- can be given the task.
+        """
+        chosen = resolve_assignee(data, project, project_tasks, account_users(context))
+        if chosen is not None:
+            data["assignee_id"], data["assignee"] = chosen
 
     def project_or_404(workspace: Any, project_id: str) -> dict[str, Any]:
         project = workspace.load_projects().get(project_id)
@@ -262,6 +393,14 @@ def register_task_routes(namespace: Mapping[str, Any]) -> dict[str, Any]:
         )
         return {"tasks": tasks, "total": len(tasks)}
 
+    @app.get("/api/projects/{project_id}/assignees")
+    async def list_assignees(project_id: str, context=Depends(require_account)) -> dict[str, Any]:
+        """Who a task on this project may be assigned to."""
+        project = project_or_404(context.workspace, project_id)
+        project_tasks = context.workspace.load_tasks().get(project_id, [])
+        people = assignable_people(project, project_tasks, account_users(context))
+        return {"assignees": people, "total": len(people)}
+
     @app.get("/api/projects/{project_id}/tasks/{task_id}")
     async def get_task(project_id: str, task_id: str, context=Depends(require_account)) -> dict[str, Any]:
         project_or_404(context.workspace, project_id)
@@ -276,18 +415,19 @@ def register_task_routes(namespace: Mapping[str, Any]) -> dict[str, Any]:
     @app.post("/api/projects/{project_id}/tasks")
     async def create_task(project_id: str, request: Request, context=Depends(require_account)) -> dict[str, Any]:
         workspace = context.workspace
-        project_or_404(workspace, project_id)
+        project = project_or_404(workspace, project_id)
         context.require("task.create", "creating tasks")
-        data = await request.json()
+        data = dict(await request.json())
         if not str(data.get("name", "")).strip():
             raise HTTPException(status_code=422, detail="Task name is required")
+        bind_assignee(context, project, workspace.load_tasks().get(project_id, []), data)
         # Opening a task with money already on it is the same act as setting
         # the cost afterwards, so it answers to the same rule.
         if _cost(data.get("cost")) and not context.can_edit_task_cost(data):
             context.require_task_cost_editor(data)
         tasks = workspace.load_tasks()
         project_tasks = tasks.setdefault(project_id, [])
-        validate_task(data, project_tasks)
+        validate_task(data, project_tasks, project=project)
         task = make_task(data, project_id)
         project_tasks.append(task)
         workspace.save_tasks(tasks)
@@ -297,13 +437,22 @@ def register_task_routes(namespace: Mapping[str, Any]) -> dict[str, Any]:
     async def update_task(project_id: str, task_id: str, request: Request,
                           context=Depends(require_account)) -> dict[str, Any]:
         workspace = context.workspace
-        project_or_404(workspace, project_id)
+        project = project_or_404(workspace, project_id)
         tasks = workspace.load_tasks()
         project_tasks = tasks.get(project_id, [])
         task = task_or_404(project_tasks, task_id)
-        data = await request.json()
+        data = dict(await request.json())
         if "name" in data and not str(data["name"]).strip():
             raise HTTPException(status_code=422, detail="Task name cannot be empty")
+        # Re-sending the assignee the task already has is not a reassignment:
+        # the whole-record save of an older task must still go through.
+        if (_text(data.get("assignee_id")) and _text(data.get("assignee_id")) == _text(task.get("assignee_id"))) \
+                or ("assignee_id" not in data and _text(data.get("assignee")) == _text(task.get("assignee"))
+                    and "assignee" in data):
+            data.pop("assignee", None)
+            data.pop("assignee_id", None)
+        else:
+            bind_assignee(context, project, project_tasks, data)
         # Validate the record as it will be, so a partial update that only moves
         # the parent is still checked against the other fields.
         # A cost change is governed separately from the rest of the task: the
@@ -312,7 +461,13 @@ def register_task_routes(namespace: Mapping[str, Any]) -> dict[str, Any]:
         if "cost" in data and _cost(data["cost"]) != _cost(task.get("cost")):
             context.require_task_cost_editor(task)
         assert_field_permissions(context, task, data)
-        validate_task({**task, **data}, project_tasks, task_id=task_id)
+        # The project's window is checked whenever the dates change. A task
+        # saved before the rule existed can still have its status or notes
+        # edited without first being moved.
+        dates_changed = any(field in data and _text(data[field]) != _text(task.get(field))
+                            for field in ("start_time", "end_time"))
+        validate_task({**task, **data}, project_tasks, task_id=task_id,
+                      project=project if dates_changed else None)
         apply_task_updates(task, data)
         tasks[project_id] = project_tasks
         workspace.save_tasks(tasks)
@@ -337,6 +492,6 @@ def register_task_routes(namespace: Mapping[str, Any]) -> dict[str, Any]:
 
 __all__ = [
     "TASK_FIELDS", "TASK_PRIORITIES", "TASK_STATUSES", "apply_task_updates",
-    "detach_children", "filter_tasks", "make_task", "register_task_routes",
-    "validate_task",
+    "check_project_dates", "check_within_project", "detach_children", "filter_tasks", "make_task", "parse_when",
+    "project_window", "register_task_routes", "tasks_outside_project", "validate_task",
 ]

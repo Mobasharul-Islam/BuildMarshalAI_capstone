@@ -8,6 +8,10 @@
   // ═══ State ═══
   const state = {
     currentPage: 'all-projects',
+    // The Documents page filter: every document, the unassigned ones, or one project's.
+    docFilter: { scope: 'all', projectId: '' },
+    // The people each project's tasks may be assigned to, by project id.
+    projectAssignees: {},
     expandedGroups: { projects: true, companySettings: false },
     chats: {},
     activeChatId: null,
@@ -18,6 +22,7 @@
     trades: [],
     vendors: [],
     teamMembers: [],
+    feedbackStats: { data: null, loading: false, error: '' },
     users: [],
     projects: [],
     _projectsMeta: { total: 0, page: 1, pages: 1, per_page: 10 },
@@ -121,7 +126,7 @@
     btnOpenSettings: $('#btnOpenSettings'),
     btnHeaderSettings: $('#btnHeaderSettings'),
     apiUrlInput: $('#apiUrlInput'),
-    voiceApiUrlInput: $('#voiceApiUrlInput'),
+    voiceServiceStatus: $('#voiceServiceStatus'),
     modelSelect: $('#modelSelect'),
     topKInput: $('#topKInput'),
     crudModal: $('#crudModal'),
@@ -286,7 +291,6 @@
 
   // ═══ API ═══
   function getApiUrl() { return APP_CONFIG.API_URL || localStorage.getItem(APP_CONFIG.STORAGE_KEYS.API_URL) || ''; }
-  function getVoiceApiUrl() { return APP_CONFIG.VOICE_API_URL || (state.settings && state.settings.voice_api_url) || ''; }
 
   function getToken() { return (state.session && state.session.token) || ''; }
 
@@ -313,12 +317,16 @@
         throw new Error('Your session has ended. Please sign in again.');
       }
       const e = await res.json().catch(() => ({}));
-      throw new Error(e.detail || `API error: ${res.status}`);
+      // The status travels with the error, so a caller can tell "refused" from
+      // "failed" without matching on message text.
+      const error = new Error(e.detail || `API error: ${res.status}`);
+      error.status = res.status;
+      throw error;
     }
     return res;
   }
 
-  // ═══ Voice input (separate Whisper service) ═══
+  // ═══ Voice input (the local Whisper service, reached through the backend) ═══
   /** The box a dictated phrase lands in: the chat composer unless another asked. */
   function voiceInput() {
     const target = state.voiceTarget && $(`#${state.voiceTarget.inputId}`);
@@ -350,9 +358,9 @@
     state.voiceStopTimer = null;
   }
 
+  // The recording goes to the backend, which forwards it to the local voice
+  // service. The browser never talks to the voice service itself.
   async function transcribeVoice(blob) {
-    const base = getVoiceApiUrl();
-    if (!base) throw new Error('Voice service URL not configured. Open Settings.');
     state.isTranscribingVoice = true;
     setVoiceButton('transcribing');
     try {
@@ -360,13 +368,14 @@
       const file = new File([blob], `voice-message.${extension}`, { type: blob.type || 'audio/webm' });
       const form = new FormData();
       form.append('file', file);
-      const response = await fetch(`${base.replace(/\/$/, '')}/api/transcribe`, {
-        method: 'POST',
-        headers: { 'ngrok-skip-browser-warning': 'true' },
-        body: form
-      });
+      let response;
+      try {
+        response = await apiReq('/api/voice/transcribe', { method: 'POST', body: form });
+      } catch (error) {
+        if (error instanceof TypeError) throw new Error('Could not reach the backend to transcribe the recording. Check that it is running.');
+        throw error;
+      }
       const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.detail || `Voice API error: ${response.status}`);
       const transcript = (data.text || '').trim();
       if (!transcript) throw new Error('No speech was detected. Please try again closer to the microphone.');
       const target = voiceInput();
@@ -389,11 +398,6 @@
   async function toggleVoiceRecording() {
     if (state.isTranscribingVoice) return;
     if (state.isRecordingVoice) { stopVoiceRecording(); return; }
-    if (!getVoiceApiUrl()) {
-      openSettings();
-      showToast('Add the Voice Service URL before recording.', 'warning', 5000);
-      return;
-    }
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
       showToast('Voice recording is not supported by this browser.', 'error');
       return;
@@ -606,8 +610,8 @@
       case 'todo-lists': DOM.contentArea.innerHTML = renderTodoListPage(); break;
       case 'onboarding': DOM.contentArea.innerHTML = renderOnboardingPage(); break;
       case 'project-types': DOM.contentArea.innerHTML = renderTypeCatalogPage('project'); break;
-      case 'contact': case 'my-feedback':
-        DOM.contentArea.innerHTML = `<div class="empty-state"><span class="material-icons-outlined">construction</span><h3>${PAGE_TITLES[page] || page}</h3><p>This section is coming soon.</p></div>`; break;
+      case 'contact': DOM.contentArea.innerHTML = renderContactPage(); break;
+      case 'my-feedback': DOM.contentArea.innerHTML = renderFeedbackPage(); break;
       default: renderAllProjectsPage(); break;
     }
     bindPageEvents();
@@ -618,6 +622,8 @@
       fetchCompany().finally(() => { state._companyLoading = false; renderPage(); });
     }
     if (page === 'todo-lists' && !todoState().loaded && !todoState().loading) refreshTodoPreview();
+    if (page === 'my-feedback' && !state.feedbackStats.data && !state.feedbackStats.loading
+        && !state.feedbackStats.error && getApiUrl() && state.session) loadFeedbackStats();
     if (page === 'documents' && !storageState().data && !storageState().loading
         && getApiUrl() && state.session) loadStorage();
     if (page === 'onboarding' && isAccountAdmin() && !onboarding().loaded && !onboarding().loading
@@ -654,51 +660,128 @@
     </div>`;
   }
 
-  function renderProjectDetails() {
-    const internal = state.teamMembers.filter(m => m.category === 'internal');
-    const vendors = state.teamMembers.filter(m => m.category === 'vendor');
-    const contractors = state.teamMembers.filter(m => m.category === 'contractor');
-    const consultants = state.teamMembers.filter(m => m.category === 'consultant');
-    const cards = [
-      { title: 'Internal Team', members: internal, cols: ['Name', 'Email', 'Department'], getRow: m => [m.name, m.email, m.department || '—'] },
-      { title: 'Subcontractors & Trades', members: contractors, cols: ['Name', 'Company'], getRow: m => [m.name, m.company || '—'] },
-      { title: 'Consultants & Designers', members: consultants, cols: ['Name', 'Company'], getRow: m => [m.name, m.company || '—'] },
-      { title: 'Vendors & Suppliers', members: vendors, cols: ['Vendor', 'Contact', 'Email'], getRow: m => [m.company || m.name, m.contactName || '—', m.email || '—'] }
-    ];
-    return `${notConnectedMsg()}<div class="team-grid">${cards.map(c => `
-      <div class="team-card"><div class="team-card-header">
-        <span class="team-card-title">${c.title} (${c.members.length})</span>
-        <button class="btn btn-primary btn-sm" data-action="add-team" data-cat="${c.title}"><span class="material-icons-outlined" style="font-size:16px">add</span> Add</button>
-      </div><div class="team-card-body">
-        ${c.members.length ? `<table><thead><tr>${c.cols.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>${c.members.map(m => `<tr>${c.getRow(m).map(v => `<td>${esc(v)}</td>`).join('')}</tr>`).join('')}</tbody></table>` : `<div class="empty-msg">No ${c.title.toLowerCase()} yet</div>`}
-      </div></div>`).join('')}</div>`;
+  // ═══ Contact — the account's directory of people and companies ═══
+  // Backed by /api/team-members. The four groups are the categories the
+  // contact form already offers, so a contact always lands in exactly one.
+  const CONTACT_GROUPS = [
+    { cat: 'internal', title: 'Internal Team', cols: ['Name', 'Email', 'Department'],
+      row: m => [m.name, m.email || '—', m.department || '—'] },
+    { cat: 'contractor', title: 'Subcontractors & Trades', cols: ['Name', 'Company', 'Email'],
+      row: m => [m.name, m.company || '—', m.email || '—'] },
+    { cat: 'consultant', title: 'Consultants & Designers', cols: ['Name', 'Company', 'Email'],
+      row: m => [m.name, m.company || '—', m.email || '—'] },
+    { cat: 'vendor', title: 'Vendors & Suppliers', cols: ['Company', 'Contact', 'Email'],
+      row: m => [m.company || m.name, m.contactName || m.name || '—', m.email || '—'] },
+  ];
+
+  function renderContactPage() {
+    const known = new Set(CONTACT_GROUPS.map(g => g.cat));
+    // A contact saved with a category this page does not know still shows up,
+    // under Internal Team, rather than silently disappearing.
+    const inGroup = g => state.teamMembers.filter(m =>
+      (known.has(m.category) ? m.category : 'internal') === g.cat);
+    return `${notConnectedMsg()}
+      ${companyBreadcrumb('Contact')}
+      <div class="page-header">
+        <div><h1 class="page-title">Contact</h1>
+          <p class="page-subtitle">Everyone this account works with — your own team, subcontractors, consultants and suppliers.</p></div>
+      </div>
+      <div class="team-grid">${CONTACT_GROUPS.map(g => {
+        const members = inGroup(g);
+        return `
+        <div class="team-card"><div class="team-card-header">
+          <span class="team-card-title">${esc(g.title)} (${members.length})</span>
+          <button class="btn btn-primary btn-sm" data-requires="contact.manage" data-action="add-team" data-cat="${g.cat}"><span class="material-icons-outlined" style="font-size:16px">add</span> Add</button>
+        </div><div class="team-card-body">
+          ${members.length ? `<table><thead><tr>${g.cols.map(h => `<th>${esc(h)}</th>`).join('')}<th></th></tr></thead><tbody>${
+            members.map(m => `<tr data-id="${esc(m.id)}">${g.row(m).map(v => `<td>${esc(v)}</td>`).join('')}
+              <td><div class="table-actions">
+                <button class="btn-table-action" data-requires="contact.manage" data-action="edit-team" data-id="${esc(m.id)}" title="Edit"><span class="material-icons-outlined">edit</span></button>
+                <button class="btn-table-action delete" data-requires="contact.manage" data-action="delete-team" data-id="${esc(m.id)}" title="Remove"><span class="material-icons-outlined">delete</span></button>
+              </div></td></tr>`).join('')}</tbody></table>`
+            : `<div class="empty-msg">No ${esc(g.title.toLowerCase())} yet</div>`}
+        </div></div>`;
+      }).join('')}</div>`;
+  }
+
+  // ═══ My Feedback — how the evidence behind answers has been rated ═══
+  // The evidence viewer's thumbs-up / thumbs-down buttons post to
+  // /api/evidence/feedback; this page reads the account's totals back.
+  async function loadFeedbackStats() {
+    const slice = state.feedbackStats;
+    slice.loading = true;
+    slice.error = '';
+    try {
+      const res = await apiReq('/api/evidence-feedback/stats');
+      slice.data = await res.json();
+    } catch (e) {
+      slice.error = e.message;
+    } finally {
+      slice.loading = false;
+      if (state.currentPage === 'my-feedback') renderPage();
+    }
+  }
+
+  function renderFeedbackPage() {
+    const slice = state.feedbackStats;
+    const data = slice.data;
+    let body;
+    if (slice.error) {
+      body = `<div class="empty-state"><span class="material-icons-outlined">error_outline</span><h3>Feedback could not be loaded</h3><p>${esc(slice.error)}</p></div>`;
+    } else if (!data) {
+      body = `<div class="empty-state"><span class="material-icons-outlined">hourglass_empty</span><h3>Loading feedback…</h3></div>`;
+    } else if (!data.total) {
+      body = `<div class="empty-state"><span class="material-icons-outlined">thumbs_up_down</span><h3>No feedback yet</h3>
+        <p>Open the evidence behind any Marshal answer and mark it relevant or not relevant. Every rating is counted here.</p></div>`;
+    } else {
+      const share = Math.round((data.relevant / data.total) * 100);
+      const card = (label, value, hint) => `
+        <div class="stat-card" style="flex:1;min-width:180px;background:var(--bg-card);border:1px solid var(--border-light);border-radius:var(--radius-lg);padding:20px">
+          <div style="font-size:.8rem;color:var(--text-secondary);font-weight:600">${label}</div>
+          <div style="font-size:2rem;font-weight:800;margin:4px 0">${value}</div>
+          <div style="font-size:.8rem;color:var(--text-muted)">${hint}</div></div>`;
+      body = `<div style="display:flex;gap:16px;flex-wrap:wrap">
+        ${card('Ratings given', data.total, 'evidence pages rated in this account')}
+        ${card('Relevant', data.relevant, 'the page supported the answer')}
+        ${card('Not relevant', data.not_relevant, 'the page did not support it')}
+        ${card('Judged relevant', `${share}%`, 'of all rated evidence')}
+      </div>
+      <p class="viz-note" style="margin-top:16px">A low share means retrieval is surfacing pages that do not answer the question — worth checking which documents are indexed for the project.</p>`;
+    }
+    return `${notConnectedMsg()}
+      ${companyBreadcrumb('My Feedback')}
+      <div class="page-header">
+        <div><h1 class="page-title">My Feedback</h1>
+          <p class="page-subtitle">How the evidence behind Marshal's answers has been rated in this account.</p></div>
+        <button class="btn btn-secondary" id="btnRefreshFeedback"><span class="material-icons-outlined">refresh</span> Refresh</button>
+      </div>${body}`;
   }
 
   function renderTradesPage() {
     return `${notConnectedMsg()}
       <div class="page-header"><h1 class="page-title">Trades Management</h1>
-        <button class="btn btn-primary" id="btnCreateTrade"><span class="material-icons-outlined">add</span> Create Trade</button></div>
+        <button class="btn btn-primary" data-requires="trade.manage" id="btnCreateTrade"><span class="material-icons-outlined">add</span> Create Trade</button></div>
       <div class="filters-bar"><div class="filters-row">
         <div class="filter-group"><div class="filter-label">Search</div><input class="filter-input search" id="tradeSearch" placeholder="Search by name..."></div>
         <div class="filter-group"><div class="filter-label">Status</div><select class="filter-input" id="tradeStatusFilter"><option value="">All</option><option value="Active">Active</option><option value="Inactive">Inactive</option></select></div>
       </div><div class="filters-meta"><span class="total-count">Total: ${state.trades.length}</span></div></div>
       <div class="data-table-container"><table class="data-table" id="tradesTable">
         <thead><tr><th>Name</th><th>Description</th><th>Status</th><th>Actions</th></tr></thead>
-        <tbody>${state.trades.length ? state.trades.map(t => `<tr data-id="${t.id}"><td>${esc(t.name)}</td><td>${esc(t.description)}</td><td><span class="badge ${t.status === 'Active' ? 'badge-active' : 'badge-inactive'}">${t.status}</span></td><td><div class="table-actions"><button class="btn-table-action" data-action="edit-trade" data-id="${t.id}" title="Edit"><span class="material-icons-outlined">edit</span></button><button class="btn-table-action delete" data-action="delete-trade" data-id="${t.id}" title="Delete"><span class="material-icons-outlined">delete</span></button></div></td></tr>`).join('') : `<tr><td colspan="4" class="td-empty">${getApiUrl() ? 'No trades found' : 'Connect backend to load trades'}</td></tr>`}</tbody></table></div>`;
+        <tbody>${state.trades.length ? state.trades.map(t => `<tr data-id="${t.id}"><td>${esc(t.name)}</td><td>${esc(t.description)}</td><td><span class="badge ${t.status === 'Active' ? 'badge-active' : 'badge-inactive'}">${t.status}</span></td><td><div class="table-actions"><button class="btn-table-action" data-requires="trade.manage" data-action="edit-trade" data-id="${t.id}" title="Edit"><span class="material-icons-outlined">edit</span></button><button class="btn-table-action delete" data-requires="trade.manage" data-action="delete-trade" data-id="${t.id}" title="Delete"><span class="material-icons-outlined">delete</span></button></div></td></tr>`).join('') : `<tr><td colspan="4" class="td-empty">${getApiUrl() ? 'No trades found' : 'Connect backend to load trades'}</td></tr>`}</tbody></table></div>`;
   }
 
   function renderVendorsPage() {
     return `${notConnectedMsg()}
       <div class="breadcrumb"><a href="#" data-nav="project-details"><span class="material-icons-outlined">home</span></a><span class="sep">/</span><span>Company Settings</span><span class="sep">/</span><span>Vendors</span></div>
       <div class="page-header"><h1 class="page-title">Vendors Management</h1>
-        <button class="btn btn-primary" id="btnCreateVendor"><span class="material-icons-outlined">add</span> Create Vendor</button></div>
+        <button class="btn btn-primary" data-requires="vendor.manage" id="btnCreateVendor"><span class="material-icons-outlined">add</span> Create Vendor</button></div>
       <div class="filters-bar"><div class="filters-row">
         <div class="filter-group"><div class="filter-label">Search</div><input class="filter-input search" id="vendorSearch" placeholder="Search by name..."></div>
         <div class="filter-group"><div class="filter-label">Status</div><select class="filter-input" id="vendorStatusFilter"><option value="">All</option><option value="Active">Active</option><option value="Inactive">Inactive</option></select></div>
       </div><div class="filters-meta"><span class="total-count">Total: ${state.vendors.length}</span></div></div>
       <div class="data-table-container"><table class="data-table" id="vendorsTable">
         <thead><tr><th>Vendor Name</th><th>Type</th><th>Trade</th><th class="hide-mobile">Active Projects</th><th>Status</th><th>Actions</th></tr></thead>
-        <tbody>${state.vendors.length ? state.vendors.map(v => `<tr data-id="${v.id}"><td>${esc(v.name)}</td><td><span class="badge badge-blue">${v.vendorType || '—'}</span></td><td>${esc(v.trade || '—')}</td><td class="hide-mobile">${v.activeProjects || 0}</td><td><span class="badge ${v.status === 'Active' ? 'badge-active' : 'badge-inactive'}">${v.status}</span></td><td><div class="table-actions"><button class="btn-table-action" data-action="edit-vendor" data-id="${v.id}" title="Edit"><span class="material-icons-outlined">edit</span></button><button class="btn-table-action delete" data-action="delete-vendor" data-id="${v.id}" title="Delete"><span class="material-icons-outlined">delete</span></button></div></td></tr>`).join('') : `<tr><td colspan="6" class="td-empty">${getApiUrl() ? 'No vendors found' : 'Connect backend to load vendors'}</td></tr>`}</tbody></table></div>`;
+        <tbody>${state.vendors.length ? state.vendors.map(v => `<tr data-id="${v.id}"><td>${esc(v.name)}</td><td><span class="badge badge-blue">${v.vendorType || '—'}</span></td><td>${esc(v.trade || '—')}</td><td class="hide-mobile">${v.activeProjects || 0}</td><td><span class="badge ${v.status === 'Active' ? 'badge-active' : 'badge-inactive'}">${v.status}</span></td><td><div class="table-actions"><button class="btn-table-action" data-requires="vendor.manage" data-action="edit-vendor" data-id="${v.id}" title="Edit"><span class="material-icons-outlined">edit</span></button><button class="btn-table-action delete" data-requires="vendor.manage" data-action="delete-vendor" data-id="${v.id}" title="Delete"><span class="material-icons-outlined">delete</span></button></div></td></tr>`).join('') : `<tr><td colspan="6" class="td-empty">${getApiUrl() ? 'No vendors found' : 'Connect backend to load vendors'}</td></tr>`}</tbody></table></div>`;
   }
 
   // ═══ Company Settings ═══
@@ -832,25 +915,49 @@
     }
   }
 
+  // ═══ Saving a fetched file ═══
+  // Files come through apiReq so the request carries the session, then are
+  // handed to the browser through an object URL.
+
+  /** Save a fetched file under a name. The object URL is released a little
+   *  later: revoking it straight after click() can cancel the download in
+   *  Firefox and Safari. */
+  async function saveResponseAs(response, filename) {
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  }
+
+  /** Why a download failed, in words someone can act on.
+   *
+   *  An HTTP error carries a status and its own message. A network failure
+   *  (a TypeError from fetch) for a file the server did produce is most often a
+   *  download manager such as IDM, which takes PDF and CSV responses over and
+   *  hands the page an empty reply -- so it says that, instead of "Failed to
+   *  fetch", which reads as if nothing happened. */
+  function downloadFailure(error) {
+    if (error && error.status) return error.message;
+    return `${error.message}. If a download manager such as IDM is installed, it may have taken the file`;
+  }
+
   async function downloadTodoList(format) {
     try {
       const response = await apiReq(`/api/todo-list/download?fmt=${format}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(todoBody())
       });
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
       const stamp = new Date().toISOString().slice(0, 10);
-      link.download = `${(todoState().title || 'todo-list').replace(/[^a-z0-9._-]+/gi, '-')}-${stamp}.${format}`;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      URL.revokeObjectURL(url);
+      await saveResponseAs(response,
+        `${(todoState().title || 'todo-list').replace(/[^a-z0-9._-]+/gi, '-')}-${stamp}.${format}`);
       showToast(`Downloaded as ${format.toUpperCase()}`, 'success');
     } catch (error) {
-      showToast(`Could not download the list: ${error.message}`, 'error', 7000);
+      showToast(`Could not download the list: ${downloadFailure(error)}`, 'error', 9000);
     }
   }
 
@@ -1019,9 +1126,9 @@
 
   // ═══ User Roles ═══
   //
-  // Super Admin and System Admin are built in and cannot be edited. Every
-  // other role is a name plus the permissions ticked for it, created here.
-  // Managing roles is Super Admin work and is deliberately not itself a
+  // Head (Super Admin) and Head (System Admin) are built in and cannot be
+  // edited. Every other role is a name plus the permissions ticked for it,
+  // created here. Managing roles is Head (Super Admin) work and is deliberately not itself a
   // permission: an authority that could be ticked on a role would be an
   // authority that could be given away.
 
@@ -1042,7 +1149,7 @@
         <div><h1 class="page-title">User Roles</h1>
           <p class="page-subtitle">${canManage
             ? 'Define what each role in this workspace is allowed to do.'
-            : 'What each role in this workspace is allowed to do. Only a Super Admin can change these.'}</p></div>
+            : 'What each role in this workspace is allowed to do. Only a Head (Super Admin) can change these.'}</p></div>
         ${canManage ? '<button class="btn btn-primary" id="btnCreateRole"><span class="material-icons-outlined">add</span> Create Role</button>' : ''}
       </div>
       <div class="filters-bar"><div class="filters-row"></div>
@@ -1065,7 +1172,7 @@
             <span>${role.builtin ? 'All permissions' : `${role.permissions.length} permission${role.permissions.length === 1 ? '' : 's'}`}</span>
           </div>
           ${role.builtin
-            ? `<div class="form-hint">${role.name === 'Super Admin'
+            ? `<div class="form-hint">${role.name === 'Head (Super Admin)'
                 ? 'Full access, and the only role that can manage roles, permissions, and company information.'
                 : 'Account administration, unchanged.'}</div>`
             : (role.permissions.length
@@ -1075,7 +1182,7 @@
         </div>`).join('')}</div>`
       : `<div class="empty-state"><span class="material-icons-outlined">badge</span>
           <h3>No roles yet</h3>
-          <p>${canManage ? 'Create a role to describe what a group of people may do, then assign it when you add a user.' : 'A Super Admin has not created any roles yet.'}</p></div>`}`;
+          <p>${canManage ? 'Create a role to describe what a group of people may do, then assign it when you add a user.' : 'A Head (Super Admin) has not created any roles yet.'}</p></div>`}`;
   }
 
   function openRoleModal(roleId) {
@@ -1088,7 +1195,7 @@
         <input class="form-input" id="roleName" value="${esc(role?.name || '')}" placeholder="e.g. Site Lead"></div>
       <div class="form-group"><label class="form-label">Description</label>
         <input class="form-input" id="roleDescription" value="${esc(role?.description || '')}" placeholder="What this role is for"></div>
-      <div class="form-hint" style="margin-bottom:10px">Tick everything this role should be allowed to do. Managing roles, permissions, and company information stays with Super Admins and cannot be granted here.</div>
+      <div class="form-hint" style="margin-bottom:10px">Tick everything this role should be allowed to do. Managing roles, permissions, and company information stays with the Head (Super Admin) and cannot be granted here.</div>
       ${state.permissionGroups.map(group => `
         <div class="perm-group">
           <div class="perm-group-head">
@@ -1229,10 +1336,26 @@
   }
 
   function renderDocumentsPage() {
+    const f = state.docFilter;
+    const all = state.uploadedDocs;
+    const orphanCount = all.filter(d => !(d.projects || []).length).length;
+    const shown = all.filter(d => f.scope === 'unassigned' ? !(d.projects || []).length
+      : f.scope === 'project' ? (d.project_ids || []).includes(f.projectId) : true);
+    const projectsWithDocs = state.projects.filter(p => all.some(d => (d.project_ids || []).includes(p.id)));
+    const filterBar = all.length ? `<div class="doc-filter-bar" role="group" aria-label="Filter documents">
+        <button class="chip-btn ${f.scope === 'all' ? 'active' : ''}" data-action="doc-filter" data-scope="all">All <span class="chip-count">${all.length}</span></button>
+        <button class="chip-btn ${f.scope === 'unassigned' ? 'active' : ''}" data-action="doc-filter" data-scope="unassigned" title="Documents linked to no project">Unassigned <span class="chip-count">${orphanCount}</span></button>
+        <select class="form-input doc-filter-project" id="docFilterProject" aria-label="Documents of one project">
+          <option value="">By project…</option>
+          ${projectsWithDocs.map(p => `<option value="${esc(p.id)}" ${f.scope === 'project' && f.projectId === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}
+        </select>
+      </div>` : '';
     return `${notConnectedMsg()}
       <div class="page-header"><h1 class="page-title">Documents</h1>
-        <button class="btn btn-primary" id="btnUploadDocs"><span class="material-icons-outlined">upload_file</span> Upload</button></div>
-      ${state.uploadedDocs.length ? `<div class="doc-cards-grid">${state.uploadedDocs.map(d => {
+        <button class="btn btn-primary" data-requires="document.upload" id="btnUploadDocs"><span class="material-icons-outlined">upload_file</span> Upload</button></div>
+      ${filterBar}
+      ${all.length && !shown.length ? `<div class="empty-msg">${f.scope === 'unassigned' ? 'Every document belongs to at least one project.' : 'No documents match this filter.'}</div>` : ''}
+      ${all.length ? `<div class="doc-cards-grid">${shown.map(d => {
       const ext = getExt(d.name);
       const icon = getFileIcon(ext);
       const cls = getFileClass(ext);
@@ -1241,11 +1364,12 @@
           <div class="doc-card-icon ${cls}">${icon}</div>
           <div class="doc-card-info">
             <div class="doc-card-name">${esc(d.name)}</div>
-            <div class="doc-card-meta">${d.pages ? d.pages + ' pages' : ext.toUpperCase()} · <span class="badge ${d.status === 'indexed' ? 'badge-active' : 'badge-inactive'}" style="font-size:0.68rem">${d.status || '—'}</span></div>
+            <div class="doc-card-meta">${d.pages ? pagesLabel(d.pages) : ext.toUpperCase()}${d.origin_label ? ` · ${esc(d.origin_label)}` : ''} · <span class="badge ${d.status === 'indexed' ? 'badge-active' : 'badge-inactive'}" style="font-size:0.68rem">${d.status || '—'}</span></div>
+            ${docProjectsLine(d, { label: (d.projects || []).length === 1 ? 'Project' : 'Projects' })}
           </div>
           <div class="doc-card-actions">
             ${previewable ? `<button class="btn-table-action" data-action="preview-doc" data-id="${d.id}" data-name="${esc(d.name)}" title="Preview"><span class="material-icons-outlined">visibility</span></button>` : ''}
-            <button class="btn-table-action delete" data-action="delete-doc" data-id="${d.id}" title="Delete"><span class="material-icons-outlined">delete</span></button>
+            <button class="btn-table-action delete" data-requires="document.delete" data-action="delete-doc" data-id="${d.id}" title="Delete"><span class="material-icons-outlined">delete</span></button>
           </div>
         </div>`;
     }).join('')}</div>` : `<div class="empty-state"><span class="material-icons-outlined">folder_open</span><h3>No documents uploaded</h3><p>${getApiUrl() ? 'Upload documents to enable AI chat. Supports PDFs, images, audio, Excel, Word, and more.' : 'Connect backend to manage documents.'}</p></div>`}`;
@@ -1286,7 +1410,7 @@
             <div class="table-actions">
               <button class="btn-table-action" data-action="open-project" data-id="${p.id}" title="View"><span class="material-icons-outlined">open_in_new</span></button>
               <button class="btn-table-action" data-action="edit-project" data-id="${p.id}" title="Edit"><span class="material-icons-outlined">edit</span></button>
-              <button class="btn-table-action delete" data-action="delete-project" data-id="${p.id}" title="Delete"><span class="material-icons-outlined">delete</span></button>
+              ${isAccountAdmin() ? `<button class="btn-table-action delete" data-action="delete-project" data-id="${p.id}" title="Delete"><span class="material-icons-outlined">delete</span></button>` : ''}
             </div>
           </td>
         </tr>`).join('')
@@ -1390,7 +1514,7 @@
         <div class="proj-dash-name">${esc(p.name)}</div>
         <div class="proj-dash-actions">
           <button class="btn btn-ghost btn-sm" data-action="edit-project" data-id="${p.id}"><span class="material-icons-outlined">edit</span> Edit</button>
-          <button class="btn btn-ghost btn-sm" data-action="upload-project-sources" data-id="${p.id}"><span class="material-icons-outlined">upload_file</span> Upload Sources</button>
+          <button class="btn btn-ghost btn-sm" data-requires="document.upload" data-action="upload-project-sources" data-id="${p.id}"><span class="material-icons-outlined">upload_file</span> Upload</button>
           <button class="btn btn-ghost btn-sm" data-action="generate-report" data-id="${p.id}"><span class="material-icons-outlined">picture_as_pdf</span> Generate Doc</button>
           <button class="btn btn-ghost btn-sm" data-action="project-report" data-id="${p.id}"><span class="material-icons-outlined">description</span> Report</button>
           <span class="badge ${p.status === 'Active' ? 'badge-active' : 'badge-inactive'} badge-lg">${esc(p.status)}</span>
@@ -1427,7 +1551,9 @@
         <div class="detail-grid">
           ${field('NAME', p.name)}
           ${field('PROJECT CODE', p.project_code)}
-          ${field('PROJECT MANAGER', p.manager)}
+          ${field('PROJECT MANAGER', p.manager
+            ? esc(p.manager) + (p.manager_unlinked ? ' <span class="badge badge-inactive" title="Not one of this account\'s users. Edit the project to choose one.">not a user</span>' : '')
+            : '')}
           ${field('TYPE', p.type)}
           ${field('PROJECT STATUS', p.status)}
           ${''}
@@ -1458,8 +1584,9 @@
         <div class="tasks-section-header">
           <h3 class="section-sub-title">Project Documents</h3>
           <div class="tasks-section-actions">
-            <span class="total-count">${state.projectSources.length} source${state.projectSources.length === 1 ? '' : 's'}</span>
-            <button class="btn btn-primary btn-sm" data-action="upload-project-sources" data-id="${p.id}"><span class="material-icons-outlined">upload_file</span> Upload Source</button>
+            <span class="total-count">${state.projectSources.length} document${state.projectSources.length === 1 ? '' : 's'}</span>
+            <button class="btn btn-primary btn-sm" data-requires="document.upload" data-action="upload-project-sources" data-id="${p.id}"><span class="material-icons-outlined">upload_file</span> Upload</button>
+            <button class="btn btn-secondary btn-sm" data-requires="document.upload" data-action="link-project-docs" data-id="${p.id}"><span class="material-icons-outlined">add_link</span> Link existing</button>
             <button class="btn btn-ghost btn-sm" id="btnRefreshProjectSources" title="Refresh project documents"><span class="material-icons-outlined">refresh</span></button>
           </div>
         </div>
@@ -1553,6 +1680,7 @@
       state.rolesEditable = !!d.can_manage;
       state.myPermissions = d.my_permissions || [];
     } catch (e) { state.userRoles = []; state.rolesEditable = false; }
+    applyPermissionGates();
   }
 
   async function fetchPermissionCatalogue() {
@@ -1573,12 +1701,17 @@
     return state.myPermissions.includes(permission);
   }
 
-  /** Managing roles is Super Admin work and deliberately not a permission. */
-  function isSuperAdmin() {
-    const user = state.currentUser;
-    return !!user && (!!user.is_owner || user.role === 'Super Admin');
+  /** Hide what the signed-in person's role does not allow. The server refuses
+   *  it regardless; this only avoids offering a button that will say no.
+   *  style.display rather than the hidden attribute, which a button's own CSS
+   *  display would override. */
+  function applyPermissionGates(root = document) {
+    root.querySelectorAll('[data-requires]').forEach(el => {
+      el.style.display = can(el.dataset.requires) ? '' : 'none';
+    });
   }
 
+  /** Managing roles is Head (Super Admin) work and deliberately not a permission. */
   async function fetchCompany() {
     try {
       const r = await apiReq('/api/company');
@@ -1778,6 +1911,102 @@
     </table></div>`;
   }
 
+  /** The people a task on this project may be given to, cached per project. */
+  async function loadAssignees(projectId, { force = false } = {}) {
+    if (!projectId) return [];
+    if (!force && state.projectAssignees[projectId]) return state.projectAssignees[projectId];
+    try {
+      const res = await apiReq(`/api/projects/${projectId}/assignees`);
+      state.projectAssignees[projectId] = (await res.json()).assignees || [];
+    } catch (e) { state.projectAssignees[projectId] = []; }
+    return state.projectAssignees[projectId];
+  }
+
+  /** Options for an assignee select: the project's people, and nobody else.
+   *
+   * An older task may name someone by name only, or someone no longer on the
+   * project; that name is kept as the selected option, marked, so saving the
+   * form does not quietly unassign it.
+   */
+  function assigneeOptions(projectId, task) {
+    const people = state.projectAssignees[projectId];
+    const selectedId = task?.assignee_id || '';
+    const selectedName = task?.assignee || '';
+    if (!people) return `<option value="">Loading the project's people…</option>`;
+    let html = `<option value="">Unassigned</option>`;
+    html += people.map(p => `<option value="${esc(p.user_id)}" ${p.user_id === selectedId ? 'selected' : ''}>${esc(p.name || p.email)}</option>`).join('');
+    const known = people.some(p => p.user_id === selectedId);
+    if (selectedName && !known) {
+      html += `<option value="name:${esc(selectedName)}" selected>${esc(selectedName)} (not on this project)</option>`;
+    }
+    if (!people.length) html += `<option value="" disabled>No one is on this project yet — add people on its People tab</option>`;
+    return html;
+  }
+
+  /** Fill an assignee select once the project's people have loaded. */
+  async function hydrateAssigneeSelect(selectId, projectId, task) {
+    const select = document.getElementById(selectId);
+    if (!select) return;
+    select.innerHTML = assigneeOptions(projectId, task);
+    await loadAssignees(projectId, { force: true });
+    const again = document.getElementById(selectId);
+    if (again) again.innerHTML = assigneeOptions(projectId, task);
+  }
+
+  /** What an assignee select means, as the fields the task routes read. */
+  function assigneeFields(value) {
+    const chosen = String(value || '');
+    if (chosen.startsWith('name:')) return { assignee: chosen.slice(5) };   // unchanged legacy name
+    return { assignee_id: chosen, assignee: '' };
+  }
+
+  /** The earliest and latest a task of this project may be, as datetime-local values. */
+  function projectTaskWindow(projectId) {
+    const p = state.projects.find(x => x.id === projectId) || {};
+    const start = String(p.start_date || '').slice(0, 10);
+    const end = String(p.end_date || '').slice(0, 10);
+    return { start, end, min: start ? `${start}T00:00` : '', max: end ? `${end}T23:59`: '', name: p.name || 'the project' };
+  }
+
+  /** Hold a pair of task date pickers inside the project's dates. */
+  function boundTaskDateInputs(startId, endId, projectId) {
+    const w = projectTaskWindow(projectId);
+    [startId, endId].forEach(id => {
+      const input = document.getElementById(id);
+      if (!input) return;
+      if (w.min) input.min = w.min; else input.removeAttribute('min');
+      if (w.max) input.max = w.max; else input.removeAttribute('max');
+    });
+    const hint = document.getElementById(`${startId}Window`);
+    if (hint) hint.textContent = w.start || w.end
+      ? `Within ${w.name}: ${w.start || 'any start'} → ${w.end || 'no end date'}`
+      : '';
+    // The end can be no earlier than the start the person has just chosen.
+    const start = document.getElementById(startId);
+    const end = document.getElementById(endId);
+    if (start && end) {
+      const sync = () => { end.min = start.value || w.min || ''; if (!end.min) end.removeAttribute('min'); };
+      start.addEventListener('change', sync);
+      sync();
+    }
+  }
+
+  /** Why these task dates cannot be saved, or '' if they can. The server checks the same. */
+  function taskDatesProblem(body, projectId) {
+    const w = projectTaskWindow(projectId);
+    const start = body.start_time || '';
+    const end = body.end_time || '';
+    // Compare as local date-time text: a date alone means the start of its day.
+    const at = value => (value.length === 10 ? `${value}T00:00` : value.slice(0, 16));
+    if (start && end && at(end) < at(start)) return 'End time cannot be earlier than start time';
+    for (const [value, label] of [[start, 'Start time'], [end, 'End time']]) {
+      if (!value) continue;
+      if (w.min && at(value) < w.min) return `${label} is before ${w.name} starts on ${w.start}`;
+      if (w.max && at(value) > w.max) return `${label} is after ${w.name} ends on ${w.end}`;
+    }
+    return '';
+  }
+
   function taskOptionList(values, selected) {
     return values.map(v => `<option value="${esc(v)}" ${v === selected ? 'selected' : ''}>${esc(v)}</option>`).join('');
   }
@@ -1800,7 +2029,6 @@
   }
 
   function renderTaskDetail(task) {
-    const members = state.users.map(u => u.name).filter(Boolean);
     const workers = state.teamMembers.map(m => m.name).filter(Boolean);
     const trades = state.trades.map(t => t.name);
     const types = state.taskTypes.map(t => t.name);
@@ -1824,9 +2052,9 @@
           <div class="form-group"><label class="form-label">Task type</label><select class="form-input" id="tdType"><option value="">Task (workspace default)</option>${taskOptionList(types, task.task_type)}</select></div>
           <div class="form-group"><label class="form-label">Parent task</label><select class="form-input" id="tdParent">${parentTaskOptions(task)}</select></div>
           <div class="form-group"><label class="form-label">Trade</label><select class="form-input" id="tdTrade"><option value="">None</option>${taskOptionList(trades, task.trade)}</select></div>
-          <div class="form-group"><label class="form-label">Assignee</label><select class="form-input" id="tdAssignee"><option value="">Select assignee</option>${taskOptionList(members, task.assignee)}</select></div>
+          <div class="form-group"><label class="form-label" for="tdAssignee">Assignee</label><select class="form-input" id="tdAssignee">${assigneeOptions(task.project_id, task)}</select><div class="form-hint">Only people on this project.</div></div>
           <div class="form-group"><label class="form-label">On Site Field Worker</label><select class="form-input" id="tdWorker"><option value="">Select on site field worker</option>${taskOptionList(workers, task.field_worker)}</select></div>
-          <div class="form-group"><label class="form-label">Start Time</label><input type="datetime-local" class="form-input" id="tdStart" value="${esc(task.start_time || '')}"></div>
+          <div class="form-group"><label class="form-label" for="tdStart">Start Time</label><input type="datetime-local" class="form-input" id="tdStart" value="${esc(task.start_time || '')}"><div class="form-hint" id="tdStartWindow"></div></div>
           <div class="form-group"><label class="form-label">End Time</label><input type="datetime-local" class="form-input" id="tdEnd" value="${esc(task.end_time || '')}"></div>
           <div class="form-group"><label class="form-label">Priority</label><select class="form-input" id="tdPriority">${taskOptionList(TASK_PRIORITIES, task.priority || 'Normal')}</select></div>
           <div class="form-group"><label class="form-label">Status</label><select class="form-input" id="tdStatus">${taskOptionList(TASK_STATUSES, task.status)}</select></div>
@@ -1858,9 +2086,9 @@
         <div class="form-group"><label class="form-label">Task type</label><select class="form-input" id="ctType"><option value="">Task (workspace default)</option>${taskOptionList(state.taskTypes.map(t => t.name), '')}</select></div>
         <div class="form-group"><label class="form-label">Parent task</label><select class="form-input" id="ctParent"><option value="">None (root under project)</option>${siblings.map(t => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join('')}</select></div>
         <div class="form-group"><label class="form-label">Trade</label><select class="form-input" id="ctTrade"><option value="">None</option>${taskOptionList(state.trades.map(t => t.name), '')}</select></div>
-        <div class="form-group"><label class="form-label">Assignee</label><select class="form-input" id="ctAssignee"><option value="">Select assignee</option>${taskOptionList(state.users.map(u => u.name).filter(Boolean), '')}</select></div>
+        <div class="form-group"><label class="form-label" for="ctAssignee">Assignee</label><select class="form-input" id="ctAssignee">${assigneeOptions(projectId, null)}</select><div class="form-hint">Only people on the chosen project.</div></div>
         <div class="form-group"><label class="form-label">On Site Field Worker</label><select class="form-input" id="ctWorker"><option value="">Select on site field worker</option>${taskOptionList(state.teamMembers.map(m => m.name).filter(Boolean), '')}</select></div>
-        <div class="form-group"><label class="form-label">Start Time</label><input type="datetime-local" class="form-input" id="ctStart"></div>
+        <div class="form-group"><label class="form-label" for="ctStart">Start Time</label><input type="datetime-local" class="form-input" id="ctStart"><div class="form-hint" id="ctStartWindow"></div></div>
         <div class="form-group"><label class="form-label">End Time</label><input type="datetime-local" class="form-input" id="ctEnd"></div>
         <div class="form-group"><label class="form-label">Priority</label><select class="form-input" id="ctPriority">${taskOptionList(TASK_PRIORITIES, 'Normal')}</select></div>
         <div class="form-group"><label class="form-label">Status</label><select class="form-input" id="ctStatus">${taskOptionList(TASK_STATUSES, 'Open')}</select></div>
@@ -1870,6 +2098,8 @@
     DOM.btnSaveCrud.dataset.crudAction = 'create-task';
     DOM.btnSaveCrud.dataset.crudId = projectId;
     DOM.crudModal.classList.add('open');
+    hydrateAssigneeSelect('ctAssignee', projectId, null);
+    boundTaskDateInputs('ctStart', 'ctEnd', projectId);
 
     // Re-scoping the project changes which tasks can be a parent.
     const projectSelect = $('#ctProject');
@@ -1878,6 +2108,9 @@
       const options = board.tasks.filter(t => t.project_id === chosen);
       $('#ctParent').innerHTML = `<option value="">None (root under project)</option>${options.map(t => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join('')}`;
       DOM.btnSaveCrud.dataset.crudId = chosen;
+      // Another project has other people, and other dates.
+      hydrateAssigneeSelect('ctAssignee', chosen, null);
+      boundTaskDateInputs('ctStart', 'ctEnd', chosen);
     });
   }
 
@@ -1887,7 +2120,7 @@
       task_type: $('#ctType')?.value || '',
       parent_id: $('#ctParent')?.value || null,
       trade: $('#ctTrade')?.value || '',
-      assignee: $('#ctAssignee')?.value || '',
+      ...assigneeFields($('#ctAssignee')?.value),
       field_worker: $('#ctWorker')?.value || '',
       start_time: $('#ctStart')?.value || '',
       end_time: $('#ctEnd')?.value || '',
@@ -1901,6 +2134,8 @@
   async function submitCreateTask(projectId) {
     const body = readCreateTaskForm();
     if (!body.name) { showToast('Task title is required', 'warning'); return; }
+    const dateProblem = taskDatesProblem(body, projectId);
+    if (dateProblem) { showToast(dateProblem, 'warning', 6000); return; }
     try {
       const res = await apiReq(`/api/projects/${projectId}/tasks`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
@@ -1912,6 +2147,9 @@
       if (task.parent_id) board.expanded[task.parent_id] = true;
       closeCrudModal();
       await fetchBoardTasks();
+      // Created from a project's page, it belongs in that page's task list too.
+      if (projectId === state.activeProjectId) await fetchProjectTasks(projectId);
+      delete state.projectAssignees[projectId];
       renderPage();
       showToast('Task created', 'success');
     } catch (error) { showToast(error.message, 'error'); }
@@ -1925,7 +2163,7 @@
       task_type: $('#tdType')?.value || '',
       parent_id: $('#tdParent')?.value || null,
       trade: $('#tdTrade')?.value || '',
-      assignee: $('#tdAssignee')?.value || '',
+      ...assigneeFields($('#tdAssignee')?.value),
       field_worker: $('#tdWorker')?.value || '',
       start_time: $('#tdStart')?.value || '',
       end_time: $('#tdEnd')?.value || '',
@@ -1941,6 +2179,11 @@
     if (!task) return;
     const body = changes || readTaskDetailForm();
     if ('name' in body && !body.name) { showToast('Task title is required', 'warning'); return; }
+    // Only dates being changed are held to the project's; an older task saved
+    // before the rule can still have its other fields edited.
+    const moved = ['start_time', 'end_time'].some(f => f in body && String(body[f] || '') !== String(task[f] || ''));
+    const dateProblem = moved ? taskDatesProblem({ ...task, ...body }, task.project_id) : '';
+    if (dateProblem) { showToast(dateProblem, 'warning', 6000); return; }
     try {
       await apiReq(`/api/projects/${task.project_id}/tasks/${task.id}`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
@@ -1979,6 +2222,11 @@
 
   function bindTasksPageEvents() {
     const board = taskBoard();
+    const open = selectedTask();
+    if (open) {
+      hydrateAssigneeSelect('tdAssignee', open.project_id, open);
+      boundTaskDateInputs('tdStart', 'tdEnd', open.project_id);
+    }
 
     $$('[data-task-project]').forEach(tab => {
       if (tab.tagName !== 'BUTTON') return;
@@ -2224,19 +2472,24 @@
   function renderPeopleTab(project) {
     const data = projectTab().people;
     if (!data) return `<div class="empty-msg">Loading people…</div>`;
+    const sourceLabel = { 'Manager': 'Manager', 'Member': 'Member', 'Task assignee': 'Task assignee' };
     const rows = data.members.map(m => `<tr>
       <td><div class="people-cell"><span class="user-avatar-badge">${esc((m.name || m.email || '?').slice(0, 2))}</span>
         <div><div class="people-name">${esc(m.name || '—')}</div><div class="people-email">${esc(m.email)}</div></div></div></td>
+      <td><div class="people-sources">${(m.sources || []).map(s => `<span class="people-source source-${esc(s.toLowerCase().replace(/\s+/g, '-'))}">${esc(sourceLabel[s] || s)}${s === 'Task assignee' && m.task_count ? ` · ${m.task_count}` : ''}</span>`).join('')}</div>
+        ${m.project_role ? `<div class="people-email">${esc(m.project_role)}</div>` : ''}</td>
       <td>${m.role ? `<span class="badge ${roleBadgeClass(m.role)}">${esc(m.role)}</span>` : '—'}</td>
       <td>${esc(m.department || '—')}</td>
       <td>${m.added_at ? new Date(m.added_at).toLocaleDateString() : '—'}</td>
-      <td><div class="table-actions"><button class="btn-table-action" data-remove-member="${esc(m.user_id)}" title="Remove from project"><span class="material-icons-outlined">person_remove</span></button></div></td>
+      <td><div class="table-actions">${m.removable && can('project.people.manage')
+        ? `<button class="btn-table-action" data-remove-member="${esc(m.user_id)}" title="Remove from project" aria-label="Remove ${esc(m.name || m.email)} from the project"><span class="material-icons-outlined">person_remove</span></button>`
+        : ''}</div></td>
     </tr>`).join('');
 
     return `<div class="overview-section">
       <div class="tasks-section-header">
         <div><h3 class="section-sub-title">Project People</h3>
-          <div class="form-hint">${data.total} assigned · ${data.available.length} more available in this account</div></div>
+          <div class="form-hint">${data.total} on the project — its manager, the people added to it, and anyone assigned one of its tasks · ${data.available.length} more available in this account</div></div>
         <div class="tasks-section-actions">
           ${can('project.people.manage') ? `<button class="btn btn-primary btn-sm" id="btnAddProjectMembers" ${data.available.length ? '' : 'disabled'}>` : `<button class="btn btn-primary btn-sm" hidden>`}
             <span class="material-icons-outlined" style="font-size:18px">person_add</span> Add People</button>
@@ -2244,9 +2497,9 @@
         </div>
       </div>
       ${data.members.length ? `<div class="data-table-container"><table class="data-table">
-        <thead><tr><th>Person</th><th>Role</th><th>Department</th><th>Added</th><th></th></tr></thead>
+        <thead><tr><th>Person</th><th>On the project as</th><th>Role</th><th>Department</th><th>Added</th><th></th></tr></thead>
         <tbody>${rows}</tbody></table></div>`
-      : `<div class="empty-msg">No one is assigned to this project yet. Click <b>Add People</b> to assign account members.</div>`}
+      : `<div class="empty-msg">No one is on this project yet. Choose a manager by editing the project, or click <b>Add People</b>.</div>`}
       ${data.available.length ? '' : '<div class="form-hint" style="margin-top:10px">Everyone active in this account is already on this project. Add more people under <b>Company Settings → User</b>.</div>'}
     </div>`;
   }
@@ -2282,7 +2535,8 @@
       });
       closeCrudModal();
       await loadProjectTab('people', projectId, { force: true });
-      showToast(`Added ${ids.length} person${ids.length === 1 ? '' : 's'} to the project`, 'success');
+      delete state.projectAssignees[projectId];
+      showToast(`Added ${ids.length} ${ids.length === 1 ? 'person' : 'people'} to the project`, 'success');
     } catch (error) { showToast(error.message, 'error'); }
   }
 
@@ -2488,7 +2742,7 @@
           <div class="form-hint">Materials and services ordered for this project. Cancelled lines are excluded from committed spend.</div></div>
         <div class="tasks-section-actions">
           <span class="total-count">${data.count} item${data.count === 1 ? '' : 's'} · ${money(data.total)} committed</span>
-          <button class="btn btn-primary btn-sm" id="btnAddProcurement"><span class="material-icons-outlined" style="font-size:18px">add</span> Add Item</button>
+          <button class="btn btn-primary btn-sm" data-requires="procurement.manage" id="btnAddProcurement"><span class="material-icons-outlined" style="font-size:18px">add</span> Add Item</button>
           <button class="btn btn-ghost btn-sm" data-dash-refresh="procore" title="Refresh"><span class="material-icons-outlined">refresh</span></button>
         </div>
       </div>
@@ -2503,8 +2757,8 @@
           <td>${i.needed_by ? new Date(i.needed_by).toLocaleDateString() : '—'}</td>
           <td><span class="task-status-chip ${procurementStatusClass(i.status)}">${esc(i.status)}</span></td>
           <td><div class="table-actions">
-            <button class="btn-table-action" data-edit-procurement="${esc(i.id)}" title="Edit"><span class="material-icons-outlined">edit</span></button>
-            <button class="btn-table-action" data-delete-procurement="${esc(i.id)}" title="Delete"><span class="material-icons-outlined">delete</span></button>
+            <button class="btn-table-action" data-requires="procurement.manage" data-edit-procurement="${esc(i.id)}" title="Edit"><span class="material-icons-outlined">edit</span></button>
+            <button class="btn-table-action" data-requires="procurement.manage" data-delete-procurement="${esc(i.id)}" title="Delete"><span class="material-icons-outlined">delete</span></button>
           </div></td></tr>`).join('')}</tbody></table></div>
         <div class="cost-total-bar"><span>Committed spend</span><strong>${money(data.total)}</strong></div>`
       : `<div class="empty-msg">Nothing has been procured for this project yet. Click <b>Add Item</b> to start.</div>`}
@@ -2568,6 +2822,7 @@
   // ── Tab events ────────────────────────────────────────────────────────────
 
   function bindDashTabEvents(tab, project) {
+    applyPermissionGates();
     if (tab === STATS_TAB) { bindStatsEvents(project); return; }
     $$('[data-dash-refresh]').forEach(b => b.addEventListener('click', () =>
       loadProjectTab(b.dataset.dashRefresh, project.id, { force: true })));
@@ -2581,6 +2836,7 @@
         if (!confirm('Remove this person from the project? Their account is not affected.')) return;
         try {
           await apiReq(`/api/projects/${project.id}/members/${b.dataset.removeMember}`, { method: 'DELETE' });
+          delete state.projectAssignees[project.id];
           await loadProjectTab('people', project.id, { force: true });
           showToast('Removed from project', 'info');
         } catch (error) { showToast(error.message, 'error'); }
@@ -2998,11 +3254,33 @@
       <div class="form-group"><label class="form-label">Attendees (comma separated)</label>
         <input class="form-input" id="calEvAttendees" value="${esc((record.attendees || []).map(a => a.email).filter(Boolean).join(', '))}"></div>
       <div class="form-group"><label class="form-label">Description</label>
-        <textarea class="form-input" id="calEvDescription" rows="3">${esc(record.description || '')}</textarea></div>`;
+        <textarea class="form-input" id="calEvDescription" rows="3">${esc(record.description || '')}</textarea></div>
+      <div class="form-group" style="margin-top:4px">
+        <button type="button" class="btn btn-danger btn-sm" id="btnCalEvDelete">
+          <span class="material-icons-outlined" style="font-size:18px">event_busy</span> Cancel this event</button>
+      </div>`;
     DOM.btnSaveCrud.dataset.crudAction = 'update-calendar-event';
     DOM.btnSaveCrud.dataset.crudId = event.source;
     DOM.btnSaveCrud.dataset.crudExtra = `${event.accountId}|${event.eventId}`;
     DOM.crudModal.classList.add('open');
+    $('#btnCalEvDelete')?.addEventListener('click', () =>
+      deleteCalendarEvent(event.source, event.accountId, event.eventId, event.title));
+  }
+
+  /** Cancel an event on the connected calendar. Attendees are told by the
+   *  provider, so it asks first -- the same rule as every other outward action. */
+  async function deleteCalendarEvent(providerId, accountId, eventId, title) {
+    const cfg = providerConfig(providerId);
+    if (!confirm(`Cancel “${title}” in ${cfg.calendarLabel}? Anyone invited is told it was cancelled.`)) return;
+    try {
+      await apiReq(`${cfg.api}/calendar/events/${encodeURIComponent(eventId)}` +
+        `?account_id=${encodeURIComponent(accountId)}&confirm=true`, { method: 'DELETE' });
+      closeCrudModal();
+      await loadCalendar({ force: true });
+      showToast(`Cancelled in ${cfg.calendarLabel}`, 'success');
+    } catch (error) {
+      showToast(`Could not cancel the event: ${error.message}`, 'error', 7000);
+    }
   }
 
   /**
@@ -3422,6 +3700,11 @@
       config: null, accounts: [], accountId: '', tab: 'files', loading: false,
       files: [], messages: [], events: [],
       selectedFiles: new Set(), selectedMessages: new Set(),
+      // The folder path from the root, one {id, name} per level; a search looks
+      // across the whole drive instead. Picked files are remembered by name so
+      // the selection can be shown while browsing other folders.
+      folderStack: [], search: '', nextPageToken: '', filesLoaded: false,
+      selectedNames: new Map(),
       emailDraft: { to: '', cc: '', subject: '', body: '', instruction: '' },
       taskProjectId: ''
     };
@@ -3490,14 +3773,55 @@
     const slice = ws(providerId);
     const P = providerId;
     return `<div class="workspace-toolbar">
-      <div class="filter-group grow"><label class="filter-label">Search ${esc(cfg.filesLabel)}</label><input class="filter-input" id="${P}DriveSearch" placeholder="File name"></div>
+      <div class="filter-group grow"><label class="filter-label">Search ${esc(cfg.filesLabel)}</label><input class="filter-input" id="${P}DriveSearch" placeholder="File name" value="${esc(slice.search)}"></div>
       <div class="filter-group"><label class="filter-label">Index under project</label><select class="filter-input" id="${P}DriveProject">${providerProjectOptions()}</select></div>
       <button class="btn btn-secondary" id="btn${cap(P)}DriveRefresh"><span class="material-icons-outlined">search</span>Load files</button>
-      <button class="btn btn-primary" id="btn${cap(P)}DriveImport" ${slice.selectedFiles.size ? '' : 'disabled'}><span class="material-icons-outlined">library_add</span>Index selected (${slice.selectedFiles.size})</button>
+      <button class="btn btn-primary" data-requires="document.upload" id="btn${cap(P)}DriveImport" ${slice.selectedFiles.size ? '' : 'disabled'}><span class="material-icons-outlined">library_add</span>Index selected (${slice.selectedFiles.size})</button>
     </div>
-    <div class="data-table-container"><table class="data-table google-table"><thead><tr><th class="check-col"><input type="checkbox" id="${P}DriveAll"></th><th>Name</th><th>Type</th><th>Modified</th><th></th></tr></thead><tbody>
-      ${slice.files.length ? slice.files.map(file => `<tr><td>${file.is_folder ? '' : `<input type="checkbox" class="provider-file-check" data-provider="${P}" value="${esc(file.id)}" ${slice.selectedFiles.has(file.id) ? 'checked' : ''}>`}</td><td><div class="google-item-title"><span class="material-icons-outlined">${file.is_folder ? 'folder' : 'description'}</span>${esc(file.name)}</div></td><td>${esc(String(file.mimeType || '').replace('application/vnd.google-apps.', 'Google ').replace('application/vnd.openxmlformats-officedocument.', 'Office '))}</td><td>${file.modifiedTime ? new Date(file.modifiedTime).toLocaleString() : '—'}</td><td>${file.webViewLink ? `<a class="btn-table-action" href="${esc(file.webViewLink)}" target="_blank" rel="noopener"><span class="material-icons-outlined">open_in_new</span></a>` : ''}</td></tr>`).join('') : `<tr><td colspan="5" class="td-empty">Click Load files to see documents in this ${esc(cfg.filesLabel)}.</td></tr>`}
-    </tbody></table></div>`;
+    ${renderDriveTrail(providerId)}
+    <div class="data-table-container"><table class="data-table google-table"><thead><tr><th class="check-col"><input type="checkbox" id="${P}DriveAll" ${visibleFiles(slice).length && visibleFiles(slice).every(f => slice.selectedFiles.has(f.id)) ? 'checked' : ''} title="Select every file in this folder"></th><th>Name</th><th>Type</th><th>Modified</th><th></th></tr></thead><tbody>
+      ${slice.files.length ? slice.files.map(file => `<tr><td>${file.is_folder ? '' : `<input type="checkbox" class="provider-file-check" data-provider="${P}" value="${esc(file.id)}" data-name="${esc(file.name)}" ${slice.selectedFiles.has(file.id) ? 'checked' : ''}>`}</td><td><div class="google-item-title"><span class="material-icons-outlined">${file.is_folder ? 'folder' : 'description'}</span>${file.is_folder ? `<button class="drive-folder" data-provider="${P}" data-drive-folder="${esc(file.id)}" data-name="${esc(file.name)}" title="Open folder">${esc(file.name)}</button>` : esc(file.name)}</div></td><td>${esc(String(file.mimeType || '').replace('application/vnd.google-apps.', 'Google ').replace('application/vnd.openxmlformats-officedocument.', 'Office '))}</td><td>${file.modifiedTime ? new Date(file.modifiedTime).toLocaleString() : '—'}</td><td>${file.webViewLink ? `<a class="btn-table-action" href="${esc(file.webViewLink)}" target="_blank" rel="noopener"><span class="material-icons-outlined">open_in_new</span></a>` : ''}</td></tr>`).join('') : `<tr><td colspan="5" class="td-empty">${slice.filesLoaded ? (slice.search ? 'Nothing matches that name.' : 'This folder is empty.') : `Click Load files to see documents in this ${esc(cfg.filesLabel)}.`}</td></tr>`}
+    </tbody></table></div>
+    ${slice.nextPageToken ? `<div class="drive-more"><button class="btn btn-ghost btn-sm" data-provider="${P}" data-drive-more>Load more</button></div>` : ''}`;
+  }
+
+  /** Files (not folders) on screen: what select-all acts on. */
+  function visibleFiles(slice) { return slice.files.filter(file => !file.is_folder); }
+
+  /** Where in the drive this is, how to get back up, and what is picked so far. */
+  function renderDriveTrail(providerId) {
+    const cfg = providerConfig(providerId);
+    const slice = ws(providerId);
+    const P = providerId;
+    const crumbs = [{ id: '', name: cfg.filesLabel }, ...slice.folderStack];
+    const path = slice.search
+      ? `<span class="material-icons-outlined">search</span>Results for “${esc(slice.search)}” across ${esc(cfg.filesLabel)}
+         <button class="drive-crumb" data-provider="${P}" data-drive-crumb="${slice.folderStack.length}">Back to the folder</button>`
+      : crumbs.map((crumb, index) => index === crumbs.length - 1
+          ? `<strong>${esc(crumb.name)}</strong>`
+          : `<button class="drive-crumb" data-provider="${P}" data-drive-crumb="${index}">${esc(crumb.name)}</button>`)
+          .join('<span class="material-icons-outlined drive-sep">chevron_right</span>');
+    const names = [...slice.selectedNames.values()];
+    const picked = slice.selectedFiles.size ? `<div class="drive-picked">
+        <span class="material-icons-outlined">check_box</span>
+        <span><strong>${slice.selectedFiles.size} selected</strong>${names.length ? ` — ${esc(names.slice(0, 3).join(', '))}${names.length > 3 ? ` and ${names.length - 3} more` : ''}` : ''}</span>
+        <button class="drive-crumb" data-provider="${P}" data-drive-clear>Clear selection</button></div>` : '';
+    return `<div class="drive-trail">${path}</div>${picked}`;
+  }
+
+  /** Load the current folder -- or the search -- and optionally the next page. */
+  async function loadProviderFiles(providerId, { append = false } = {}) {
+    const cfg = providerConfig(providerId);
+    const slice = ws(providerId);
+    const params = new URLSearchParams({ account_id: slice.accountId, q: slice.search || '' });
+    const folder = slice.folderStack.length ? slice.folderStack[slice.folderStack.length - 1].id : '';
+    if (folder && !slice.search) params.set('folder_id', folder);
+    if (append && slice.nextPageToken) params.set('page_token', slice.nextPageToken);
+    const response = await apiReq(`${cfg.api}/drive/files?${params}`);
+    const data = await response.json();
+    slice.files = append ? slice.files.concat(data.files || []) : (data.files || []);
+    slice.nextPageToken = data.next_page_token || '';
+    slice.filesLoaded = true;
   }
 
   function renderProviderMailTab(providerId) {
@@ -3510,7 +3834,7 @@
         <div class="filter-group grow"><label class="filter-label">Search ${esc(cfg.mailLabel)}</label><input class="filter-input" id="${P}MailSearch" placeholder="${esc(cfg.mailSearchHint)}"></div>
         <div class="filter-group"><label class="filter-label">Index under project</label><select class="filter-input" id="${P}MailProject">${providerProjectOptions()}</select></div>
         <button class="btn btn-secondary" id="btn${cap(P)}MailRefresh">Load emails</button>
-        <button class="btn btn-primary" id="btn${cap(P)}MailImport" ${slice.selectedMessages.size ? '' : 'disabled'}>Index selected (${slice.selectedMessages.size})</button>
+        <button class="btn btn-primary" data-requires="document.upload" id="btn${cap(P)}MailImport" ${slice.selectedMessages.size ? '' : 'disabled'}>Index selected (${slice.selectedMessages.size})</button>
       </div>
       <div class="data-table-container"><table class="data-table google-table"><thead><tr><th class="check-col"><input type="checkbox" id="${P}MailAll"></th><th>Subject</th><th>From</th><th>Date</th></tr></thead><tbody>
         ${slice.messages.length ? slice.messages.map(message => `<tr><td><input type="checkbox" class="provider-message-check" data-provider="${P}" value="${esc(message.id)}" ${slice.selectedMessages.has(message.id) ? 'checked' : ''}></td><td><strong>${esc(message.subject)}</strong><div class="google-snippet">${esc(message.snippet || '')}</div></td><td>${esc(message.from)}</td><td>${esc(message.date)}</td></tr>`).join('') : '<tr><td colspan="4" class="td-empty">Click Load emails to see messages. Only checked messages are indexed.</td></tr>'}
@@ -3655,25 +3979,113 @@
     return providerId === 'microsoft' ? connectMicrosoftAccount() : connectGoogleAccount();
   }
 
+  function pagesLabel(count) {
+    const n = Number(count || 0);
+    return `${n} page${n === 1 ? '' : 's'}`;
+  }
+
+  /** Chips naming the projects a document belongs to, or saying it has none. */
+  /** Every project a document belongs to, named in full: "Project A, Project B". */
+  function docProjectsLine(doc, { except = '', label = 'Projects' } = {}) {
+    const all = doc.projects || [];
+    if (!all.length) return '<div class="doc-projects"><span class="doc-chip doc-chip-orphan" title="Linked to no project">Unassigned</span></div>';
+    const names = all.filter(p => p.id !== except).map(p => p.name).filter(Boolean);
+    if (!names.length) return '';
+    return `<div class="doc-projects" title="${esc(names.join(', '))}"><span class="doc-projects-label">${esc(label)}:</span> ${esc(names.join(', '))}</div>`;
+  }
+
+  function docProjectChips(doc, { except = '' } = {}) {
+    const projects = (doc.projects || []).filter(p => p.id !== except);
+    if (!(doc.projects || []).length) return '<span class="doc-chip doc-chip-orphan" title="Linked to no project">Unassigned</span>';
+    return projects.map(p => `<span class="doc-chip" title="Also on ${esc(p.name)}">${esc(p.name)}</span>`).join('');
+  }
+
   function renderProjectSourcesSection() {
     if (!state.projectSources.length) {
-      return `<div class="empty-msg">No PDF sources are linked to this project yet. Click <b>Upload Source</b> to add one.</div>`;
+      return `<div class="empty-msg">No documents are linked to this project yet. <b>Upload</b> a new one, or <b>Link existing</b> documents from Documents, other projects, or the chat.</div>`;
     }
+    const pid = state.activeProjectId;
     return `<div class="doc-cards-grid">${state.projectSources.map(d => {
       const ext = getExt(d.name || 'source.pdf');
-      const sourceType = (d.source_type || 'reference').replaceAll('_', ' ');
+      const sourceType = d.source_type ? d.source_type.replaceAll('_', ' ') : '';
+      const previewable = isImage(ext) || isAudio(ext) || isVideo(ext) || isPdf(ext) || isText(ext);
+      const shared = (d.projects || []).filter(p => p.id !== pid);
       return `<div class="doc-card" data-doc-id="${d.id}" data-name="${esc(d.name)}">
         <div class="doc-card-icon ${getFileClass(ext)}">${getFileIcon(ext)}</div>
         <div class="doc-card-info">
           <div class="doc-card-name">${esc(d.name)}</div>
-          <div class="doc-card-meta">${d.pages || 0} pages Â· ${esc(sourceType)} Â· <span class="badge ${d.status === 'indexed' ? 'badge-active' : 'badge-inactive'}" style="font-size:0.68rem">${esc(d.status || 'indexed')}</span></div>
+          <div class="doc-card-meta">${pagesLabel(d.pages)}${sourceType ? ` · ${esc(sourceType)}` : ''}${d.origin_label && d.origin !== 'project' ? ` · from ${esc(d.origin_label)}` : ''} · <span class="badge ${d.status === 'indexed' ? 'badge-active' : 'badge-inactive'}" style="font-size:0.68rem">${esc(d.status || 'indexed')}</span></div>
+          ${shared.length ? docProjectsLine(d, { except: pid, label: 'Also on' }) : ''}
         </div>
         <div class="doc-card-actions">
-          <button class="btn-table-action" data-action="preview-doc" data-id="${d.id}" data-name="${esc(d.name)}" title="Preview"><span class="material-icons-outlined">visibility</span></button>
-          <button class="btn-table-action delete" data-action="delete-doc" data-id="${d.id}" title="Delete"><span class="material-icons-outlined">delete</span></button>
+          ${previewable ? `<button class="btn-table-action" data-action="preview-doc" data-id="${d.id}" data-name="${esc(d.name)}" title="Preview"><span class="material-icons-outlined">visibility</span></button>` : ''}
+          <button class="btn-table-action delete" data-requires="document.upload" data-action="unlink-project-doc" data-id="${d.id}" data-name="${esc(d.name)}" title="Remove from this project (the document is kept)" aria-label="Remove ${esc(d.name)} from this project"><span class="material-icons-outlined">link_off</span></button>
         </div>
       </div>`;
     }).join('')}</div>`;
+  }
+
+  /** Link documents the account already holds to a project: no copy, no re-index. */
+  async function openLinkDocumentsModal(projectId) {
+    const project = state.projects.find(p => p.id === projectId);
+    DOM.crudModalTitle.textContent = 'Link Existing Documents';
+    DOM.crudModalBody.innerHTML = '<div class="empty-msg">Loading documents…</div>';
+    DOM.btnSaveCrud.dataset.crudAction = 'save-link-project-docs';
+    DOM.btnSaveCrud.dataset.crudId = projectId;
+    DOM.crudModal.classList.add('open');
+    let docs = [];
+    try {
+      docs = (await (await apiReq(`/api/projects/${projectId}/linkable-documents`)).json()).documents || [];
+    } catch (error) {
+      DOM.crudModalBody.innerHTML = `<div class="connection-banner warning"><span class="material-icons-outlined">warning</span><span>${esc(error.message)}</span></div>`;
+      return;
+    }
+    const origins = [...new Set(docs.map(d => d.origin_label).filter(Boolean))];
+    DOM.crudModalBody.innerHTML = docs.length ? `
+      <div class="form-hint" style="margin-bottom:10px">Choose documents to add to <b>${esc(project?.name || 'this project')}</b>. They are linked, not copied: each stays one document, on every project it is linked to.</div>
+      <div class="link-picker-filters">
+        <input class="form-input" id="linkDocSearch" placeholder="Search by name" aria-label="Search documents">
+        <select class="form-input" id="linkDocOrigin" aria-label="Where the document came from">
+          <option value="">From anywhere</option>
+          <option value="__orphans">Unassigned only</option>
+          ${origins.map(o => `<option value="${esc(o)}">${esc(o)}</option>`).join('')}
+        </select>
+      </div>
+      <div class="member-picker link-picker" id="linkDocList">${docs.map(d => `
+        <label class="member-option" data-name="${esc(String(d.name || '').toLowerCase())}" data-origin="${esc(d.origin_label || '')}" data-orphan="${(d.projects || []).length ? '0' : '1'}">
+          <input type="checkbox" class="link-doc-check" value="${esc(d.id)}">
+          <span class="doc-icon ${getFileClass(getExt(d.name))}">${getFileIcon(getExt(d.name))}</span>
+          <span><span class="people-name">${esc(d.name)}</span>
+            <span class="people-email">${esc(d.origin_label || 'Documents')} · ${pagesLabel(d.pages)}</span>
+            ${docProjectsLine(d, { label: (d.projects || []).length === 1 ? 'Project' : 'Projects' })}</span>
+        </label>`).join('')}</div>`
+      : '<div class="empty-msg">Every document in this account is already linked to this project.</div>';
+    const filter = () => {
+      const text = String($('#linkDocSearch')?.value || '').trim().toLowerCase();
+      const origin = $('#linkDocOrigin')?.value || '';
+      $$('#linkDocList .member-option').forEach(row => {
+        const show = (!text || row.dataset.name.includes(text))
+          && (!origin || (origin === '__orphans' ? row.dataset.orphan === '1' : row.dataset.origin === origin));
+        row.hidden = !show;
+      });
+    };
+    $('#linkDocSearch')?.addEventListener('input', filter);
+    $('#linkDocOrigin')?.addEventListener('change', filter);
+  }
+
+  async function submitLinkDocuments(projectId) {
+    const ids = [...document.querySelectorAll('.link-doc-check:checked')].map(box => box.value);
+    if (!ids.length) { showToast('Choose at least one document', 'warning'); return; }
+    try {
+      const res = await apiReq(`/api/projects/${projectId}/source-documents/link`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ doc_ids: ids })
+      });
+      const data = await res.json();
+      closeCrudModal();
+      await Promise.all([fetchProjectSources(projectId), fetchDocuments()]);
+      renderPage();
+      showToast(`Linked ${data.linked.length} document${data.linked.length === 1 ? '' : 's'} to the project`, 'success');
+    } catch (error) { showToast(error.message, 'error'); }
   }
 
   function renderProjectTasksSection() {
@@ -3702,9 +4114,33 @@
    * sentence, say -- and `missing` names the fields that still have to be
    * filled, so the form can point at them instead of leaving them to be found.
    */
+  /** The account's active users, for a picker, sorted by name. */
+  function activeUsers() {
+    return (state.users || [])
+      .filter(u => String(u.status || 'Active').toLowerCase() === 'active')
+      .sort((a, b) => String(a.name || a.email).localeCompare(String(b.name || b.email)));
+  }
+
+  /** The user a project form should preselect: its manager, or a name the chat gave. */
+  function managerChoice(p) {
+    if (p?.manager_id) return p.manager_id;
+    const named = String(p?.manager || '').trim().toLowerCase();
+    if (!named) return '';
+    const matches = activeUsers().filter(u =>
+      String(u.name || '').trim().toLowerCase() === named || String(u.email || '').toLowerCase() === named);
+    return matches.length === 1 ? matches[0].id : '';
+  }
+
   function openProjectModal(pid = null, seed = null, missing = []) {
     const p = pid ? state.projects.find(x => x.id === pid) : seed;
     const title = pid ? 'Edit Project' : 'New Project';
+    const chosenManager = managerChoice(p);
+    const users = activeUsers();
+    // A manager whose account was deactivated is still shown, so the form does
+    // not silently hand the project to whoever sorts first.
+    const current = pid && p?.manager_id && !users.some(u => u.id === p.manager_id)
+      ? (state.users || []).find(u => u.id === p.manager_id) : null;
+    const unlinked = p?.manager && !chosenManager && !current;
     DOM.crudModalTitle.textContent = title;
     DOM.crudModalBody.innerHTML = `
       <div class="form-grid-2">
@@ -3717,8 +4153,14 @@
           <input class="form-input" id="projFCode" value="${esc(p?.project_code || '')}" placeholder="e.g. PPWV">
         </div>
         <div class="form-group">
-          <label class="form-label">Project Manager</label>
-          <input class="form-input" id="projFMgr" value="${esc(p?.manager || '')}" placeholder="Manager name">
+          <label class="form-label required" for="projFMgr">Project Manager</label>
+          <select class="form-input" id="projFMgr">
+            <option value="">— Choose a user —</option>
+            ${users.map(u => `<option value="${esc(u.id)}" ${u.id === chosenManager ? 'selected' : ''}>${esc(u.name || u.email)}${u.name && u.email ? ` · ${esc(u.email)}` : ''}</option>`).join('')}
+            ${current ? `<option value="${esc(current.id)}" selected>${esc(current.name || current.email)} (inactive)</option>` : ''}
+          </select>
+          ${unlinked ? `<div class="form-hint">“${esc(p.manager)}” is not one of this account's users. Choose the manager from the list.</div>` : ''}
+          ${users.length ? '' : '<div class="form-hint">Add users under <b>Company Settings → User</b> first.</div>'}
         </div>
         <div class="form-group">
           <label class="form-label">Type</label>
@@ -3734,7 +4176,12 @@
             ${PROJECT_STATUSES.map(s => `<option value="${s}" ${(p?.status || 'Active') === s ? 'selected' : ''}>${s}</option>`).join('')}
           </select>
         </div>
-        <div class="form-group"></div>
+        <div class="form-group">
+          <label class="form-label">Currency</label>
+          <select class="form-input" id="projFCurrency">
+            ${Object.keys(CURRENCY_SYMBOLS).map(code => `<option value="${code}" ${String(p?.currency || 'USD').toUpperCase() === code ? 'selected' : ''}>${code} (${CURRENCY_SYMBOLS[code].trim()})</option>`).join('')}
+          </select>
+        </div>
         <div class="form-group">
           <label class="form-label">Start Date</label>
           <input type="date" class="form-input" id="projFStart" value="${esc(p?.start_date || '')}">
@@ -3748,6 +4195,16 @@
         <label class="form-label">Description</label>
         <textarea class="form-input" id="projFDesc" rows="3" placeholder="Project description">${esc(p?.description || '')}</textarea>
       </div>
+      ${pid ? '' : `<div class="form-group">
+        <span class="form-label">Project Members</span>
+        <div class="form-hint" style="margin-bottom:6px">People to add to the project now. The manager is on it already; you can add more later on the <b>People</b> tab.</div>
+        <div class="member-picker" id="projFMembers">${users.map(u => `
+          <label class="member-option">
+            <input type="checkbox" class="proj-member-check" value="${esc(u.id)}">
+            <span class="user-avatar-badge">${esc((u.name || u.email || '?').slice(0, 2))}</span>
+            <span><span class="people-name">${esc(u.name || u.email)}</span><span class="people-email">${esc(u.email || '')}${u.role ? ' · ' + esc(u.role) : ''}</span></span>
+          </label>`).join('') || '<div class="empty-msg">No other users yet.</div>'}</div>
+      </div>`}
       <p class="section-sub-title" style="margin:1rem 0 .5rem">Address</p>
       <div class="form-grid-2">
         <div class="form-group">
@@ -3778,6 +4235,23 @@
     DOM.btnSaveCrud.dataset.crudAction = pid ? 'save-edit-project' : 'save-new-project';
     DOM.btnSaveCrud.dataset.crudId = pid || '';
     DOM.crudModal.classList.add('open');
+    // The manager is on the project by being its manager; ticking them as a
+    // member as well would say nothing new.
+    const syncManagerTick = () => {
+      const manager = $('#projFMgr')?.value;
+      $$('.proj-member-check').forEach(box => {
+        const isManager = box.value === manager;
+        box.disabled = isManager;
+        if (isManager) box.checked = false;
+        box.closest('.member-option')?.classList.toggle('is-manager', isManager);
+      });
+    };
+    $('#projFMgr')?.addEventListener('change', syncManagerTick);
+    syncManagerTick();
+    // A project cannot end before it starts.
+    const syncEnd = () => { const s = $('#projFStart')?.value; const e = $('#projFEnd'); if (e) e.min = s || ''; };
+    $('#projFStart')?.addEventListener('change', syncEnd);
+    syncEnd();
     markMissingFields({ name: 'projFName', project_code: 'projFCode', manager: 'projFMgr',
                         type: 'projFType', status: 'projFStatus', start_date: 'projFStart',
                         end_date: 'projFEnd', description: 'projFDesc' }, missing);
@@ -3822,6 +4296,14 @@
         <input class="form-input" id="docGenTitle" placeholder="Auto-generated when blank">
       </div>
       <div class="form-group">
+        <label class="form-label" for="docGenLanguage">Language</label>
+        <select class="form-input" id="docGenLanguage">
+          <option value="English" selected>English</option>
+          <option value="Bangla">বাংলা (Bangla)</option>
+        </select>
+        <div class="form-hint">The whole document is written in this language; Bangla sources are translated when English is chosen.</div>
+      </div>
+      <div class="form-group">
         <label class="form-label">Additional Instructions</label>
         <textarea class="form-input" id="docGenInstructions" rows="4" placeholder="Example: Focus on revised deadlines and commercial allowances"></textarea>
       </div>
@@ -3838,15 +4320,8 @@
 
   async function downloadGeneratedDocument(metadata) {
     const response = await apiReq(metadata.download_url);
-    const blob = await response.blob();
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `${(metadata.title || 'BuildMarshal_Document').replace(/[^a-z0-9._-]+/gi, '_')}.pdf`;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
+    await saveResponseAs(response,
+      `${(metadata.title || 'BuildMarshal_Document').replace(/[^a-z0-9._-]+/gi, '_')}.pdf`);
   }
 
   // ═══ Authentication & Account ═══
@@ -3884,6 +4359,7 @@
     state.trades = [];
     state.vendors = [];
     state.teamMembers = [];
+    state.feedbackStats = { data: null, loading: false, error: '' };
     state.users = [];
     state.projects = [];
     state.projectTasks = [];
@@ -3985,6 +4461,12 @@
       account: payload.account
     });
     hideAuthGate();
+    // ?signin / ?signup only chose the screen; once signed in they mean nothing.
+    try {
+      if (window.location.search) {
+        window.history.replaceState(null, '', window.location.pathname + window.location.hash);
+      }
+    } catch (e) { }
     renderUserProfileHeader();
     await loadConversations();
     renderChatMessages();
@@ -4001,19 +4483,54 @@
     startNotificationPolling();
   }
 
+  /** The sign-in tab the address asked for (?signin / ?signup), or ''. */
+  function requestedAuthMode() {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      if (params.has('signup')) return 'signup';
+      if (params.has('signin')) return 'signin';
+    } catch (e) { }
+    return '';
+  }
+
   async function restoreSession() {
     const stored = readStoredSession();
-    if (!stored) { showAuthGate('signin'); return; }
+    const asked = requestedAuthMode();
+    if (!stored) { showAuthGate(asked || 'signin'); return; }
     // Trust the stored token only as far as the backend confirms it.
     state.session = { token: stored.token };
+    let me;
     try {
       const res = await apiReq('/api/auth/me', { skipAuthRedirect: true });
-      await applySession({ ...(await res.json()), token: stored.token });
+      me = await res.json();
     } catch (e) {
-      clearAccountState();
-      writeStoredSession(null);
-      renderUserProfileHeader();
+      state.session = null;
+      if (e && e.status === 401) {
+        // Refused: this visitor is signed out. Unless they asked for the
+        // sign-in screen, a signed-out visit to the app is the homepage.
+        clearAccountState();
+        writeStoredSession(null);
+        renderUserProfileHeader();
+        if (!asked) { window.location.replace('home.html'); return; }
+        showAuthGate(asked);
+        return;
+      }
+      // Unreachable is not refused. A backend that is restarting says nothing
+      // about the token, and throwing it away signed people out every time the
+      // server blinked -- so it is kept, and a reload picks the session back up.
       showAuthGate('signin');
+      setAuthError(DOM.signInError,
+        `Cannot reach the backend at ${getApiUrl() || '(no URL set)'}: ${e.message}. ` +
+        'Your session is kept — reload once the backend is running.');
+      return;
+    }
+    // The session is confirmed. Something failing while the workspace loads is
+    // reported, not treated as a sign-out: the person is still signed in.
+    try {
+      await applySession({ ...me, token: stored.token });
+    } catch (e) {
+      console.error('Loading the workspace failed', e);
+      showToast(`Some workspace data did not load: ${e.message}`, 'error', 8000);
     }
   }
 
@@ -4355,7 +4872,7 @@
   // Mirrors ACCOUNT_ROLES in backend/accounts.py. Administration is a
   // system-level role; everything else describes what a person does.
   // Only these two exist without being created; see the User Roles page.
-  const SYSTEM_ROLES = ['Super Admin', 'System Admin'];
+  const SYSTEM_ROLES = ['Head (Super Admin)', 'Head (System Admin)'];
 
   /** Every assignable role: the built-ins plus whatever this account created. */
   function assignableRoles() {
@@ -4375,7 +4892,7 @@
   function roleBadgeClass(role) {
     return {
       'Guest': 'badge-role-guest', 'User': 'badge-role-user',
-      'Super Admin': 'badge-role-super', 'System Admin': 'badge-role-system',
+      'Head (Super Admin)': 'badge-role-super', 'Head (System Admin)': 'badge-role-system',
       'Project Manager': 'badge-role-admin', 'Site Supervisor': 'badge-role-admin',
       'HR': 'badge-role-blue', 'Sales Representative': 'badge-role-blue',
       'Accountant': 'badge-role-blue', 'Procurement Officer': 'badge-role-blue',
@@ -4737,11 +5254,18 @@
 
   // ═══ Page Events ═══
   function bindPageEvents() {
+    applyPermissionGates();
     $$('[data-nav]').forEach(el => el.addEventListener('click', e => { e.preventDefault(); navigateTo(el.dataset.nav); }));
     $$('[data-action]').forEach(el => el.addEventListener('click', handleAction));
+    $('#btnRefreshFeedback')?.addEventListener('click', () => { state.feedbackStats.error = ''; loadFeedbackStats(); });
     const btnCT = $('#btnCreateTrade'); if (btnCT) btnCT.addEventListener('click', () => openCrudModal('trade'));
     const btnCV = $('#btnCreateVendor'); if (btnCV) btnCV.addEventListener('click', () => openCrudModal('vendor'));
     const btnUD = $('#btnUploadDocs'); if (btnUD) btnUD.addEventListener('click', () => openUploadPanel(null));
+    const docProject = $('#docFilterProject');
+    if (docProject) docProject.addEventListener('change', () => {
+      state.docFilter = docProject.value ? { scope: 'project', projectId: docProject.value } : { scope: 'all', projectId: '' };
+      renderPage();
+    });
 
     // Company Settings
     $('#btnCompanyEdit')?.addEventListener('click', () => { state._companyEditing = true; renderPage(); });
@@ -4913,6 +5437,7 @@
         if (!content || !p) return;
         if (newTab === 'overview') {
           content.innerHTML = renderDashOverview(p, renderProjectTasksSection());
+          applyPermissionGates(content);
           // Re-bind controls created by swapping the tab content.
           content.querySelectorAll('[data-action]').forEach(el => el.addEventListener('click', handleAction));
           const btnOT = $('#btnOpenTasks'); if (btnOT) btnOT.addEventListener('click', () => openCreateTaskModal(state.activeProjectId));
@@ -5025,26 +5550,39 @@
 
     // ── Files ──
     const fileChecks = $$(`.provider-file-check[data-provider="${P}"]`);
-    fileChecks.forEach(check => check.addEventListener('change', () => {
-      check.checked ? slice.selectedFiles.add(check.value) : slice.selectedFiles.delete(check.value);
-      updateProviderSelectionButtons(P);
-    }));
+    const pick = (check, on) => {
+      check.checked = on;
+      if (on) { slice.selectedFiles.add(check.value); slice.selectedNames.set(check.value, check.dataset.name || check.value); }
+      else { slice.selectedFiles.delete(check.value); slice.selectedNames.delete(check.value); }
+    };
+    // A pick re-renders so the selection line and select-all stay truthful.
+    fileChecks.forEach(check => check.addEventListener('change', () => { pick(check, check.checked); renderPage(); }));
     const filesAll = $(`#${P}DriveAll`); if (filesAll) filesAll.addEventListener('change', () => {
-      fileChecks.forEach(check => {
-        check.checked = filesAll.checked;
-        check.checked ? slice.selectedFiles.add(check.value) : slice.selectedFiles.delete(check.value);
-      });
-      updateProviderSelectionButtons(P);
+      // Only the files in this folder: a selection made elsewhere is kept.
+      fileChecks.forEach(check => pick(check, filesAll.checked));
+      renderPage();
     });
+    const browse = async (change) => {
+      change();
+      try { await loadProviderFiles(P); } catch (error) { showToast(error.message, 'error'); }
+      renderPage();
+    };
     const filesRefresh = $(`#btn${C}DriveRefresh`); if (filesRefresh) filesRefresh.addEventListener('click', async () => {
-      try {
-        filesRefresh.disabled = true;
-        const query = $(`#${P}DriveSearch`)?.value.trim() || '';
-        const response = await apiReq(`${cfg.api}/drive/files?account_id=${encodeURIComponent(slice.accountId)}&q=${encodeURIComponent(query)}`);
-        slice.files = (await response.json()).files || [];
-        renderPage();
-      } catch (error) { showToast(error.message, 'error'); }
-      finally { filesRefresh.disabled = false; }
+      filesRefresh.disabled = true;
+      await browse(() => { slice.search = $(`#${P}DriveSearch`)?.value.trim() || ''; });
+    });
+    $(`#${P}DriveSearch`)?.addEventListener('keydown', event => { if (event.key === 'Enter') filesRefresh?.click(); });
+    $$(`[data-drive-folder][data-provider="${P}"]`).forEach(button => button.addEventListener('click', () =>
+      browse(() => { slice.search = ''; slice.folderStack.push({ id: button.dataset.driveFolder, name: button.dataset.name }); })));
+    $$(`[data-drive-crumb][data-provider="${P}"]`).forEach(button => button.addEventListener('click', () =>
+      browse(() => { slice.search = ''; slice.folderStack = slice.folderStack.slice(0, Number(button.dataset.driveCrumb)); })));
+    $(`[data-drive-more][data-provider="${P}"]`)?.addEventListener('click', async event => {
+      event.currentTarget.disabled = true;
+      try { await loadProviderFiles(P, { append: true }); } catch (error) { showToast(error.message, 'error'); }
+      renderPage();
+    });
+    $(`[data-drive-clear][data-provider="${P}"]`)?.addEventListener('click', () => {
+      slice.selectedFiles.clear(); slice.selectedNames.clear(); renderPage();
     });
     const filesImport = $(`#btn${C}DriveImport`); if (filesImport) filesImport.addEventListener('click', async () => {
       const projectId = $(`#${P}DriveProject`)?.value || null;
@@ -5056,6 +5594,7 @@
         });
         const result = await response.json();
         slice.selectedFiles.clear();
+        slice.selectedNames.clear();
         await fetchDocuments();
         if (projectId) await fetchProjectSources(projectId);
         renderPage();
@@ -5182,6 +5721,9 @@
         const response = await apiReq(`${cfg.api}/calendar/events`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
         const created = await response.json();
         showToast(created.meet_link ? 'Calendar event created with a Meet link.' : 'Calendar event created.', 'success');
+        // The Calendar page was loaded at sign-in; without this it kept
+        // showing the calendar from before the event was added.
+        if (calendarState().loaded) loadCalendar({ force: true });
         calendarRefresh?.click();
       } catch (error) { showToast(error.message, 'error'); }
     });
@@ -5201,11 +5743,17 @@
       if (!confirm('Delete this vendor?')) return;
       try { await apiReq(`/api/vendors/${id}`, { method: 'DELETE' }); await fetchVendors(); renderPage(); showToast('Vendor deleted', 'info'); } catch (e) { showToast(e.message, 'error'); }
     }
-    else if (action === 'add-team') {
-      // Map card title → member category
-      const catMap = { 'Internal Team': 'internal', 'Subcontractors & Trades': 'contractor', 'Consultants & Designers': 'consultant', 'Vendors & Suppliers': 'vendor' };
-      const cat = catMap[btn.dataset.cat] || 'internal';
-      openCrudModal('team-member', null, cat);
+    else if (action === 'add-team') openCrudModal('team-member', null, btn.dataset.cat || 'internal');
+    else if (action === 'edit-team') openCrudModal('team-member', id);
+    else if (action === 'delete-team') {
+      const member = state.teamMembers.find(m => m.id === id);
+      if (!confirm(`Remove ${member ? member.name : 'this contact'} from the directory?`)) return;
+      try {
+        await apiReq(`/api/team-members/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        await fetchTeamMembers();
+        renderPage();
+        showToast('Contact removed', 'info');
+      } catch (e) { showToast(e.message, 'error'); }
     }
     else if (action === 'preview-doc') openDocPreview(id, btn.dataset.name);
     else if (action === 'delete-doc') {
@@ -5277,6 +5825,23 @@
     }
     else if (action === 'upload-project-sources') {
       openUploadPanel(id);
+    }
+    else if (action === 'link-project-docs') {
+      openLinkDocumentsModal(id);
+    }
+    else if (action === 'unlink-project-doc') {
+      const project = state.projects.find(p => p.id === state.activeProjectId);
+      if (!confirm(`Remove “${btn.dataset.name}” from ${project ? project.name : 'this project'}? The document is kept in Documents and on any other project it is linked to.`)) return;
+      try {
+        await apiReq(`/api/projects/${state.activeProjectId}/source-documents/${id}`, { method: 'DELETE' });
+        await Promise.all([fetchProjectSources(state.activeProjectId), fetchDocuments()]);
+        renderPage();
+        showToast('Removed from the project', 'info');
+      } catch (e) { showToast(e.message, 'error'); }
+    }
+    else if (action === 'doc-filter') {
+      state.docFilter = { scope: btn.dataset.scope || 'all', projectId: '' };
+      renderPage();
     }
     // Pagination
     else if (action === 'proj-page') {
@@ -5354,7 +5919,6 @@
   // ═══ Document Preview ═══
   async function openDocPreview(docId, name) {
     const ext = getExt(name);
-    const baseUrl = getApiUrl().replace(/\/$/, '');
     DOM.docPreviewTitle.textContent = name;
     // Open modal immediately so the user sees it right away
     DOM.docPreviewBody.innerHTML = '';
@@ -5391,14 +5955,25 @@
       const audioMime = { mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', m4a: 'audio/mp4', flac: 'audio/flac', aac: 'audio/aac', wma: 'audio/x-ms-wma', opus: 'audio/ogg; codecs=opus' };
       DOM.docPreviewBody.innerHTML = `<div class="preview-audio-container" >
         <div class="audio-visual"><span class="material-icons-outlined" style="font-size:64px;color:var(--brand-blue)">graphic_eq</span></div>
-        <audio controls preload="metadata" style="width:100%"><source data-authsrc="/api/pages/${encodeURIComponent(docId)}/1" type="${audioMime[ext] || 'audio/' + ext}">Your browser doesn't support audio.</audio>
+        <audio controls preload="metadata" style="width:100%"><source data-authsrc="/api/documents/${encodeURIComponent(docId)}/media" type="${audioMime[ext] || 'audio/' + ext}">Your browser doesn't support audio.</audio>
         <p class="preview-filename">${esc(name)}</p>
+        <div class="preview-transcript" id="previewTranscript"><p class="preview-hint">Loading transcript…</p></div>
       </div> `;
       hydrateAuthedMedia(DOM.docPreviewBody);
+      // The pages of a recording are its transcript -- or, when it could not
+      // be transcribed, a line saying why.  Either way, show what was indexed.
+      try {
+        const evidence = await (await apiReq(`/api/evidence/${encodeURIComponent(docId)}/1`)).json();
+        const box = document.getElementById('previewTranscript');
+        if (box) box.innerHTML = `<h4>Transcript</h4><p>${esc(evidence.text_content || 'No transcript.')}</p>`;
+      } catch (e) {
+        const box = document.getElementById('previewTranscript');
+        if (box) box.innerHTML = `<p class="preview-hint">Transcript unavailable: ${esc(e.message)}</p>`;
+      }
     }
     else if (isVideo(ext)) {
       const videoMime = { mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime', avi: 'video/x-msvideo', mkv: 'video/x-matroska' };
-      DOM.docPreviewBody.innerHTML = `<div class="preview-video-container" > <video controls preload="metadata" style="width:100%;max-height:60vh;border-radius:8px"><source data-authsrc="/api/pages/${encodeURIComponent(docId)}/1" type="${videoMime[ext] || 'video/' + ext}">Your browser doesn't support video.</video></div> `;
+      DOM.docPreviewBody.innerHTML = `<div class="preview-video-container" > <video controls preload="metadata" style="width:100%;max-height:60vh;border-radius:8px"><source data-authsrc="/api/documents/${encodeURIComponent(docId)}/media" type="${videoMime[ext] || 'video/' + ext}">Your browser doesn't support video.</video></div> `;
       hydrateAuthedMedia(DOM.docPreviewBody);
     }
     else if (isText(ext)) {
@@ -5493,7 +6068,6 @@
     else if (type === 'team-member') {
       const item = editId ? state.teamMembers.find(m => m.id === editId) : { name: '', email: '', department: '', category: defaultCat || 'internal', company: '', contactName: '' };
       if (!item) return;
-      const isVendorCat = (item.category === 'vendor');
       fields = `<div class="form-group" ><label class="form-label">Name</label><input class="form-input" id="crudName" value="${esc(item.name)}"></div>
         <div class="form-group"><label class="form-label">Email</label><input class="form-input" type="email" id="crudEmail" value="${esc(item.email || '')}"></div>
         <div class="form-group"><label class="form-label">Category</label><select class="form-input" id="crudCat"><option value="internal" ${item.category === 'internal' ? 'selected' : ''}>Internal Team</option><option value="contractor" ${item.category === 'contractor' ? 'selected' : ''}>Subcontractor</option><option value="consultant" ${item.category === 'consultant' ? 'selected' : ''}>Consultant</option><option value="vendor" ${item.category === 'vendor' ? 'selected' : ''}>Vendor / Supplier</option></select></div>
@@ -5575,7 +6149,10 @@
         schema: null, schemaLoading: false,
         instructions: '', pendingFiles: [], uploading: false, analyzing: false,
         plan: null, planLoading: false, result: null, committing: false,
-        commandBusy: false, commandLog: [], collapsed: {}, busyItem: ''
+        commandBusy: false, commandLog: [], collapsed: {}, busyItem: '',
+        // Review & complete lists every kind of record in its own section
+        // ('type'); 'project' draws each project with what hangs off it.
+        reviewView: 'type'
       };
     }
     return state.onboarding;
@@ -5944,7 +6521,29 @@
     return chips.filter(Boolean).join('');
   }
 
-  function renderOnboardingRow(item, depth = 0) {
+  /** Where a record sits in the draft: its project, parent task, and so on. */
+  function onboardingPath(item) {
+    const names = [];
+    const seen = new Set([item.id]);
+    let cursor = item;
+    // Up through the same-kind parent (a subtask's task), then the parent_ref
+    // (a task's project, a cost's task), as far as the draft goes.
+    while (cursor) {
+      const upId = cursor.parent_id || cursor.parent_ref;
+      const up = upId && !seen.has(upId) ? onboardingItem(upId) : null;
+      if (!up) break;
+      seen.add(up.id);
+      names.unshift(up.fields.name || kindLabel(up.kind));
+      cursor = up;
+    }
+    if (item.kind === 'user') {
+      const projects = (item.project_refs || []).map(ref => onboardingItem(ref)?.fields.name).filter(Boolean);
+      return projects.length ? `On ${projects.join(', ')}` : 'Not tied to a project';
+    }
+    return names.length ? `In ${names.join(' › ')}` : '';
+  }
+
+  function renderOnboardingRow(item, depth = 0, showPath = false) {
     const blocked = (item.blocked_by || []).length > 0;
     const blockedNames = (item.blocked_by || [])
       .map(id => onboardingItem(id)?.fields.name).filter(Boolean).join(', ');
@@ -5962,6 +6561,7 @@
           ${esc(name)}
           ${item.complete ? '' : '<span class="onb-flag">⚠ Incomplete</span>'}
         </div>
+        ${showPath && onboardingPath(item) ? `<div class="onb-row-where">${esc(onboardingPath(item))}</div>` : ''}
         <div class="onb-row-meta">${onboardingItemMeta(item)}</div>
         ${missing.length ? `<div class="onb-row-missing">
           Missing required field${missing.length === 1 ? '' : 's'}:
@@ -6019,6 +6619,13 @@
       ${people.length ? `<div class="onb-subhead" style="--onb-depth:1">People on this project</div>${people.map(user => renderOnboardingRow(user, 1)).join('')}` : ''}`;
   }
 
+  /** One record and, under it, its same-kind children (subtasks), for the By type view. */
+  function renderOnboardingKindTree(item, depth) {
+    const nested = entitySpec(item.kind)?.self_parent
+      ? onboardingItems(item.kind).filter(row => row.parent_id === item.id) : [];
+    return renderOnboardingRow(item, depth, true) + nested.map(row => renderOnboardingKindTree(row, depth + 1)).join('');
+  }
+
   function renderOnboardingGroup(kind) {
     const slice = onboarding();
     const spec = entitySpec(kind);
@@ -6030,7 +6637,13 @@
 
     let body = '';
     let heading = spec.plural;
-    if (kind === 'project') {
+    if (slice.reviewView !== 'project') {
+      // Every kind in its own section, whatever the schema defines: a record
+      // is never only reachable by opening something else. Subtasks sit under
+      // their task; everything else says where it belongs.
+      const roots = items.filter(item => !(spec.self_parent && item.parent_id && onboardingItem(item.parent_id)));
+      body = roots.map(item => renderOnboardingKindTree(item, 0)).join('');
+    } else if (kind === 'project') {
       body = items.map(renderOnboardingProjectTree).join('');
     } else if (spec.parent) {
       // Drawn inside their parent; only orphans need a section of their own.
@@ -6048,7 +6661,7 @@
     }
     if (!body) return '';
 
-    return `<section class="onb-group ${collapsed ? 'is-collapsed' : ''}">
+    return `<section class="onb-group ${collapsed ? 'is-collapsed' : ''}" id="onb-group-${esc(kind)}">
       <header class="onb-group-head">
         <button class="onb-group-toggle" data-onb-collapse="${kind}" aria-expanded="${!collapsed}">
           <span class="material-icons-outlined">${collapsed ? 'chevron_right' : 'expand_more'}</span>
@@ -6183,11 +6796,15 @@
     return `
       <div class="onb-summary-bar">
         ${kinds.filter(kind => summary.counts[kind]).map(kind => `
-          <div class="onb-summary-tile">
+          <button class="onb-summary-tile" data-onb-jump="${esc(kind)}" title="Go to ${esc(kindLabel(kind, true))}">
             <span class="onb-summary-num">${summary.selected[kind]}<span class="onb-summary-of">/${summary.counts[kind]}</span></span>
             <span class="onb-summary-label">${esc(kindLabel(kind, true))}</span>
-          </div>`).join('')}
+          </button>`).join('')}
         <div class="onb-summary-actions">
+          <div class="onb-view-toggle" role="group" aria-label="Arrange the draft">
+            <button class="chip-btn ${slice.reviewView !== 'project' ? 'active' : ''}" data-onb-view="type" aria-pressed="${slice.reviewView !== 'project'}">By type</button>
+            <button class="chip-btn ${slice.reviewView === 'project' ? 'active' : ''}" data-onb-view="project" aria-pressed="${slice.reviewView === 'project'}">By project</button>
+          </div>
           ${summary.incomplete ? `<span class="onb-flag onb-flag-lg">${summary.incomplete} incomplete</span>` : ''}
           <button class="btn btn-ghost btn-sm" data-onb-all="">Select everything</button>
           <button class="btn btn-ghost btn-sm" data-onb-none="">Clear all</button>
@@ -6216,6 +6833,10 @@
     return `<div class="onb-panel onb-result">
       <h3 class="onb-panel-title"><span class="material-icons-outlined">check_circle</span> Onboarded</h3>
       <p class="onb-panel-blurb">${result.total_created} record${result.total_created === 1 ? '' : 's'} created, ${result.total_reused} matched to something that already existed${result.memberships ? `, ${result.memberships} project membership${result.memberships === 1 ? '' : 's'} added` : ''}.</p>
+      ${(result.people_notes || []).length ? `<div class="onb-blocked">
+        <strong>People to choose by hand</strong>
+        <ul>${result.people_notes.map(note => `<li>${esc(note)}</li>`).join('')}</ul>
+      </div>` : ''}
       ${credentials.length ? `<div class="onb-credentials">
         <div class="onb-credentials-head">
           <span class="material-icons-outlined">key</span>
@@ -6262,7 +6883,7 @@
         <span>Nothing is created while any of these are selected. Go back, complete them, or clear their checkbox.</span>
       </div>` : ''}
       ${roleRows.length && !plan.can_create_roles ? `<div class="onb-blocked">
-        <strong>Roles need a Super Admin</strong>
+        <strong>Roles need a Head (Super Admin)</strong>
         <ul>${roleRows.map(row => `<li>${esc(row.name)} will be skipped</li>`).join('')}</ul>
       </div>` : ''}
 
@@ -6613,6 +7234,18 @@
       selectAllOnboarding(element.dataset.onbAll, true)));
     $$('[data-onb-none]').forEach(element => element.addEventListener('click', () =>
       selectAllOnboarding(element.dataset.onbNone, false)));
+    $$('[data-onb-view]').forEach(element => element.addEventListener('click', () => {
+      onboarding().reviewView = element.dataset.onbView;
+      renderPage();
+    }));
+    $$('[data-onb-jump]').forEach(element => element.addEventListener('click', () => {
+      const kind = element.dataset.onbJump;
+      // A kind drawn inside its parent in the project view has no section there.
+      if (!document.getElementById(`onb-group-${kind}`)) onboarding().reviewView = 'type';
+      onboarding().collapsed[kind] = false;
+      renderPage();
+      document.getElementById(`onb-group-${kind}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }));
     $$('[data-onb-collapse]').forEach(element => element.addEventListener('click', () => {
       slice.collapsed[element.dataset.onbCollapse] = !slice.collapsed[element.dataset.onbCollapse];
       renderPage();
@@ -7342,17 +7975,9 @@
   async function downloadReport(reportId, title) {
     try {
       const response = await apiReq(`/api/generated-documents/${reportId}/download`);
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = `${(title || 'project-report').replace(/[^A-Za-z0-9._-]+/g, '_')}.pdf`;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      await saveResponseAs(response, `${(title || 'project-report').replace(/[^A-Za-z0-9._-]+/g, '_')}.pdf`);
     } catch (error) {
-      showToast(error.message, 'error', 6000);
+      showToast(`The report is ready, but could not be saved: ${downloadFailure(error)}`, 'error', 9000);
     }
   }
 
@@ -7543,7 +8168,12 @@
         .filter(row => row.bytes || row.count)
         .map(row => `• ${row.label}: ${row.human}${row.count ? ` (${row.count} item(s))` : ''}`);
       if (!lines.length) { showToast('There is nothing to reclaim right now', 'info'); return; }
-      if (!confirm(`This will reclaim ${plan.human}:\n\n${lines.join('\n')}\n\nOriginal uploads are never touched. Continue?`)) return;
+      // Collapsing duplicates deletes the extra copies' uploads; say so rather
+      // than promising originals are untouched.
+      const originals = actions.includes('duplicates')
+        ? 'Duplicate copies are deleted; one copy of every original upload is always kept.'
+        : 'Original uploads are not touched.';
+      if (!confirm(`This will reclaim ${plan.human}:\n\n${lines.join('\n')}\n\n${originals} Continue?`)) return;
 
       const done = await apiReq('/api/storage/sweep', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -7623,6 +8253,7 @@
   let entityCollection = null;
 
   const GIVE_UP = /^\s*(?:cancel|stop|never\s*mind|nevermind|forget\s+it|abort|leave\s+it)\b/i;
+  const ASKS_A_QUESTION = /\?\s*$|^\s*(?:what|what's|which|who|whose|when|where|why|how|is|are|does|do|did|give\s+me|show|list|tell|summari[sz]e|compare|explain|describe)\b/i;
 
   /** The question to ask for what is still outstanding.
    *
@@ -7664,6 +8295,12 @@
       const what = String(entityCollection.label || 'record').toLowerCase();
       entityCollection = null;
       return `Stopped — no ${esc(what)} was created. Nothing was saved.`;
+    }
+    // A question asked while a record is half-filled is a new question, not
+    // the missing field: drop the pending record and let the question through.
+    if (collecting && ASKS_A_QUESTION.test(text)) {
+      entityCollection = null;
+      return null;
     }
 
     const payload = collecting
@@ -8024,7 +8661,6 @@
     // Closing always resets the window state so the next open is predictable
     if (chatWindowState !== 'normal') applyChatWindowState('normal');
   }
-  function toggleChat() { DOM.chatPanel.classList.contains('collapsed') ? showChat() : hideChat(); }
 
   function minimizeChat() { openChatPanel(); applyChatWindowState('minimized'); }
   function restoreChat() { openChatPanel(); applyChatWindowState('normal'); }
@@ -8443,15 +9079,7 @@
           throw new Error(`Failed to export chat: ${errText || res.statusText}`);
       }
       
-      const blob = await res.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'Marshal_Chat_Export.pdf';
-      document.body.appendChild(a);
-      a.click();
-      window.URL.revokeObjectURL(url);
-      document.body.removeChild(a);
+      await saveResponseAs(res, 'Marshal_Chat_Export.pdf');
       showToast('PDF downloaded', 'success');
     } catch (e) {
       showToast(e.message, 'error');
@@ -8795,6 +9423,21 @@
    */
   const CALENDAR_WORDS = /\b(calendar|calender|event|meeting|schedule|appointment|invite)\b/i;
   const CALENDAR_VERBS = /\b(add|create|book|schedule|set\s*up|setup|arrange|organi[sz]e|put)\b/i;
+  const CALENDAR_ACTION = '(?:add|create|book|schedule|set\\s*up|setup|arrange|organi[sz]e|put)';
+  //: An outright request to book something: "Schedule a meeting ...",
+  //: "can you add an event ...", "I'd like to set up a call ...".
+  const CALENDAR_REQUEST = new RegExp(
+    `^\\s*(?:please\\s+)?${CALENDAR_ACTION}\\b` +
+    `|\\b(?:can|could|would|will)\\s+you\\s+(?:please\\s+)?${CALENDAR_ACTION}\\b` +
+    `|\\b(?:please|i\\s+want\\s+to|i'?d\\s+like\\s+to|i\\s+need\\s+to|let'?s|help\\s+me)\\s+${CALENDAR_ACTION}\\b`, 'i');
+
+  // "Which items put the schedule at risk?" contains a calendar word and a
+  // verb, but it is a question about the project, not a booking.
+  function asksToBookCalendar(text) {
+    if (!CALENDAR_WORDS.test(text)) return false;
+    if (CALENDAR_REQUEST.test(text)) return true;
+    return CALENDAR_VERBS.test(text) && !ASKS_A_QUESTION.test(text);
+  }
 
   async function handleWorkspaceAgentRequest(text) {
     if (!text) return { handled: false, query: text };
@@ -8832,7 +9475,7 @@
     if (!providerId) {
       // Falling through to document search here produced "no information in
       // the project documents", which does not explain the real problem.
-      if (looksLikeCalendar && CALENDAR_VERBS.test(text)) {
+      if (asksToBookCalendar(text)) {
         return { handled: true, response: 'To schedule anything I need a connected calendar. Open **Google Workspace** or **Microsoft 365** in the sidebar and choose **Add account**, then ask me again.' };
       }
       return { handled: false, query: text };
@@ -8862,7 +9505,7 @@ Open **${cfg.label} → ${cfg.mailLabel}** to edit it, save a draft, or send it.
     }
 
     const calendarWords = CALENDAR_WORDS.test(text);
-    const createCalendar = calendarWords && CALENDAR_VERBS.test(text);
+    const createCalendar = asksToBookCalendar(text);
     if (createCalendar) {
       const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
       const interpreted = await apiReq(`${cfg.api}/assistant/interpret`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ account_id: accountId, query: text, timezone }) });
@@ -8914,6 +9557,7 @@ ${JSON.stringify(context)}` };
       for (const file of filesToUpload) {
         try {
           const fd = new FormData(); fd.append('file', file); fd.append('doc_id', genId());
+          fd.append('origin', 'chat');
           await apiReq('/api/upload', { method: 'POST', body: fd });
           showToast(`Uploaded: ${file.name} `, 'success');
         } catch (e) { showToast(`Upload failed: ${file.name} `, 'error'); }
@@ -8945,13 +9589,15 @@ ${JSON.stringify(context)}` };
           history,
           model: APP_CONFIG.MODEL,
           top_k: APP_CONFIG.TOP_K,
-          project_id: state.currentPage === 'project-details' ? (state.activeProjectId || null) : null
+          // The project on screen, if any: its page, or its tab on the Task Manager.
+          project_id: state.currentPage === 'project-details' ? (state.activeProjectId || null)
+            : (state.currentPage === 'tasks' ? (taskBoard().activeProjectId || null) : null)
         })
       });
       const el = document.getElementById('typingIndicator'); if (el) el.remove();
       const ct = res.headers.get('content-type') || '';
       if (ct.includes('text/event-stream')) { await handleStream(res); }
-      else { const data = await res.json(); addMessage('bot', data.response, data.sources || null); renderChatMessages(); }
+      else { const data = await res.json(); addMessage('bot', scopeNote(data.scope) + data.response, data.sources || null); renderChatMessages(); }
     } catch (error) {
       const el = document.getElementById('typingIndicator'); if (el) el.remove();
       if (error.message.includes('Backend URL not configured')) {
@@ -8959,6 +9605,13 @@ ${JSON.stringify(context)}` };
       } else { addMessage('bot', `❌ ** Error:** ${error.message} `); }
       renderChatMessages();
     } finally { state.isStreaming = false; }
+  }
+
+  /** One line saying which project's documents an answer was limited to. */
+  function scopeNote(scope) {
+    if (!scope || !(scope.project_ids || []).length) return '';
+    const names = (scope.projects || []).map(p => `**${p.name}**`).join(' and ');
+    return `*Searched only ${names}'s documents (${scope.reason}).*\n\n`;
   }
 
   async function handleStream(response) {
@@ -8999,7 +9652,7 @@ ${JSON.stringify(context)}` };
   function openUploadPanel(projectId = null) {
     state.uploadProjectId = typeof projectId === 'string' ? projectId : null;
     const title = DOM.uploadPanel.querySelector('.upload-panel-header h2');
-    if (title) title.textContent = state.uploadProjectId ? '📁 Upload Project PDF Sources' : '📁 Upload Files';
+    if (title) title.textContent = state.uploadProjectId ? '📁 Upload Project Documents' : '📁 Upload Files';
     DOM.uploadPanel.classList.add('open'); DOM.uploadPanelOverlay.classList.add('open'); fetchDocuments();
   }
   function closeUploadPanel() {
@@ -9020,12 +9673,16 @@ ${JSON.stringify(context)}` };
         const endpoint = projectId
           ? `/api/projects/${projectId}/source-documents`
           : '/api/upload';
+        if (!projectId) fd.append('origin', 'documents');
         const res = await apiReq(endpoint, { method: 'POST', body: fd });
         const data = await res.json();
-        doc.status = 'indexed'; doc.pages = data.pages || 0; doc.project_id = data.project_id || null;
+        doc.status = data.status === 'error' ? 'error' : 'indexed'; doc.pages = data.pages || 0; doc.project_id = data.project_id || null;
+        // The account already held these bytes: say what was done instead.
+        if (data.status === 'duplicate') showToast(data.message || `${file.name} is already in the account`, 'info', 6000);
       } catch (e) { doc.status = 'error'; renderDocList(); showToast(`Upload failed: ${file.name} `, 'error'); }
     }
     updateDocBadge();
+    await fetchDocuments();
     if (projectId) await fetchProjectSources(projectId);
     if (state.currentPage === 'documents' || (state.currentPage === 'project-details' && state.activeProjectId === projectId)) renderPage();
   }
@@ -9039,7 +9696,8 @@ ${JSON.stringify(context)}` };
       const tc = getFileClass(ext);
       const item = document.createElement('div'); item.className = 'document-item';
       const sLabel = doc.status === 'indexing' ? '⟳ Indexing' : doc.status === 'indexed' ? '✓ Ready' : doc.status === 'uploading' ? '⬆ Up…' : '✕ Error';
-      item.innerHTML = `<div class="doc-icon ${tc}" > ${icon}</div><div class="doc-info"><div class="doc-name">${esc(doc.name)}</div><div class="doc-meta">${fmtSize(doc.size || 0)}${doc.pages ? ' · ' + doc.pages + ' pg' : ''}</div></div><span class="doc-status ${doc.status}">${sLabel}</span><button class="doc-delete" title="Remove">🗑</button>`;
+      const projectNames = (doc.projects || []).map(p => p.name).filter(Boolean);
+      item.innerHTML = `<div class="doc-icon ${tc}" > ${icon}</div><div class="doc-info"><div class="doc-name">${esc(doc.name)}</div><div class="doc-meta">${fmtSize(doc.size || 0)}${doc.pages ? ' · ' + doc.pages + ' pg' : ''}</div>${doc.status === 'uploading' ? '' : `<div class="doc-meta" title="${esc(projectNames.join(', '))}">${projectNames.length ? esc(projectNames.join(', ')) : 'Unassigned'}</div>`}</div><span class="doc-status ${doc.status}">${sLabel}</span><button class="doc-delete" title="Remove">🗑</button>`;
       item.querySelector('.doc-delete').addEventListener('click', async () => {
         try { await apiReq(`/api/documents/${doc.id}`, { method: 'DELETE' }); state.uploadedDocs = state.uploadedDocs.filter(d => d.id !== doc.id); renderDocList(); updateDocBadge(); showToast('Removed', 'info'); } catch (e) { showToast('Delete failed', 'error'); }
       });
@@ -9051,17 +9709,30 @@ ${JSON.stringify(context)}` };
   // ═══ Settings ═══
   function openSettings() {
     DOM.apiUrlInput.value = getApiUrl() || 'http://127.0.0.1:8000';
-    DOM.voiceApiUrlInput.value = getVoiceApiUrl();
     DOM.modelSelect.value = APP_CONFIG.MODEL;
     DOM.topKInput.value = APP_CONFIG.TOP_K;
     DOM.settingsModal.classList.add('open');
+    showVoiceServiceStatus();
+  }
+
+  /** Say whether the local voice service is up; the backend is what asks it. */
+  async function showVoiceServiceStatus() {
+    const host = DOM.voiceServiceStatus;
+    if (!host) return;
+    host.textContent = 'Checking the local voice service…';
+    try {
+      const voice = (await (await apiReq('/api/health')).json()).voice || {};
+      host.textContent = voice.available
+        ? `Ready: the local voice service (${voice.model || 'Whisper'} on ${voice.device || 'this machine'}).`
+        : 'The local voice service is not running. Start it with START-BUILDMARSHAL.ps1, or run python scripts/run_voice_service.py.';
+    } catch (e) {
+      host.textContent = 'Connect the backend to check the voice service.';
+    }
   }
   function closeSettings() { DOM.settingsModal.classList.remove('open'); }
   async function saveSettings() {
     const url = DOM.apiUrlInput.value.trim() || 'http://127.0.0.1:8000';
-    const voiceUrl = DOM.voiceApiUrlInput.value.trim();
     APP_CONFIG.API_URL = url;
-    APP_CONFIG.VOICE_API_URL = voiceUrl;
     APP_CONFIG.MODEL = DOM.modelSelect.value;
     APP_CONFIG.TOP_K = Math.max(1, Math.min(20, parseInt(DOM.topKInput.value) || 5));
     // The backend URL is a property of this browser, not of the account, so it
@@ -9077,7 +9748,7 @@ ${JSON.stringify(context)}` };
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            model: APP_CONFIG.MODEL, top_k: APP_CONFIG.TOP_K, voice_api_url: voiceUrl
+            model: APP_CONFIG.MODEL, top_k: APP_CONFIG.TOP_K
           })
         });
         applyAccountSettings((await res.json()).settings);
@@ -9092,7 +9763,6 @@ ${JSON.stringify(context)}` };
     state.settings = settings || {};
     if (state.settings.model) APP_CONFIG.MODEL = state.settings.model;
     if (state.settings.top_k) APP_CONFIG.TOP_K = state.settings.top_k;
-    APP_CONFIG.VOICE_API_URL = state.settings.voice_api_url || '';
   }
 
   // ═══ Image Preview ═══
@@ -9168,22 +9838,35 @@ ${JSON.stringify(context)}` };
           doc_kind: $('#docGenKind')?.value || 'tender_summary',
           title: $('#docGenTitle')?.value.trim() || null,
           instructions: $('#docGenInstructions')?.value.trim() || '',
+          language: $('#docGenLanguage')?.value || 'English',
           top_k_per_section: Math.max(1, Math.min(12, parseInt($('#docGenTopK')?.value || '6', 10))),
         };
         DOM.btnSaveCrud.disabled = true;
         DOM.btnSaveCrud.textContent = 'Generating…';
+        let metadata;
         try {
           const response = await apiReq(`/api/projects/${crudId}/documents`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
           });
-          const metadata = await response.json();
-          closeCrudModal();
-          await downloadGeneratedDocument(metadata);
-          showToast(`Generated ${metadata.title}`, 'success');
+          metadata = await response.json();
         } catch (error) {
+          // Generation itself failed: the dialog is still open, so let them retry.
           DOM.btnSaveCrud.disabled = false;
           DOM.btnSaveCrud.textContent = 'Generate PDF';
           showToast(error.message, 'error');
+          return;
+        }
+        closeCrudModal();
+        // The document exists from here on. A failed download is not a failed
+        // generation, and saying "Failed to fetch" invites generating it again.
+        // Download managers such as IDM take over PDF responses and hand the page
+        // an empty reply, which is the usual reason for this.
+        try {
+          await downloadGeneratedDocument(metadata);
+          showToast(`Generated ${metadata.title}`, 'success');
+        } catch (error) {
+          showToast(`Generated ${metadata.title}, but it could not be saved: ${downloadFailure(error)}.`,
+            'warning', 10000);
         }
         return;
       }
@@ -9215,12 +9898,18 @@ ${JSON.stringify(context)}` };
       if (crudAct === 'save-new-project') {
         const name = $('#projFName')?.value.trim();
         const project_code = $('#projFCode')?.value.trim();
+        const manager_id = $('#projFMgr')?.value || '';
         if (!name || !project_code) { showToast('Name and Project Code are required', 'warning'); return; }
+        if (!manager_id) { showToast('Choose the project manager', 'warning'); $('#projFMgr')?.focus(); return; }
+        if ($('#projFStart')?.value && $('#projFEnd')?.value && $('#projFEnd').value < $('#projFStart').value) {
+          showToast("The project's end date cannot be earlier than its start date", 'warning'); return;
+        }
         const body = {
-          name, project_code,
-          manager: $('#projFMgr')?.value.trim(),
+          name, project_code, manager_id,
+          member_ids: [...$$('.proj-member-check:checked')].map(box => box.value),
           type: $('#projFType')?.value,
           status: $('#projFStatus')?.value || 'Active',
+          currency: $('#projFCurrency')?.value || 'USD',
           start_date: $('#projFStart')?.value,
           end_date: $('#projFEnd')?.value,
           description: $('#projFDesc')?.value.trim(),
@@ -9232,7 +9921,7 @@ ${JSON.stringify(context)}` };
           country: $('#projFCountry')?.value.trim(),
         };
         try {
-          const created = await apiReq('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => r.json());
+          await apiReq('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => r.json());
           await fetchProjects();
           closeCrudModal();
           renderPage();
@@ -9249,12 +9938,17 @@ ${JSON.stringify(context)}` };
       if (crudAct === 'save-edit-project') {
         const name = $('#projFName')?.value.trim();
         const project_code = $('#projFCode')?.value.trim();
+        const manager_id = $('#projFMgr')?.value || '';
         if (!name || !project_code) { showToast('Name and Project Code are required', 'warning'); return; }
+        if (!manager_id) { showToast('Choose the project manager', 'warning'); $('#projFMgr')?.focus(); return; }
+        if ($('#projFStart')?.value && $('#projFEnd')?.value && $('#projFEnd').value < $('#projFStart').value) {
+          showToast("The project's end date cannot be earlier than its start date", 'warning'); return;
+        }
         const body = {
-          name, project_code,
-          manager: $('#projFMgr')?.value.trim(),
+          name, project_code, manager_id,
           type: $('#projFType')?.value,
           status: $('#projFStatus')?.value,
+          currency: $('#projFCurrency')?.value,
           start_date: $('#projFStart')?.value,
           end_date: $('#projFEnd')?.value,
           description: $('#projFDesc')?.value.trim(),
@@ -9266,12 +9960,15 @@ ${JSON.stringify(context)}` };
           country: $('#projFCountry')?.value.trim(),
         };
         try {
-          await apiReq(`/api/projects/${crudId}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+          const saved = await (await apiReq(`/api/projects/${crudId}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).json();
           await fetchProjects();
           // Refresh dashboard data if currently on project-details
           if (state.activeProjectId === crudId) {
             const updated = state.projects.find(p => p.id === crudId);
-            if (updated) Object.assign(updated, body);
+            if (updated) Object.assign(updated, saved);
+            else state.projects.push(saved);
+            // A new manager changes who is on the project.
+            if (projectTab().projectId === crudId) projectTab().people = null;
           }
           closeCrudModal();
           renderPage();
@@ -9286,6 +9983,7 @@ ${JSON.stringify(context)}` };
         return;
       }
       if (crudAct === 'add-project-members') { await submitAddMembers(crudId); return; }
+      if (crudAct === 'save-link-project-docs') { await submitLinkDocuments(crudId); return; }
       if (crudAct === 'add-project-cost') { await submitProjectCost(crudId, ''); return; }
       if (crudAct === 'update-project-cost') { await submitProjectCost(crudId, crudExtra); return; }
       if (crudAct === 'add-procurement') { await submitProcurement(crudId, ''); return; }

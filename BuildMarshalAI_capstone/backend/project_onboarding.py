@@ -48,18 +48,20 @@ from pydantic import BaseModel, Field
 
 try:  # the notebook puts this directory on sys.path
     from entity_schema import (
-        ENTITIES, ENTITY_ORDER, catalog, coerce_fields, entity, is_complete,
-        missing_required, permission_catalogue_rows, reconcile, reference_choices,
+        ENTITIES, ENTITY_ORDER, catalog, coerce_fields, missing_required, permission_catalogue_rows, reconcile, reference_choices,
         validate_entity,
     )
-    from permissions import role_names
+    from permissions import canonical_role, role_names
+    from project_people import member_id, resolve_user
+    from document_links import link_document
 except ModuleNotFoundError:  # imported as backend.project_onboarding
     from backend.entity_schema import (
-        ENTITIES, ENTITY_ORDER, catalog, coerce_fields, entity, is_complete,
-        missing_required, permission_catalogue_rows, reconcile, reference_choices,
+        ENTITIES, ENTITY_ORDER, catalog, coerce_fields, missing_required, permission_catalogue_rows, reconcile, reference_choices,
         validate_entity,
     )
-    from backend.permissions import role_names
+    from backend.permissions import canonical_role, role_names
+    from backend.project_people import member_id, resolve_user
+    from backend.document_links import link_document
 
 
 #: The kinds a draft can hold, in the order they must be created.
@@ -277,9 +279,12 @@ def item_issues(draft: Mapping[str, Any], item: Mapping[str, Any],
         for other in (draft.get("items") or {}).values()
         if other.get("kind") == item.get("kind") and other["id"] != item["id"]
     ]
+    parent = (draft.get("items") or {}).get(item.get("parent_ref") or "") or {}
+    project = parent.get("fields") if item.get("kind") == "task" and parent.get("kind") == "project" else None
     try:
         validate_entity(item["kind"], item.get("fields") or {},
-                        siblings=siblings, roles=roles, ignore_id=item["id"])
+                        siblings=siblings, roles=roles, ignore_id=item["id"],
+                        project=({**project, "name": project.get("name")} if project else None))
     except HTTPException as error:
         return [str(error.detail)]
     return []
@@ -1126,7 +1131,7 @@ def pending_question(draft: Mapping[str, Any],
 # Matching against what already exists
 # ──────────────────────────────────────────────────────────────────────────
 
-#: Where a catalogue kind lives inside management.json.
+#: Where a catalogue kind lives inside the management store.
 MGMT_KEYS: dict[str, str] = {
     "task_type": "task_types", "project_type": "project_types",
     "trade": "trades", "vendor": "vendors",
@@ -1172,8 +1177,10 @@ def match_existing(kind: str, fields: Mapping[str, Any], *, projects: Mapping[st
                 return {"id": _text(entry.get("id")), "label": _text(entry.get("name")), "on": "name"}
         return None
     if kind == "role_type":
+        # A document may still use a built-in's former name ("Super Admin").
+        wanted = _fold(canonical_role(fields.get("name")))
         for role in roles:
-            if _fold(role) == name:
+            if _fold(role) in (name, wanted):
                 return {"id": _text(role), "label": _text(role), "on": "name"}
         return None
     if kind == "project_cost":
@@ -1327,10 +1334,11 @@ def build_plan(draft: Mapping[str, Any], *, projects: Mapping[str, Any],
 class _Transaction:
     """Everything the commit touches, so a failure leaves nothing behind.
 
-    The stores are JSON documents rather than a database, so the unit of work is
-    a snapshot: read every store once, mutate the copies, write them all at the
-    end. Users are the exception -- the registry writes them one at a time -- so
-    the ones created are recorded and deleted on rollback.
+    The unit of work: read every store once, mutate the copies, write them all
+    at the end. :func:`commit_draft` runs it inside one database transaction
+    (``workspace.atomic()``), so a failure rolls back every store and every user
+    created on the way. The snapshot restore below is the same guarantee for a
+    workspace without transactions.
     """
 
     def __init__(self, workspace: Any, registry: Any) -> None:
@@ -1358,9 +1366,10 @@ class _Transaction:
         self.workspace.save_procurement(self.procurement)
 
     def rollback(self) -> None:
-        # Nothing was written for the file-backed stores unless commit() ran, so
-        # restoring them is only needed when it half-ran; doing it always is
-        # cheap and makes the guarantee unconditional.
+        # Inside the commit's transaction this is undone with everything else;
+        # it matters only for a workspace without transactions, where nothing
+        # was written unless commit() ran -- restoring always keeps the
+        # guarantee unconditional.
         self.workspace.save_projects(self._before["projects"])
         self.workspace.save_tasks(self._before["tasks"])
         self.workspace.save_mgmt(self._before["mgmt"])
@@ -1373,7 +1382,120 @@ class _Transaction:
                 pass
 
 
-def commit_draft(draft: dict[str, Any], *, workspace: Any, registry: Any,
+def commit_draft(draft: dict[str, Any], *, workspace: Any, **kwargs: Any) -> dict[str, Any]:
+    """Create the selected draft items for real, in one transaction.
+
+    See :func:`_commit_draft`. With a database-backed workspace the whole commit
+    is one transaction: an exception anywhere rolls back every record and every
+    user it created.
+    """
+    atomic = getattr(workspace, "atomic", None)
+    if atomic is None:
+        return _commit_draft(draft, workspace=workspace, **kwargs)
+    with atomic():
+        return _commit_draft(draft, workspace=workspace, **kwargs)
+
+
+def _bind_people(work: Any, real_id: Mapping[str, str], items: Mapping[str, Any],
+                 ordered: Sequence[str], users: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Turn the manager and assignee names of new records into user ids.
+
+    A name that matches no user, or several, is cleared rather than stored as
+    text that looks like a person; the returned notes say which, so the
+    manager can be chosen on the project and the task reassigned.
+    """
+    notes: list[str] = []
+    created = {real_id[ref] for ref in ordered if ref in real_id}
+    for project_id, project in list(work.projects.items()):
+        if project_id not in created or project.get("manager_id"):
+            continue
+        named = _text(project.get("manager"))
+        if not named:
+            continue
+        user = resolve_user(users, name=named)
+        if user:
+            project["manager_id"], project["manager"] = user["id"], user.get("name") or user.get("email")
+        else:
+            project["manager"] = ""
+            notes.append(f"{project.get('name')}: the manager {named!r} is not a user in this "
+                         "account, so no manager was set. Choose one on the project.")
+        work.projects[project_id] = project
+    for project_id, tasks in work.tasks.items():
+        project = work.projects.get(project_id)
+        if project is None:
+            continue
+        members = list(project.get("members", []) or [])
+        present = {member_id(entry) for entry in members} | {_text(project.get("manager_id"))}
+        for task in tasks:
+            if task.get("id") not in created or task.get("assignee_id") or not _text(task.get("assignee")):
+                continue
+            named = _text(task.get("assignee"))
+            user = resolve_user(users, name=named)
+            if user is None:
+                task["assignee"] = ""
+                notes.append(f"{task.get('name')}: the assignee {named!r} is not a user in this "
+                             "account, so the task was left unassigned.")
+                continue
+            task["assignee_id"], task["assignee"] = user["id"], user.get("name") or user.get("email")
+            if user["id"] not in present:
+                members.append({"user_id": user["id"], "project_role": "", "added_at": _now()})
+                present.add(user["id"])
+        project["members"] = members
+        work.projects[project_id] = project
+    return notes
+
+
+def _link_draft_documents(workspace: Any, draft: Mapping[str, Any], items: Mapping[str, Any],
+                          real_id: Mapping[str, str]) -> int:
+    """Link each document the draft was built from to the project it describes.
+
+    A document belongs to every project that one of its items belongs to: a
+    project it named, or the project above a task, cost or procurement line it
+    produced, or a project a person it listed is on. When the draft holds one
+    project, every attached document is that project's. Only documents attached
+    to this draft are ever linked. Returns the number of new links.
+    """
+    projects = [ref for ref, item in items.items() if item.get("kind") == "project" and ref in real_id]
+    if not projects:
+        return 0
+    attached = {_text(d.get("doc_id")) for d in draft.get("documents", []) or [] if d.get("doc_id")}
+
+    def owning_projects(item: Mapping[str, Any]) -> set[str]:
+        if item.get("kind") == "project":
+            return {item["id"]}
+        if item.get("kind") == "user":
+            return {ref for ref in item.get("project_refs", []) or [] if ref in projects}
+        seen: set[str] = set()
+        cursor = item
+        while cursor and cursor.get("parent_ref") and cursor["parent_ref"] not in seen:
+            seen.add(cursor["parent_ref"])
+            cursor = items.get(cursor["parent_ref"])
+            if cursor and cursor.get("kind") == "project":
+                return {cursor["id"]}
+        return set()
+
+    wanted: dict[str, set[str]] = {ref: set() for ref in projects}
+    for item in items.values():
+        doc_id = _text((item.get("source") or {}).get("doc_id"))
+        if doc_id in attached:
+            for ref in owning_projects(item):
+                wanted.setdefault(ref, set()).add(doc_id)
+    if len(projects) == 1:
+        wanted[projects[0]] |= attached
+
+    metadata = workspace.load_metadata()
+    documents = metadata.get("documents", {})
+    linked = 0
+    for ref, doc_ids in wanted.items():
+        for doc_id in doc_ids:
+            if doc_id in documents and link_document(documents[doc_id], real_id[ref]):
+                linked += 1
+    if linked:
+        workspace.save_metadata(metadata)
+    return linked
+
+
+def _commit_draft(draft: dict[str, Any], *, workspace: Any, registry: Any,
                  account_id: str, make_project: Callable[[Mapping[str, Any]], dict[str, Any]],
                  make_task: Callable[[Mapping[str, Any], str], dict[str, Any]],
                  catalog_entry: Callable[[Mapping[str, Any], str], dict[str, Any]],
@@ -1461,7 +1583,7 @@ def commit_draft(draft: dict[str, Any], *, workspace: Any, registry: Any,
             elif kind == "role_type":
                 if not allow_roles:
                     skipped.append({"id": item_id, "kind": kind, "name": name,
-                                    "reason": "only a Super Admin can create roles"})
+                                    "reason": "only a Head (Super Admin) can create roles"})
                     continue
                 match = match_existing(kind, fields, roles=role_names(work.roles))
                 if match:
@@ -1629,14 +1751,23 @@ def commit_draft(draft: dict[str, Any], *, workspace: Any, registry: Any,
             project["members"] = members
             work.projects[project_id] = project
 
+        # People last of all. A manager and an assignee are users, so the names
+        # the documents gave are matched to the account's users -- including the
+        # ones just created -- and anyone given a task joins its project.
+        people_notes = _bind_people(work, real_id, items, ordered, account_users)
+
         work.commit()
+        # The documents the project was onboarded from are its documents: link
+        # them, so its Project Documents list and project-scoped chat have them.
+        documents_linked = _link_draft_documents(workspace, draft, items, real_id)
     except Exception:
         work.rollback()
         raise
 
     result = {
         "created": created, "reused": reused, "skipped": skipped,
-        "memberships": memberships,
+        "memberships": memberships, "people_notes": people_notes,
+        "documents_linked": documents_linked,
         "counts": {kind: sum(1 for row in created if row["kind"] == kind) for kind in ITEM_KINDS},
         "total_created": len(created), "total_reused": len(reused),
         "project_ids": [real_id[ref] for ref in ordered
@@ -1695,8 +1826,8 @@ def register_project_onboarding_routes(namespace: Mapping[str, Any]) -> dict[str
     """Register the Onboarding routes on the notebook app.
 
     Everything here is administrator work, and everything before ``/commit`` is
-    read-only with respect to the live stores: drafts live in the account's own
-    ``onboarding.json``.
+    read-only with respect to the live stores: drafts are the account's own
+    records (the ``onboarding_drafts`` table).
     """
     required = ("app", "require_account", "ingest_document", "vl_generate", "_make_project")
     missing = [name for name in required if name not in namespace]
@@ -1744,11 +1875,13 @@ def register_project_onboarding_routes(namespace: Mapping[str, Any]) -> dict[str
             "procurement": lambda: make_procurement({}, "reconcile"),
         },
         server_owned={
+            # currency is not here: it is a field the person chooses, and the
+            # project constructor stores it like any other.
             "project": ("id", "archived", "created_at", "updated_at", "members",
-                        "additional_costs", "currency"),
+                        "additional_costs"),
             "task": ("id", "project_id", "created_at", "updated_at", "parent_id", "cost"),
             "task_type": ("id", "created_at"), "project_type": ("id", "created_at"),
-            "role_type": ("id", "created_at", "updated_at"),
+            "role_type": ("id", "created_at", "updated_at", "upgrades"),
             "procurement": ("id", "project_id", "created_at", "updated_at"),
         },
     )
@@ -1902,7 +2035,10 @@ def register_project_onboarding_routes(namespace: Mapping[str, Any]) -> dict[str
             save_path.unlink(missing_ok=True)
             raise HTTPException(500, detail=f"Could not save file: {error}") from None
 
-        meta = ingest_document(save_path, clean_id, workspace, display_name=safe_name)
+        meta = ingest_document(save_path, clean_id, workspace, display_name=safe_name,
+                               origin="onboarding")
+        # Bytes already indexed come back as the existing document.
+        clean_id = str(meta.get("id") or clean_id)
         record = {
             "doc_id": clean_id, "name": safe_name,
             "pages": int(meta.get("page_count") or 0),

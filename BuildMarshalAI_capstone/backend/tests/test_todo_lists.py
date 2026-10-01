@@ -94,7 +94,7 @@ USERS = [
     {"id": "u3", "name": "Gone Away", "email": "gone@example.com",
      "role": "Site Lead", "status": "Inactive"},
     {"id": "u4", "name": "Dana Boss", "email": "dana@example.com",
-     "role": "Super Admin", "status": "Active"},
+     "role": "Head (Super Admin)", "status": "Active"},
 ]
 
 
@@ -210,7 +210,7 @@ def test_preview_builds_the_list_and_names_the_recipients(account, registry):
     body = client.post("/api/todo-list/preview", json={"roles": ["Site Lead"]}).json()
     assert body["total"] == 3
     assert [p["email"] for p in body["recipients"]] == ["sam@example.com"]
-    assert body["can_send"] is True, "the owner is a Super Admin"
+    assert body["can_send"] is True, "the owner is a Head (Super Admin)"
 
 
 def test_preview_reports_each_persons_share_when_personalised(account, registry):

@@ -19,6 +19,11 @@ from typing import Any, Mapping
 
 from fastapi import HTTPException
 
+try:  # the notebook puts this directory on sys.path
+    from document_links import link_document
+except ModuleNotFoundError:  # imported as backend.external_imports
+    from backend.document_links import link_document
+
 
 class ExternalImporter:
     """Ingest downloaded external files into one account's workspace."""
@@ -45,11 +50,13 @@ class ExternalImporter:
             raise RuntimeError("Ingested document metadata was not created")
         stored.update({
             "name": display_name,
-            "project_id": project_id,
             "source_type": source_type,
             "provider": self.provider,
+            "origin": self.provider,
             self.provider: dict(external),
         })
+        if project_id:
+            link_document(stored, project_id)
         ids: list[str] = []
         metadatas: list[dict[str, Any]] = []
         documents: list[str] = []
@@ -65,8 +72,6 @@ class ExternalImporter:
                 f"{self.provider}_account_id": str(external.get("account_id", "")),
                 f"{self.provider}_item_id": str(external.get("item_id", "")),
             }
-            if project_id:
-                item["project_id"] = project_id
             metadatas.append(item)
             documents.append(text[:8000])
         workspace.save_metadata(metadata)
@@ -103,15 +108,28 @@ class ExternalImporter:
         destination = Path(workspace.docs_dir) / f"{doc_id}{path.suffix.lower()}"
         if path != destination:
             destination.write_bytes(path.read_bytes())
-        result = self.ingest_document(destination, doc_id, workspace, display_name=display_name)
+        result = self.ingest_document(destination, doc_id, workspace,
+                                      display_name=display_name, project_id=project_id,
+                                      origin=self.provider)
+        if result.get("status") == "duplicate":
+            # Already in the account; ingestion removed the new copy and linked
+            # the existing one to the project, if one was given.
+            return {
+                "id": result["id"], "name": result.get("name", display_name),
+                "project_id": project_id, "pages": result.get("page_count", 0),
+                "status": "duplicate", "source_type": result.get("source_type", source_type),
+                "provider": self.provider,
+            }
         # Generic PDF ingestion renders page images but leaves text_content
         # empty.  Preserve selectable PDF text so imported files also work well
         # for Q&A and long-form document generation.
         if destination.suffix.lower() == ".pdf":
             try:
-                from pypdf import PdfReader
+                # PyMuPDF keeps Bangla in reading order; pypdf scrambles its vowel signs.
+                import fitz
 
-                texts = [(page.extract_text() or "").strip() for page in PdfReader(str(destination)).pages]
+                with fitz.open(str(destination)) as document:
+                    texts = [(page.get_text() or "").strip() for page in document]
                 metadata = workspace.load_metadata()
                 stored = metadata["documents"][doc_id]
                 for index, page in enumerate(stored.get("pages") or []):

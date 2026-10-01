@@ -46,7 +46,7 @@ def test_an_edit_records_who_made_it():
 
 
 def test_unknown_fields_are_ignored_rather_than_stored():
-    profile = apply_company_updates(empty_company(), {"name": "M", "role": "System Admin"}, {})
+    profile = apply_company_updates(empty_company(), {"name": "M", "role": "Head (System Admin)"}, {})
     assert "role" not in profile
 
 
@@ -115,7 +115,7 @@ def test_an_administrator_may_read_and_edit_the_company(make_account):
     assert client.get("/api/company").json()["company"]["name"] == "Marshal Build Co"
 
 
-@pytest.mark.parametrize("role", ["Super Admin", "System Admin"])
+@pytest.mark.parametrize("role", ["Head (Super Admin)", "Head (System Admin)"])
 def test_every_administrator_role_may_edit(make_account, role):
     slug = role.replace(" ", "")
     client = build_app(demote(make_account(slug + "@example.com"), role))
